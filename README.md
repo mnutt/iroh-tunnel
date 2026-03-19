@@ -1,16 +1,35 @@
 # iroh-tunnel
 
-`iroh-tunnel` is a planned Sandstorm app for tunneling Sandstorm Cap'n Proto capabilities between two grains running on different Sandstorm instances.
+`iroh-tunnel` is a Sandstorm app for tunneling Sandstorm Cap'n Proto capabilities between two grains running on different Sandstorm instances.
 
-The core idea is:
+The long-term model is:
 
 - each grain runs an `iroh` endpoint
 - a user pairs two `iroh-tunnel` grains
-- a user can import a capability into one grain through the Sandstorm Powerbox
-- that capability is made available to the paired grain over an `iroh` transport
-- the receiving grain re-exports the capability back into Sandstorm so local users can use it
+- a user imports one or more capabilities through the Sandstorm Powerbox
+- selected capabilities are sent over an `iroh` transport using `capnp-rpc`
+- the receiving grain re-exports them back into Sandstorm
 
-This repository currently contains the design and implementation plan, not a working app.
+This repository already contains a working raw Sandstorm baseline, not just design notes.
+
+## Current status
+
+Implemented today:
+
+- raw Sandstorm bootstrap as `UiView` / `WebSession`
+- packaged static UI served from `/opt/app/client`
+- browser-side Powerbox request flow via `window.parent.postMessage(...)`
+- server-side `SessionContext.claimRequest()`
+- server-side `SandstormApi.save()`
+- persisted saved-capability registry under `/var/iroh-tunnel`
+- restore probing through `SandstormApi.restore()`
+
+Not implemented yet:
+
+- `iroh` transport
+- app-owned persistent object IDs for exported capabilities
+- `MainView.restore()` / `drop()` for re-exporting received capabilities
+- peer pairing and remote capability exchange
 
 ## Goals
 
@@ -19,7 +38,7 @@ This repository currently contains the design and implementation plan, not a wor
 - Persist selected capabilities in the local grain.
 - Tunnel live Cap'n Proto capabilities over an `iroh` connection.
 - Re-expose received capabilities from the destination grain back into Sandstorm.
-- Provide a minimal web UI for connection state and shared capability management.
+- Provide a minimal UI for connection state and shared capability management.
 
 ## Non-goals for the first version
 
@@ -32,15 +51,16 @@ This repository currently contains the design and implementation plan, not a wor
 
 1. Sandstorm network access is capability-gated. The app likely needs `IpNetwork` or a related raw Cap'n Proto capability from the Powerbox. This must be validated in practice.
 2. `iroh` depends on QUIC and normally benefits from UDP. It is not yet proven that Sandstorm's networking capability surface is sufficient for `iroh` in a packaged grain.
-3. The "empty Powerbox query returns everything I can access" behavior is not confirmed by the docs and must be tested.
-4. Exporting imported remote capabilities back into Sandstorm depends on a correct `AppHooks` implementation.
+3. Empty generic Powerbox queries appear unreliable enough that typed queries may be required in practice.
+4. Re-exporting imported remote capabilities back into Sandstorm depends on a correct `MainView.restore()` / `drop()` implementation.
 
-## Proposed stack
+## Current stack
 
 - Rust app server
-- minimal HTTP UI behind `sandstorm-http-bridge`
-- raw Cap'n Proto access over `/tmp/sandstorm-api`
-- `iroh` for peer transport
+- raw Sandstorm `UiView` / `WebSession` bootstrap on fd `3`
+- browser UI served from packaged assets under `/opt/app/client`
+- raw Sandstorm APIs via bootstrapped `SandstormApi` and per-session `SessionContext`
+- `iroh` planned for peer transport
 - `capnp` / `capnp-rpc` for forwarding live capabilities
 - persistent state under `/var`
 
@@ -67,23 +87,21 @@ This repo has been bootstrapped with:
 - `spktool vm create`
 - `spktool init`
 
-`spktool` created the `.sandstorm/` project scaffold, but in this environment it did not emit a managed `sandstorm-pkgdef.capnp` file into `.sandstorm/`. The root-level [sandstorm-pkgdef.capnp](/home/michael/tmp/iroh-tunnel/sandstorm-pkgdef.capnp) is therefore a draft design artifact for now, not a generated source of truth.
+The active package definition is [`.sandstorm/sandstorm-pkgdef.capnp`](/home/michael/tmp/iroh-tunnel/.sandstorm/sandstorm-pkgdef.capnp). The app currently runs as a raw Sandstorm RPC server rather than an HTTP-bridge app.
 
 ## Documents
 
 - [ARCHITECTURE.md](/home/michael/tmp/iroh-tunnel/ARCHITECTURE.md)
 - [plan.md](/home/michael/tmp/iroh-tunnel/plan.md)
-- [sandstorm-pkgdef.capnp](/home/michael/tmp/iroh-tunnel/sandstorm-pkgdef.capnp)
+- [`.sandstorm/sandstorm-pkgdef.capnp`](/home/michael/tmp/iroh-tunnel/.sandstorm/sandstorm-pkgdef.capnp)
 
-## Recommended first milestone
+## Recommended next milestone
 
-Build the smallest vertical slice:
+1. Keep the raw `UiView` baseline stable.
+2. Replace the temporary `ApiSession` Powerbox query with the intended query model.
+3. Introduce app-owned object IDs and implement `MainView.restore()` / `drop()`.
+4. Add `iroh` node identity and manual pairing UI.
+5. Send one live capability over one `iroh` RPC connection.
+6. Re-export it on the remote side through app-managed persistent object IDs.
 
-1. Package a Rust app with `sandstorm-http-bridge` and `AppHooks`.
-2. Display a local `iroh` node ticket in the UI and allow manual peer ticket entry.
-3. Request one capability through the Powerbox.
-4. Save it locally.
-5. Send it over one live `iroh` connection using `capnp-rpc`.
-6. Re-export it on the remote side through `AppHooks.restore()`.
-
-If that works, the rest is mainly UX, persistence, and operational hardening.
+If that works, the rest is mostly persistence, UX, and operational hardening.

@@ -20,6 +20,7 @@ Reduce uncertainty before building the full app.
 ### Exit criteria
 
 - one capability can be claimed and saved
+- one saved capability can be restored again
 - one peer connection can be established
 - one live capability can cross the transport boundary
 
@@ -57,12 +58,14 @@ Let a user acquire and manage local capabilities.
 3. Add claim-token POST endpoint.
 4. Redeem and save capabilities server-side.
 5. Store metadata in the registry.
-6. Add list and enable/disable controls in the UI.
+6. Add restore probe against saved tokens.
+7. Add list and enable/disable controls in the UI.
 
 ### Exit criteria
 
 - user can add a capability
 - capability metadata is persisted
+- saved capability can be restored on demand
 - user can mark it for sharing
 
 ## Phase 3: peer connectivity
@@ -112,7 +115,7 @@ Make received capabilities available from the destination grain.
 
 ### Tasks
 
-1. Implement `AppHooks`.
+1. Introduce `MainView(AppObjectId)` as the persistent export surface.
 2. Define app object IDs for exported remote capabilities.
 3. Map received capability records to app object IDs.
 4. Implement `restore()` to return imported capabilities.
@@ -173,6 +176,7 @@ Validate the model under realistic grain lifecycle events.
 
 - Grain suspension may make the product feel less "tunnel-like" than expected.
 - Cap'n Proto RPC transport adaptation over `iroh` may need custom glue.
+- Empty Powerbox queries appear unreliable enough that typed queries may be required in practice.
 
 ### Low risk
 
@@ -180,7 +184,7 @@ Validate the model under realistic grain lifecycle events.
 
 ## Immediate next steps
 
-1. Bootstrap the Sandstorm package and Rust app.
-2. Keep the raw `UiView` smoke test passing while adding Sandstorm API calls.
-3. Build the first Powerbox intake path.
-4. Run an `iroh` transport spike before investing in full UI work.
+1. Keep the raw `UiView` baseline stable.
+2. Replace the temporary `ApiSession` query with the intended capability query model.
+3. Promote saved capability records into app object IDs for `restore()` / `drop()`.
+4. Run an `iroh` transport spike before building remote export plumbing.

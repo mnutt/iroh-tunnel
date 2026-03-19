@@ -6,76 +6,297 @@
     <title>Iroh Tunnel</title>
     <style>
       :root {
-        color-scheme: light;
-        --panel: #fffdf8;
-        --line: #d8cfbf;
-        --ink: #1f1f1f;
-        --muted: #6b655c;
-        --accent: #0f766e;
+        color-scheme: dark;
+        --bg: #171c29;
+        --panel: rgba(20, 25, 37, 0.82);
+        --line: rgba(224, 232, 255, 0.14);
+        --ink: #f3f6ff;
+        --muted: #9aa4c0;
+        --accent: #dfe7ff;
       }
       * { box-sizing: border-box; }
       body {
         margin: 0;
+        min-height: 100vh;
+        overflow-x: hidden;
         font-family: "Iowan Old Style", "Palatino Linotype", serif;
-        background:
-          radial-gradient(circle at top left, rgba(15, 118, 110, 0.14), transparent 28rem),
-          linear-gradient(180deg, #efe8dc 0%, #f9f5ee 100%);
+        background: var(--bg);
         color: var(--ink);
       }
+      body::before {
+        content: "";
+        position: fixed;
+        inset: 0;
+        background:
+          radial-gradient(circle at 12% 18%, rgba(255,255,255,0.92) 0 0.08rem, transparent 0.11rem),
+          radial-gradient(circle at 21% 74%, rgba(255,255,255,0.72) 0 0.07rem, transparent 0.1rem),
+          radial-gradient(circle at 37% 28%, rgba(255,255,255,0.9) 0 0.06rem, transparent 0.09rem),
+          radial-gradient(circle at 61% 17%, rgba(255,255,255,0.7) 0 0.08rem, transparent 0.11rem),
+          radial-gradient(circle at 82% 24%, rgba(255,255,255,0.96) 0 0.09rem, transparent 0.12rem),
+          radial-gradient(circle at 74% 82%, rgba(255,255,255,0.76) 0 0.07rem, transparent 0.1rem),
+          radial-gradient(circle at 51% 89%, rgba(255,255,255,0.85) 0 0.06rem, transparent 0.09rem),
+          radial-gradient(circle at 89% 66%, rgba(255,255,255,0.62) 0 0.08rem, transparent 0.11rem);
+        pointer-events: none;
+        opacity: 0.85;
+      }
+      body::after {
+        content: "";
+        position: fixed;
+        inset: 0;
+        background:
+          radial-gradient(circle at 58% 33%, transparent 0 3.5rem, rgba(236,242,255,0.13) 3.55rem 3.63rem, transparent 3.7rem 4.85rem, rgba(236,242,255,0.12) 4.9rem 4.98rem, transparent 5.06rem 6.5rem, rgba(236,242,255,0.1) 6.56rem 6.62rem, transparent 6.7rem 8.4rem, rgba(236,242,255,0.08) 8.47rem 8.53rem, transparent 8.6rem),
+          radial-gradient(ellipse at 58% 33%, rgba(5, 8, 16, 0.72) 0 9%, transparent 10%);
+        transform: rotate(-18deg);
+        pointer-events: none;
+        opacity: 0.7;
+      }
       main {
-        max-width: 56rem;
+        position: relative;
+        max-width: 64rem;
         margin: 0 auto;
-        padding: 3rem 1.25rem 4rem;
+        padding: 2rem 1.25rem 3rem;
       }
       h1 {
-        margin: 0 0 0.5rem;
-        font-size: clamp(2.5rem, 5vw, 4rem);
-        line-height: 0.95;
+        margin: 0 0 0.35rem;
+        font-size: clamp(2.3rem, 6vw, 4rem);
+        line-height: 0.94;
         letter-spacing: -0.04em;
       }
-      p { line-height: 1.5; }
+      h2 {
+        margin: 0 0 0.6rem;
+        font-size: 0.92rem;
+        letter-spacing: 0.06em;
+        text-transform: uppercase;
+      }
+      p, li { line-height: 1.55; }
       .eyebrow {
         display: inline-block;
-        padding: 0.35rem 0.65rem;
-        border-radius: 999px;
-        background: rgba(15, 118, 110, 0.12);
+        margin-bottom: 0.85rem;
         color: var(--accent);
-        font-weight: 700;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 0.12em;
+        font-size: 0.75rem;
       }
-      .grid {
+      .scene {
+        display: block;
+        min-height: 12rem;
+      }
+      .hero-copy {
+        position: relative;
+        z-index: 2;
+        max-width: 30rem;
+      }
+      .lede {
+        max-width: 28rem;
+        font-size: 0.98rem;
+        color: var(--muted);
+      }
+      .vortex-wrap {
+        position: relative;
+        display: none;
+      }
+      .cards {
         display: grid;
-        grid-template-columns: repeat(auto-fit, minmax(16rem, 1fr));
-        gap: 1rem;
-        margin-top: 2rem;
+        grid-template-columns: repeat(12, 1fr);
+        gap: 0.9rem;
+        margin-top: 1.4rem;
       }
       .panel {
         background: var(--panel);
         border: 1px solid var(--line);
-        border-radius: 1rem;
+        border-radius: 0.95rem;
         padding: 1rem;
+        backdrop-filter: blur(8px);
+      }
+      .panel-wide { grid-column: span 7; }
+      .panel-tall { grid-column: span 5; }
+      .panel-full { grid-column: 1 / -1; }
+      button {
+        border: 0;
+        border-radius: 999px;
+        padding: 0.72rem 1rem;
+        background: rgba(228, 235, 255, 0.92);
+        color: #101626;
+        font: inherit;
+        font-weight: 700;
+        cursor: pointer;
+      }
+      ul {
+        margin: 0;
+        padding-left: 1.1rem;
+      }
+      li + li {
+        margin-top: 0.8rem;
+      }
+      .status-line {
+        min-height: 1.5rem;
+        margin-top: 0.9rem;
+      }
+      .muted {
+        color: var(--muted);
+      }
+      .saved-row {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 0.5rem;
       }
       code {
         font-family: "Berkeley Mono", "SFMono-Regular", monospace;
-        font-size: 0.9em;
+        font-size: 0.84em;
+        word-break: break-all;
       }
-      .muted { color: var(--muted); }
+      @media (max-width: 860px) {
+        .cards {
+          grid-template-columns: 1fr;
+        }
+        .panel-wide,
+        .panel-tall,
+        .panel-full {
+          grid-column: auto;
+        }
+      }
     </style>
   </head>
   <body>
     <main>
-      <div class="eyebrow">Raw Sandstorm UiView active</div>
-      <h1>Iroh Tunnel</h1>
-      <p>This grain is serving its UI directly via raw Sandstorm <code>UiView</code> and <code>WebSession</code>.</p>
-      <div class="grid">
-        <section class="panel">
+      <section class="scene">
+        <div class="hero-copy">
+          <div class="eyebrow">Iroh Tunnel</div>
+          <h1>Wormhole Gate</h1>
+          <p class="lede">
+            Request Sandstorm capabilities, save them into the grain, and verify that they can be
+            restored on demand. This is the raw <code>UiView</code> baseline for the tunnel app.
+          </p>
+        </div>
+      </section>
+
+      <section class="cards">
+        <section class="panel panel-wide">
+          <h2>Powerbox Intake</h2>
+          <p class="muted">Temporarily requesting an <code>ApiSession</code> capability to validate the raw claim/save path.</p>
+          <button id="request-cap">Request Capability</button>
+          <p id="status" class="status-line muted"></p>
+        </section>
+        <section class="panel panel-tall">
           <h2>Status</h2>
-          <p>If this page renders, the raw RPC bootstrap path is working.</p>
+          <p class="muted">If this page renders, the raw Sandstorm RPC bootstrap is working.</p>
+          <p class="muted">Next steps are typed queries, restore hooks, and re-exporting remote capabilities.</p>
         </section>
-        <section class="panel">
-          <h2>Next</h2>
-          <p class="muted">Next step is reconnecting Powerbox request and raw claim/save flow.</p>
+        <section class="panel panel-full">
+          <h2>Saved Capabilities</h2>
+          <ul id="saved-caps"></ul>
         </section>
-      </div>
+      </section>
     </main>
+    <script>
+      const statusEl = document.getElementById("status");
+      const savedCapsEl = document.getElementById("saved-caps");
+      const requestButton = document.getElementById("request-cap");
+      const TEMP_QUERY = ["EAZQAQEAABEBF1EEAQH_x80lxnnjecgAAAA"];
+
+      function setStatus(text) {
+        statusEl.textContent = text;
+      }
+
+      function renderSavedCaps(items) {
+        savedCapsEl.innerHTML = "";
+        if (!items.length) {
+          const item = document.createElement("li");
+          item.textContent = "None yet.";
+          savedCapsEl.appendChild(item);
+          return;
+        }
+
+        for (const entry of items) {
+          const item = document.createElement("li");
+          item.className = "saved-row";
+          const label = document.createElement("span");
+          label.innerHTML = `${entry.label}: <code>${entry.savedToken}</code>`;
+          item.appendChild(label);
+
+          const button = document.createElement("button");
+          button.textContent = "Restore Probe";
+          button.addEventListener("click", async () => {
+            setStatus(`Restoring ${entry.savedToken}...`);
+            const response = await fetch("api/saved-cap/restore", {
+              method: "PUT",
+              headers: { "Content-Type": "text/plain" },
+              body: entry.savedToken,
+            });
+
+            if (response.ok) {
+              setStatus(`Restore succeeded for ${entry.savedToken}`);
+            } else {
+              setStatus(`Restore failed with HTTP ${response.status}`);
+            }
+          });
+          item.appendChild(button);
+          savedCapsEl.appendChild(item);
+        }
+      }
+
+      async function refreshState() {
+        const response = await fetch("api/state");
+        const data = await response.json();
+        renderSavedCaps(data.savedCaps || []);
+      }
+
+      requestButton.addEventListener("click", () => {
+        const rpcId = `iroh-tunnel-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+        setStatus("Waiting for Powerbox selection...");
+
+        const onMessage = async (event) => {
+          const message = event.data || {};
+          if (message.rpcId !== rpcId) return;
+          window.removeEventListener("message", onMessage, false);
+
+          if (message.error) {
+            setStatus(`Powerbox error: ${message.error}`);
+            return;
+          }
+
+          if (!message.token) {
+            setStatus("Powerbox returned no token.");
+            return;
+          }
+
+          setStatus("Claiming and saving capability...");
+          const claimResponse = await fetch("api/powerbox/claim", {
+            method: "POST",
+            headers: { "Content-Type": "text/plain" },
+            body: message.token,
+          });
+
+          if (!claimResponse.ok) {
+            setStatus(`Claim failed with HTTP ${claimResponse.status}.`);
+            return;
+          }
+
+          const result = await claimResponse.json();
+          if (!result.ok) {
+            setStatus("Claim failed.");
+            return;
+          }
+
+          setStatus(`Saved capability token: ${result.savedToken}`);
+          await refreshState();
+        };
+
+        window.addEventListener("message", onMessage, false);
+        window.parent.postMessage({
+          powerboxRequest: {
+            rpcId,
+            query: TEMP_QUERY,
+            saveLabel: { defaultText: "Powerbox capability" }
+          }
+        }, "*");
+      });
+
+      refreshState().catch((error) => {
+        setStatus(`Failed to load saved capabilities: ${error}`);
+      });
+    </script>
   </body>
 </html>

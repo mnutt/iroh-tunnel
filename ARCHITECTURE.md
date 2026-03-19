@@ -2,65 +2,80 @@
 
 ## Overview
 
-`iroh-tunnel` is a hybrid Sandstorm app:
+`iroh-tunnel` is currently a raw Sandstorm app:
 
-- a human-facing HTTP UI served behind `sandstorm-http-bridge`
-- a raw Cap'n Proto integration path to Sandstorm's local API socket
-- an `iroh` transport layer between paired grains
-- an app-managed registry of locally shared and remotely received capabilities
+- a human-facing browser UI served through raw `WebSession`
+- raw Cap'n Proto integration with the grain's bootstrapped supervisor capabilities
+- a future `iroh` transport layer between paired grains
+- an app-managed registry of locally saved and remotely received capabilities
 
-The app should not attempt to encode arbitrary interface semantics itself. Instead, it should transport live capabilities using Cap'n Proto RPC over an `iroh` stream.
+The app should not attempt to encode arbitrary interface semantics itself. It should transport live capabilities using Cap'n Proto RPC over an `iroh` stream.
 
-## Why hybrid instead of raw-only
+## Current architecture
 
-The UI is simpler to build as a normal web app. The capability operations are not. Sandstorm's Powerbox, session context, durable capability handling, and application hooks all require raw Cap'n Proto access. A hybrid design keeps the UI simple while preserving full Sandstorm capability support.
+### 1. Raw UiView / WebSession server
 
-## Components
-
-### 1. HTTP UI server
+The grain boots directly as a raw Sandstorm RPC server on fd `3`.
 
 Responsibilities:
 
-- render tunnel status
-- show local node identity and pairing ticket
-- accept a remote ticket
+- serve packaged browser assets from `/opt/app/client`
+- render status and saved capability state
 - start Powerbox requests from browser JS
-- list capabilities being shared
-- list capabilities received from the remote grain
+- receive request tokens back through the grain's own HTTP surface
+- trigger save and restore probes through Sandstorm
 
-The UI should be intentionally small. It only orchestrates user actions and shows state.
+This path is already working.
 
-### 2. Sandstorm API bridge client
+### 2. Sandstorm session/supervisor integration
 
-This component connects to `/tmp/sandstorm-api` and speaks the raw interfaces exposed by `sandstorm-http-bridge`.
+Each browser session receives:
+
+- the bootstrapped `SandstormApi`
+- a per-session `SessionContext`
 
 Responsibilities:
 
-- fetch `SandstormApi`
-- fetch `SessionContext`
 - claim Powerbox request tokens
-- save and restore durable local capabilities
-- support receiving Powerbox offers if needed later
+- save durable local capabilities
+- restore saved capabilities by token
+- later request privileged networking capabilities if needed
 
-This component is also where the app eventually requests special capabilities like network access.
+The current implementation keeps the bootstrapped `SandstormApi` on `UiViewImpl` and clones the session `SessionContext` into each `WebSessionImpl`.
 
-For networking, the current assumption should be:
+### 3. Saved capability registry
 
-- request `IpNetwork` for outbound peer connectivity
-- evaluate whether `IpInterface` is required for inbound UDP listener behavior
-- treat both as privileged Powerbox requests likely requiring server-admin approval
+The app persists a simple registry under `/var/iroh-tunnel`.
 
-### 3. AppHooks server
+Current record shape:
 
-The app should set `bridgeConfig.expectAppHooks = true` and provide an `AppHooks` bootstrap object.
+- `id`
+- `label`
+- `saved_token`
+- `created_at_ms`
+
+Current storage:
+
+- [saved-caps.tsv](/var/iroh-tunnel/saved-caps.tsv) at runtime
+
+This registry is intentionally small but already shaped to evolve into app-managed persistent object IDs.
+
+## Next Sandstorm step
+
+### MainView-backed persistent exports
+
+The next major Sandstorm milestone is to extend the current bootstrap to support app-managed persistent exports through `MainView(AppObjectId)`.
 
 Responsibilities:
 
-- implement `getViewInfo()`
-- implement `restore(objectId)` for app-exported objects
-- implement `drop(objectId)`
+- define stable app object IDs
+- map saved and received capabilities onto those IDs
+- implement `restore(objectId)` for app-exported capabilities
+- implement `drop(objectId)` cleanup
 
-This is the mechanism that allows the grain to expose capabilities backed by app-managed object IDs. It is the critical piece for re-exporting remote capabilities into the local Sandstorm environment.
+This is the critical piece for re-exporting remote capabilities into the local Sandstorm environment.
+
+## Future transport components
 
 ### 4. Iroh endpoint manager
 
@@ -74,34 +89,7 @@ Responsibilities:
 
 State should be written under `/var`. Identity and pairing state must survive restarts.
 
-### 5. Capability registry
-
-This is the app's durable metadata layer.
-
-It should track:
-
-- locally claimed capabilities that the user chose to share
-- remotely received capabilities that are currently available
-- stable app object IDs used by `AppHooks.restore()`
-- labels and UI metadata
-- whether a capability is enabled for export
-
-Suggested records:
-
-- `shared_caps`
-  - `share_id`
-  - `label`
-  - `descriptor_summary`
-  - `local_object_id`
-  - `enabled`
-- `received_caps`
-  - `remote_share_id`
-  - `label`
-  - `local_export_object_id`
-  - `last_seen_connection`
-  - `status`
-
-### 6. Cap'n Proto RPC session over iroh
+### 5. Cap'n Proto RPC session over iroh
 
 This is the actual tunnel.
 
@@ -115,17 +103,45 @@ Proposed model:
 
 This is preferable to inventing a custom proxy protocol because Cap'n Proto RPC already models capability references, pipelining, method calls, and cancellation.
 
+### 6. Remote capability registry
+
+This is the durable metadata layer for exported/imported capabilities.
+
+Suggested records:
+
+- `shared_caps`
+  - `id`
+  - `label`
+  - `saved_token`
+  - `descriptor_summary`
+  - `local_object_id`
+  - `enabled`
+  - `created_at`
+- `received_caps`
+  - `remote_share_id`
+  - `label`
+  - `local_export_object_id`
+  - `last_seen_connection`
+  - `status`
+
 ## Data flow
 
-### Local share flow
+### Local save flow
 
-1. User clicks "Request capability".
+1. User clicks `Request Capability`.
 2. Browser sends a Powerbox request via `window.parent.postMessage(...)`.
 3. Sandstorm returns a claim token.
-4. Browser POSTs the token to the app.
-5. App redeems the token using the session ID and raw bridge API.
-6. App stores metadata and a durable object reference for the chosen capability.
-7. App marks the capability as shareable over the tunnel.
+4. Browser POSTs the token to the grain.
+5. App redeems the token using the current session's `SessionContext`.
+6. App saves the returned capability using `SandstormApi.save()`.
+7. App writes registry metadata and the durable save token to `/var`.
+
+### Local restore probe flow
+
+1. User selects a saved capability in the UI.
+2. Browser sends the saved token back to the grain.
+3. App decodes the token and calls `SandstormApi.restore()`.
+4. Success proves the durable token is still usable.
 
 ### Remote export flow
 
@@ -133,7 +149,7 @@ This is preferable to inventing a custom proxy protocol because Cap'n Proto RPC 
 2. Local grain exports enabled capabilities into the RPC connection.
 3. Remote grain imports those capabilities and records them in `received_caps`.
 4. Remote grain maps each imported capability to a local app object ID.
-5. When Sandstorm asks `AppHooks.restore(objectId)`, the app returns the imported live capability.
+5. When Sandstorm asks `MainView.restore(objectId)`, the app returns the imported live capability.
 
 ### Local consumption flow
 
@@ -176,32 +192,23 @@ Therefore:
 
 The first version should not promise always-on transport.
 
+## Current proven baseline
+
+The following are already demonstrated in this repo:
+
+1. packaged grain boots as a raw `UiView` / `WebSession`
+2. packaged browser assets render through that raw session
+3. browser `postMessage` Powerbox request returns a token
+4. server-side `claimRequest()` works
+5. `SandstormApi.save()` persists the selected capability
+6. `SandstormApi.restore()` can probe the persisted token later
+
 ## Open questions
 
 1. Is `IpNetwork` alone enough for `iroh`, or does practical operation inside Sandstorm also require `IpInterface` for inbound UDP?
-2. Can an empty Powerbox query be used to present a generic "pick any capability" flow?
+2. What is the cleanest query model for the “pick a capability” UX: empty queries, typed queries, or a curated set?
 3. What is the cleanest UX for exposing a received capability back into Sandstorm: direct app object links, offers, or both?
 4. Do we need relay-only `iroh` mode as a compatibility fallback if direct UDP is unavailable?
-
-## Recommended repo layout
-
-Once implementation starts:
-
-```text
-src/
-  main.rs
-  http/
-  sandstorm/
-  app_hooks/
-  iroh_transport/
-  registry/
-  rpc_bridge/
-static/
-templates/
-capnp/
-.sandstorm/
-  box.toml
-```
 
 ## Feasibility gates
 
@@ -210,4 +217,4 @@ Do not commit to the full app until these are proven:
 1. packaged grain can obtain the required Sandstorm networking capability
 2. `iroh` can connect acceptably inside that sandbox
 3. `capnp-rpc` works over the chosen `iroh` stream abstraction
-4. a received capability can be re-exported via `AppHooks.restore()`
+4. a received capability can be re-exported via `MainView.restore()`
