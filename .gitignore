@@ -1,0 +1,9 @@
+.codex/skills/sandstorm-app-author/
+.claude/skills/sandstorm-app-author/
+NvVars
+
+
+# Added by cargo
+
+/target
+/bin

@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Iroh Tunnel</title>
+    <style>
+      :root {
+        color-scheme: light;
+        --panel: #fffdf8;
+        --line: #d8cfbf;
+        --ink: #1f1f1f;
+        --muted: #6b655c;
+        --accent: #0f766e;
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        font-family: "Iowan Old Style", "Palatino Linotype", serif;
+        background:
+          radial-gradient(circle at top left, rgba(15, 118, 110, 0.14), transparent 28rem),
+          linear-gradient(180deg, #efe8dc 0%, #f9f5ee 100%);
+        color: var(--ink);
+      }
+      main {
+        max-width: 56rem;
+        margin: 0 auto;
+        padding: 3rem 1.25rem 4rem;
+      }
+      h1 {
+        margin: 0 0 0.5rem;
+        font-size: clamp(2.5rem, 5vw, 4rem);
+        line-height: 0.95;
+        letter-spacing: -0.04em;
+      }
+      p { line-height: 1.5; }
+      .eyebrow {
+        display: inline-block;
+        padding: 0.35rem 0.65rem;
+        border-radius: 999px;
+        background: rgba(15, 118, 110, 0.12);
+        color: var(--accent);
+        font-weight: 700;
+      }
+      .grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(16rem, 1fr));
+        gap: 1rem;
+        margin-top: 2rem;
+      }
+      .panel {
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 1rem;
+        padding: 1rem;
+      }
+      code {
+        font-family: "Berkeley Mono", "SFMono-Regular", monospace;
+        font-size: 0.9em;
+      }
+      .muted { color: var(--muted); }
+    </style>
+  </head>
+  <body>
+    <main>
+      <div class="eyebrow">Raw Sandstorm UiView active</div>
+      <h1>Iroh Tunnel</h1>
+      <p>This grain is serving its UI directly via raw Sandstorm <code>UiView</code> and <code>WebSession</code>.</p>
+      <div class="grid">
+        <section class="panel">
+          <h2>Status</h2>
+          <p>If this page renders, the raw RPC bootstrap path is working.</p>
+        </section>
+        <section class="panel">
+          <h2>Next</h2>
+          <p class="muted">Next step is reconnecting Powerbox request and raw claim/save flow.</p>
+        </section>
+      </div>
+    </main>
+  </body>
+</html>

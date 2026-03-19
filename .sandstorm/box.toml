@@ -1,0 +1,15 @@
+stack = "diy"
+
+[network.sandstorm]
+host = "local.sandstorm.io"
+guest_port = 6090
+external_port = 6090
+localhost_only = true
+
+[providers.vagrant]
+box = "debian/bookworm64"
+
+[providers.lima]
+arch = "x86_64"
+image = "https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-genericcloud-amd64.qcow2"
+image_arch = "x86_64"
