@@ -180,9 +180,10 @@
           <p id="status" class="status-line muted"></p>
         </section>
         <section class="panel panel-tall">
-          <h2>Status</h2>
+          <h2>Node Identity</h2>
           <p class="muted">If this page renders, the raw Sandstorm RPC bootstrap is working.</p>
-          <p class="muted">Next steps are typed queries, restore hooks, and re-exporting remote capabilities.</p>
+          <p class="muted">Local iroh node id:</p>
+          <p><code id="node-id">loading…</code></p>
         </section>
         <section class="panel panel-full">
           <h2>Saved Capabilities</h2>
@@ -193,6 +194,7 @@
     <script>
       const statusEl = document.getElementById("status");
       const savedCapsEl = document.getElementById("saved-caps");
+      const nodeIdEl = document.getElementById("node-id");
       const requestButton = document.getElementById("request-cap");
       const TEMP_QUERY = ["EAZQAQEAABEBF1EEAQH_x80lxnnjecgAAAA"];
 
@@ -233,6 +235,25 @@
             }
           });
           item.appendChild(button);
+
+          const objectButton = document.createElement("button");
+          objectButton.textContent = "Object Probe";
+          objectButton.addEventListener("click", async () => {
+            const objectId = entry.objectId || entry.id;
+            setStatus(`Resolving object ${objectId}...`);
+            const response = await fetch("api/saved-cap/resolve-object", {
+              method: "PUT",
+              headers: { "Content-Type": "text/plain" },
+              body: objectId,
+            });
+
+            if (response.ok) {
+              setStatus(`Object restore succeeded for ${objectId}`);
+            } else {
+              setStatus(`Object restore failed with HTTP ${response.status}`);
+            }
+          });
+          item.appendChild(objectButton);
           savedCapsEl.appendChild(item);
         }
       }
@@ -240,6 +261,7 @@
       async function refreshState() {
         const response = await fetch("api/state");
         const data = await response.json();
+        nodeIdEl.textContent = data.irohNodeId || "unavailable";
         renderSavedCaps(data.savedCaps || []);
       }
 

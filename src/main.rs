@@ -8,6 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use capnp::text;
 use capnp::capability::Promise;
 use capnp::traits::HasTypeId;
+use iroh::SecretKey;
 use capnp_rpc::{new_client, pry, rpc_twoparty_capnp, twoparty, RpcSystem};
 use futures::AsyncReadExt;
 use futures::TryFutureExt;
@@ -17,6 +18,7 @@ use tokio_util::compat::TokioAsyncReadCompatExt;
 const CLIENT_ROOT: &str = "/opt/app/client";
 const STATE_DIR: &str = "/var/iroh-tunnel";
 const SAVED_CAPS_PATH: &str = "/var/iroh-tunnel/saved-caps.tsv";
+const IROH_SECRET_KEY_PATH: &str = "/var/iroh-tunnel/iroh-secret-key";
 const WEB_SESSION_TYPE_ID: u64 = web_session_capnp::web_session::Client::TYPE_ID;
 
 fn main() {
@@ -380,11 +382,59 @@ impl web_session_capnp::web_session::Server for WebSessionImpl {
         }
 
         if path != "api/saved-cap/restore" {
+            if path == "api/saved-cap/resolve-object" {
+                let body = pry!(params.get_content()).get_content().unwrap_or(&[]).to_vec();
+                let object_id = match std::str::from_utf8(&body) {
+                    Ok(value) => value.trim().to_string(),
+                    Err(err) => {
+                        let mut error = results.get().init_client_error();
+                        let description =
+                            format!("<!doctype html><title>Bad Request</title><p>{err}</p>");
+                        error.set_status_code(
+                            web_session_capnp::web_session::response::ClientErrorCode::BadRequest,
+                        );
+                        error.set_description_html(description.as_str().into());
+                        return Promise::ok(());
+                    }
+                };
+
+                let saved_cap = match load_saved_capability_by_id(&object_id) {
+                    Ok(Some(saved_cap)) => saved_cap,
+                    Ok(None) => {
+                        let mut error = results.get().init_client_error();
+                        error.set_status_code(
+                            web_session_capnp::web_session::response::ClientErrorCode::NotFound,
+                        );
+                        return Promise::ok(());
+                    }
+                    Err(err) => return Promise::err(capnp::Error::failed(err)),
+                };
+
+                let sandstorm_api = self.sandstorm_api.clone();
+                return Promise::from_future(async move {
+                    let outcome = restore_saved_capability(sandstorm_api, &saved_cap.saved_token).await;
+                    match outcome {
+                        Ok(()) => {
+                            results.get().init_no_content();
+                        }
+                        Err(err) => {
+                            let mut error = results.get().init_server_error();
+                            let description = format!(
+                                "<!doctype html><title>Resolve Failed</title><pre>{}</pre>",
+                                escape_html(&err)
+                            );
+                            error.set_description_html(description.as_str().into());
+                        }
+                    }
+                    Ok(())
+                });
+            } else {
             let mut error = results.get().init_client_error();
             error.set_status_code(
                 web_session_capnp::web_session::response::ClientErrorCode::NotFound,
             );
             return Promise::ok(());
+            }
         }
 
         let body = pry!(params.get_content()).get_content().unwrap_or(&[]).to_vec();
@@ -563,6 +613,7 @@ async fn restore_saved_capability(
 }
 
 fn render_state_json() -> Result<String, String> {
+    let identity = load_or_create_iroh_identity()?;
     let mut rows = Vec::new();
     for row in load_saved_capabilities()? {
         rows.push(format!(
@@ -574,7 +625,11 @@ fn render_state_json() -> Result<String, String> {
             row.created_at_ms
         ));
     }
-    Ok(format!("{{\"savedCaps\":[{}]}}", rows.join(",")))
+    Ok(format!(
+        "{{\"irohNodeId\":\"{}\",\"savedCaps\":[{}]}}",
+        json_escape(&identity.node_id),
+        rows.join(",")
+    ))
 }
 
 fn load_saved_capabilities() -> Result<Vec<SavedCapability>, String> {
@@ -712,4 +767,55 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis() as u64)
         .unwrap_or(0)
+}
+
+fn load_or_create_iroh_identity() -> Result<IrohIdentity, String> {
+    std::fs::create_dir_all(STATE_DIR)
+        .map_err(|err| format!("failed to create state directory: {err}"))?;
+
+    let secret_key = match std::fs::read(IROH_SECRET_KEY_PATH) {
+        Ok(bytes) => {
+            if bytes.len() != 32 {
+                return Err(format!(
+                    "invalid iroh secret key length at {}: expected 32 bytes, got {}",
+                    IROH_SECRET_KEY_PATH,
+                    bytes.len()
+                ));
+            }
+            let mut raw = [0u8; 32];
+            raw.copy_from_slice(&bytes);
+            SecretKey::from_bytes(&raw)
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            let mut raw = [0u8; 32];
+            fill_random(&mut raw)?;
+            let secret_key = SecretKey::from_bytes(&raw);
+            std::fs::write(IROH_SECRET_KEY_PATH, raw)
+                .map_err(|err| format!("failed to persist iroh secret key: {err}"))?;
+            secret_key
+        }
+        Err(err) => {
+            return Err(format!(
+                "failed to read iroh secret key from {}: {err}",
+                IROH_SECRET_KEY_PATH
+            ))
+        }
+    };
+
+    Ok(IrohIdentity {
+        node_id: secret_key.public().to_string(),
+    })
+}
+
+fn fill_random(out: &mut [u8]) -> Result<(), String> {
+    use std::io::Read as _;
+
+    let mut file = std::fs::File::open("/dev/urandom")
+        .map_err(|err| format!("failed to open /dev/urandom: {err}"))?;
+    file.read_exact(out)
+        .map_err(|err| format!("failed to read random bytes: {err}"))
+}
+
+struct IrohIdentity {
+    node_id: String,
 }
