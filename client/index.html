@@ -157,6 +157,14 @@
         font: inherit;
         resize: vertical;
       }
+      input {
+        border: 1px solid var(--line);
+        border-radius: 999px;
+        padding: 0.72rem 1rem;
+        background: rgba(20, 25, 37, 0.82);
+        color: var(--ink);
+        font: inherit;
+      }
       .button-row {
         display: flex;
         flex-wrap: wrap;
@@ -195,8 +203,11 @@
       <section class="cards">
         <section class="panel panel-wide">
           <h2>Powerbox Intake</h2>
-          <p class="muted">Temporarily requesting an <code>ApiSession</code> capability to validate the raw claim/save path.</p>
-          <button id="request-cap">Request Capability</button>
+          <p class="muted">Request a known-good <code>ApiSession</code> capability or ask Sandstorm for raw outbound networking via <code>IpNetwork</code>.</p>
+          <div class="button-row">
+            <button id="request-cap">Request Capability</button>
+            <button id="request-ip-network">Request IP Network</button>
+          </div>
           <p id="status" class="status-line muted"></p>
         </section>
         <section class="panel panel-tall">
@@ -210,19 +221,65 @@
           <p><code id="endpoint-status">loading…</code></p>
         </section>
         <section class="panel panel-full">
+          <h2>Transport Assessment</h2>
+          <p id="transport-assessment" class="muted">loading…</p>
+        </section>
+        <section class="panel panel-full">
           <h2>Pairing</h2>
           <div class="stack">
-            <p class="muted">Paste a remote endpoint ticket or node-address blob here. For now this is persistent pairing state only; no live dial attempt happens yet.</p>
+            <p class="muted">Copy the local ticket from one grain into the remote ticket field of the other. The probe path uses one echo round trip over a real <code>iroh</code> connection.</p>
+            <textarea id="local-ticket" spellcheck="false" readonly></textarea>
             <textarea id="remote-ticket" spellcheck="false" placeholder="Remote node ticket"></textarea>
             <div class="button-row">
               <button id="save-ticket">Save Remote Ticket</button>
               <button id="clear-ticket">Clear Remote Ticket</button>
+              <button id="probe-ticket">Probe Connection</button>
             </div>
           </div>
         </section>
         <section class="panel panel-full">
           <h2>Saved Capabilities</h2>
+          <div class="stack">
+            <p class="muted">Capability-gated HTTP probe target.</p>
+            <div class="button-row">
+              <input id="network-probe-host" type="text" value="neverssl.com" placeholder="Host">
+              <input id="network-probe-port" type="number" value="80" min="1" max="65535" placeholder="Port">
+              <input id="network-probe-path" type="text" value="/" placeholder="Path">
+            </div>
+            <p class="muted">Raw TCP probe target and payload.</p>
+            <div class="button-row">
+              <input id="tcp-probe-host" type="text" value="neverssl.com" placeholder="Host">
+              <input id="tcp-probe-port" type="number" value="80" min="1" max="65535" placeholder="Port">
+            </div>
+            <textarea id="tcp-probe-payload" spellcheck="false">GET / HTTP/1.0
+Host: neverssl.com
+
+</textarea>
+            <p class="muted">Generic binary exchange target. Request and response payloads are base64-encoded so this can drive non-text experiments.</p>
+            <div class="button-row">
+              <input id="exchange-host" type="text" value="neverssl.com" placeholder="Host">
+              <input id="exchange-port" type="number" value="80" min="1" max="65535" placeholder="Port">
+            </div>
+            <textarea id="exchange-payload" spellcheck="false">R0VUIC8gSFRUUC8xLjANCkhvc3Q6IG5ldmVyc3NsLmNvbQ0KDQo=</textarea>
+            <p class="muted">UDP probe target. Payload is base64-encoded and the app waits for one return packet delivered through Sandstorm's <code>UdpPort</code> callback path.</p>
+            <div class="button-row">
+              <input id="udp-probe-host" type="text" value="1.1.1.1" placeholder="Host">
+              <input id="udp-probe-port" type="number" value="53" min="1" max="65535" placeholder="Port">
+              <input id="udp-probe-wait" type="number" value="1000" min="0" placeholder="Wait ms">
+            </div>
+            <textarea id="udp-probe-payload" spellcheck="false">AAABAAABAAAAAAAAB2V4YW1wbGUDY29tAAABAAE=</textarea>
+            <p class="muted">Stateful TCP session target and payload. Payloads use base64 so you can send partial frames without the one-shot exchange closing the stream.</p>
+            <div class="button-row">
+              <input id="session-host" type="text" value="neverssl.com" placeholder="Host">
+              <input id="session-port" type="number" value="80" min="1" max="65535" placeholder="Port">
+              <input id="session-read-max" type="number" value="4096" min="1" placeholder="Read bytes">
+              <input id="session-read-wait" type="number" value="250" min="0" placeholder="Wait ms">
+            </div>
+            <textarea id="session-payload" spellcheck="false">R0VUIC8gSFRUUC8xLjANCkhvc3Q6IG5ldmVyc3NsLmNvbQ0KDQo=</textarea>
+          </div>
           <ul id="saved-caps"></ul>
+          <h2>Active TCP Sessions</h2>
+          <ul id="active-tcp-sessions"></ul>
         </section>
       </section>
     </main>
@@ -232,14 +289,157 @@
       const nodeIdEl = document.getElementById("node-id");
       const endpointAddrsEl = document.getElementById("endpoint-addrs");
       const endpointStatusEl = document.getElementById("endpoint-status");
+      const transportAssessmentEl = document.getElementById("transport-assessment");
+      const localTicketEl = document.getElementById("local-ticket");
       const remoteTicketEl = document.getElementById("remote-ticket");
       const requestButton = document.getElementById("request-cap");
+      const requestIpNetworkButton = document.getElementById("request-ip-network");
       const saveTicketButton = document.getElementById("save-ticket");
       const clearTicketButton = document.getElementById("clear-ticket");
-      const TEMP_QUERY = ["EAZQAQEAABEBF1EEAQH_x80lxnnjecgAAAA"];
+      const probeTicketButton = document.getElementById("probe-ticket");
+      const networkProbeHostEl = document.getElementById("network-probe-host");
+      const networkProbePortEl = document.getElementById("network-probe-port");
+      const networkProbePathEl = document.getElementById("network-probe-path");
+      const tcpProbeHostEl = document.getElementById("tcp-probe-host");
+      const tcpProbePortEl = document.getElementById("tcp-probe-port");
+      const tcpProbePayloadEl = document.getElementById("tcp-probe-payload");
+      const exchangeHostEl = document.getElementById("exchange-host");
+      const exchangePortEl = document.getElementById("exchange-port");
+      const exchangePayloadEl = document.getElementById("exchange-payload");
+      const udpProbeHostEl = document.getElementById("udp-probe-host");
+      const udpProbePortEl = document.getElementById("udp-probe-port");
+      const udpProbeWaitEl = document.getElementById("udp-probe-wait");
+      const udpProbePayloadEl = document.getElementById("udp-probe-payload");
+      const sessionHostEl = document.getElementById("session-host");
+      const sessionPortEl = document.getElementById("session-port");
+      const sessionReadMaxEl = document.getElementById("session-read-max");
+      const sessionReadWaitEl = document.getElementById("session-read-wait");
+      const sessionPayloadEl = document.getElementById("session-payload");
+      const activeTcpSessionsEl = document.getElementById("active-tcp-sessions");
+      let powerboxQueries = {
+        apiSession: "",
+        ipNetwork: "",
+      };
 
       function setStatus(text) {
         statusEl.textContent = text;
+      }
+
+      function previewBase64Payload(base64Value) {
+        try {
+          const text = atob(base64Value);
+          return text.split("\n").slice(0, 12).join("\n");
+        } catch {
+          return "(non-text payload)";
+        }
+      }
+
+      async function fetchWithTimeout(url, options, timeoutMs) {
+        const controller = new AbortController();
+        const timeoutId = window.setTimeout(() => controller.abort(), timeoutMs);
+        try {
+          return await fetch(url, { ...options, signal: controller.signal });
+        } finally {
+          window.clearTimeout(timeoutId);
+        }
+      }
+
+      function renderActiveTcpSessions(items) {
+        activeTcpSessionsEl.innerHTML = "";
+        if (!items.length) {
+          const item = document.createElement("li");
+          item.textContent = "None yet.";
+          activeTcpSessionsEl.appendChild(item);
+          return;
+        }
+
+        for (const entry of items) {
+          const item = document.createElement("li");
+          item.className = "saved-row";
+          const label = document.createElement("span");
+          label.innerHTML = `<code>${entry.sessionId}</code> <span class="muted">${entry.host}:${entry.port}</span> <span class="muted">buffered</span> <code>${entry.bufferedBytes}</code> <span class="muted">received</span> <code>${entry.receivedBytes}</code> <span class="muted">done</span> <code>${entry.done}</code>`;
+          item.appendChild(label);
+
+          const sendButton = document.createElement("button");
+          sendButton.textContent = "Send Chunk";
+          sendButton.disabled = !!entry.done;
+          sendButton.addEventListener("click", async () => {
+            if (entry.done) {
+              setStatus(`TCP session ${entry.sessionId} is already closed by the remote side.`);
+              return;
+            }
+            const payload = (sessionPayloadEl.value || "").trim();
+            setStatus(`Sending ${entry.sessionId} payload...`);
+            const response = await fetch("api/network/session/send", {
+              method: "POST",
+              headers: { "Content-Type": "text/plain" },
+              body: `${entry.sessionId}\n${payload}`,
+            });
+
+            if (!response.ok) {
+              const body = await response.text();
+              const text = body.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+              setStatus(`TCP session send failed with HTTP ${response.status}: ${text}`);
+              return;
+            }
+
+            const result = await response.json();
+            setStatus(`TCP session ${result.sessionId} sent ${result.bytesSent} bytes [${result.trace}]`);
+            await refreshState();
+          });
+          item.appendChild(sendButton);
+
+          const receiveButton = document.createElement("button");
+          receiveButton.textContent = "Read Chunk";
+          receiveButton.addEventListener("click", async () => {
+            const maxBytes = (sessionReadMaxEl.value || "").trim() || "4096";
+            const waitMs = (sessionReadWaitEl.value || "").trim() || "250";
+            setStatus(`Reading ${entry.sessionId}...`);
+            const response = await fetch("api/network/session/receive", {
+              method: "POST",
+              headers: { "Content-Type": "text/plain" },
+              body: `${entry.sessionId}\n${maxBytes}\n${waitMs}`,
+            });
+
+            if (!response.ok) {
+              const body = await response.text();
+              const text = body.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+              setStatus(`TCP session receive failed with HTTP ${response.status}: ${text}`);
+              return;
+            }
+
+            const result = await response.json();
+            const preview = previewBase64Payload(result.responseBase64);
+            setStatus(`TCP session ${result.sessionId} read ${result.responseByteCount} bytes: ${preview} [${result.trace}]`);
+            await refreshState();
+          });
+          item.appendChild(receiveButton);
+
+          const closeButton = document.createElement("button");
+          closeButton.textContent = "Close Session";
+          closeButton.addEventListener("click", async () => {
+            setStatus(`Closing ${entry.sessionId}...`);
+            const response = await fetch("api/network/session/close", {
+              method: "POST",
+              headers: { "Content-Type": "text/plain" },
+              body: entry.sessionId,
+            });
+
+            if (!response.ok) {
+              const body = await response.text();
+              const text = body.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+              setStatus(`TCP session close failed with HTTP ${response.status}: ${text}`);
+              return;
+            }
+
+            const result = await response.json();
+            setStatus(`TCP session ${result.sessionId} closed [${result.trace}]`);
+            await refreshState();
+          });
+          item.appendChild(closeButton);
+
+          activeTcpSessionsEl.appendChild(item);
+        }
       }
 
       function renderSavedCaps(items) {
@@ -294,6 +494,151 @@
             }
           });
           item.appendChild(objectButton);
+
+          const networkButton = document.createElement("button");
+          networkButton.textContent = "IP Network Probe";
+          networkButton.addEventListener("click", async () => {
+            const host = (networkProbeHostEl.value || "").trim() || "neverssl.com";
+            const port = (networkProbePortEl.value || "").trim() || "80";
+            const path = (networkProbePathEl.value || "").trim() || "/";
+            setStatus(`Running IP network probe for ${entry.savedToken} to ${host}:${port}${path}...`);
+            const response = await fetch("api/network/http-probe", {
+              method: "POST",
+              headers: { "Content-Type": "text/plain" },
+              body: `${entry.savedToken}\n${host}\n${port}\n${path}`,
+            });
+
+            if (!response.ok) {
+              const body = await response.text();
+              const text = body.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+              setStatus(`IP network probe failed with HTTP ${response.status}: ${text}`);
+              return;
+            }
+
+            const result = await response.json();
+            setStatus(`IP network probe to ${result.host}:${result.port}${result.path} succeeded: ${result.responsePreview} [${result.trace}]`);
+          });
+          item.appendChild(networkButton);
+
+          const tcpButton = document.createElement("button");
+          tcpButton.textContent = "TCP Byte Probe";
+          tcpButton.addEventListener("click", async () => {
+            const host = (tcpProbeHostEl.value || "").trim() || "neverssl.com";
+            const port = (tcpProbePortEl.value || "").trim() || "80";
+            const payload = tcpProbePayloadEl.value || "";
+            setStatus(`Running TCP byte probe for ${entry.savedToken} to ${host}:${port}...`);
+            const response = await fetch("api/network/tcp-probe", {
+              method: "POST",
+              headers: { "Content-Type": "text/plain" },
+              body: `${entry.savedToken}\n${host}\n${port}\n\n${payload}`,
+            });
+
+            if (!response.ok) {
+              const body = await response.text();
+              const text = body.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+              setStatus(`TCP byte probe failed with HTTP ${response.status}: ${text}`);
+              return;
+            }
+
+            const result = await response.json();
+            setStatus(`TCP byte probe to ${result.host}:${result.port} returned ${result.responseByteCount} bytes: ${result.responsePreview} [${result.trace}]`);
+          });
+          item.appendChild(tcpButton);
+
+          const exchangeButton = document.createElement("button");
+          exchangeButton.textContent = "Binary Exchange";
+          exchangeButton.addEventListener("click", async () => {
+            const host = (exchangeHostEl.value || "").trim() || "neverssl.com";
+            const port = (exchangePortEl.value || "").trim() || "80";
+            const payload = (exchangePayloadEl.value || "").trim();
+            setStatus(`Running binary exchange for ${entry.savedToken} to ${host}:${port}...`);
+            const response = await fetch("api/network/exchange", {
+              method: "POST",
+              headers: { "Content-Type": "text/plain" },
+              body: `${entry.savedToken}\n${host}\n${port}\n${payload}`,
+            });
+
+            if (!response.ok) {
+              const body = await response.text();
+              const text = body.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+              setStatus(`Binary exchange failed with HTTP ${response.status}: ${text}`);
+              return;
+            }
+
+            const result = await response.json();
+            const preview = previewBase64Payload(result.responseBase64);
+            setStatus(`Binary exchange to ${result.host}:${result.port} returned ${result.responseByteCount} bytes: ${preview} [${result.trace}]`);
+          });
+          item.appendChild(exchangeButton);
+
+          const udpButton = document.createElement("button");
+          udpButton.textContent = "UDP Probe";
+          udpButton.addEventListener("click", async () => {
+            const host = (udpProbeHostEl.value || "").trim() || "1.1.1.1";
+            const port = (udpProbePortEl.value || "").trim() || "53";
+            const waitMs = (udpProbeWaitEl.value || "").trim() || "1000";
+            const payload = (udpProbePayloadEl.value || "").trim();
+            setStatus(`Running UDP probe for ${entry.savedToken} to ${host}:${port}...`);
+            let response;
+            try {
+              response = await fetchWithTimeout("api/network/udp-probe", {
+                method: "POST",
+                headers: { "Content-Type": "text/plain" },
+                body: `${entry.savedToken}\n${host}\n${port}\n${payload}\n${waitMs}`,
+              }, Number(waitMs) + 4000);
+            } catch (error) {
+              if (error.name === "AbortError") {
+                setStatus(`UDP probe client timeout after ${Number(waitMs) + 4000}ms`);
+                return;
+              }
+              setStatus(`UDP probe request failed: ${error}`);
+              return;
+            }
+
+            if (!response.ok) {
+              const body = await response.text();
+              const text = body.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+              setStatus(`UDP probe failed with HTTP ${response.status}: ${text}`);
+              return;
+            }
+
+            let result;
+            try {
+              result = await response.json();
+            } catch (error) {
+              const body = await response.text().catch(() => "");
+              setStatus(`UDP probe JSON parse failed: ${error} ${body}`.trim());
+              return;
+            }
+            const preview = previewBase64Payload(result.responseBase64);
+            setStatus(`UDP probe to ${result.host}:${result.port} returned ${result.responseByteCount} bytes in ${result.responsePacketCount} packet(s): ${preview} [${result.trace}]`);
+          });
+          item.appendChild(udpButton);
+
+          const sessionButton = document.createElement("button");
+          sessionButton.textContent = "Open TCP Session";
+          sessionButton.addEventListener("click", async () => {
+            const host = (sessionHostEl.value || "").trim() || "neverssl.com";
+            const port = (sessionPortEl.value || "").trim() || "80";
+            setStatus(`Opening TCP session for ${entry.savedToken} to ${host}:${port}...`);
+            const response = await fetch("api/network/session/open", {
+              method: "POST",
+              headers: { "Content-Type": "text/plain" },
+              body: `${entry.savedToken}\n${host}\n${port}`,
+            });
+
+            if (!response.ok) {
+              const body = await response.text();
+              const text = body.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+              setStatus(`TCP session open failed with HTTP ${response.status}: ${text}`);
+              return;
+            }
+
+            const result = await response.json();
+            setStatus(`Opened TCP session ${result.sessionId} to ${result.host}:${result.port} [${result.trace}]`);
+            await refreshState();
+          });
+          item.appendChild(sessionButton);
           savedCapsEl.appendChild(item);
         }
       }
@@ -302,12 +647,16 @@
         const response = await fetch("api/state");
         const data = await response.json();
         nodeIdEl.textContent = data.irohNodeId || "unavailable";
+        powerboxQueries = data.powerboxQueries || powerboxQueries;
         const endpoint = data.irohEndpoint || {};
         const directAddrs = endpoint.directAddrs || [];
         endpointAddrsEl.textContent = directAddrs.length ? directAddrs.join(", ") : "none";
         endpointStatusEl.textContent = endpoint.error || (endpoint.bound ? "bound (relay disabled)" : "not bound");
+        transportAssessmentEl.textContent = data.transportAssessment || "unavailable";
+        localTicketEl.value = endpoint.localTicket || "";
         remoteTicketEl.value = data.remoteTicket || "";
         renderSavedCaps(data.savedCaps || []);
+        renderActiveTcpSessions(data.activeTcpSessions || []);
       }
 
       saveTicketButton.addEventListener("click", async () => {
@@ -338,7 +687,22 @@
         await refreshState();
       });
 
-      requestButton.addEventListener("click", () => {
+      probeTicketButton.addEventListener("click", async () => {
+        setStatus("Probing remote connection...");
+        const response = await fetch("api/pairing/probe-connect", {
+          method: "POST",
+        });
+        if (!response.ok) {
+          const body = await response.text();
+          const text = body.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+          setStatus(`Probe failed with HTTP ${response.status}: ${text}`);
+          return;
+        }
+        const result = await response.json();
+        setStatus(`Probe succeeded with ${result.remoteNodeId}: ${result.response}`);
+      });
+
+      function requestPowerboxCapability(query, saveLabel) {
         const rpcId = `iroh-tunnel-${Date.now()}-${Math.random().toString(16).slice(2)}`;
         setStatus("Waiting for Powerbox selection...");
 
@@ -361,7 +725,7 @@
           const claimResponse = await fetch("api/powerbox/claim", {
             method: "POST",
             headers: { "Content-Type": "text/plain" },
-            body: message.token,
+            body: `${message.token}\n${saveLabel}`,
           });
 
           if (!claimResponse.ok) {
@@ -383,10 +747,26 @@
         window.parent.postMessage({
           powerboxRequest: {
             rpcId,
-            query: TEMP_QUERY,
-            saveLabel: { defaultText: "Powerbox capability" }
+            query: [query],
+            saveLabel: { defaultText: saveLabel }
           }
         }, "*");
+      }
+
+      requestButton.addEventListener("click", () => {
+        if (!powerboxQueries.apiSession) {
+          setStatus("ApiSession query is not loaded yet.");
+          return;
+        }
+        requestPowerboxCapability(powerboxQueries.apiSession, "Powerbox capability");
+      });
+
+      requestIpNetworkButton.addEventListener("click", () => {
+        if (!powerboxQueries.ipNetwork) {
+          setStatus("IpNetwork query is not loaded yet.");
+          return;
+        }
+        requestPowerboxCapability(powerboxQueries.ipNetwork, "IpNetwork capability");
       });
 
       refreshState().catch((error) => {

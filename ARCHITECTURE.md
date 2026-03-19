@@ -39,9 +39,15 @@ Responsibilities:
 - claim Powerbox request tokens
 - save durable local capabilities
 - restore saved capabilities by token
-- later request privileged networking capabilities if needed
+- request and save privileged networking capabilities like `IpNetwork`
 
 The current implementation keeps the bootstrapped `SandstormApi` on `UiViewImpl` and clones the session `SessionContext` into each `WebSessionImpl`.
+
+This is now proven for capability acquisition:
+
+- browser-side Powerbox requests can ask for `IpNetwork`
+- the returned request token can be claimed server-side
+- the resulting `IpNetwork` capability can be saved like any other capability
 
 ### 3. Saved capability registry
 
@@ -96,8 +102,20 @@ Current implementation:
 - attempts a relay-disabled `iroh::Endpoint` bind at startup
 - exposes local direct addresses through `GET /api/state`
 - persists a raw remote ticket string at `/var/iroh-tunnel/remote-ticket.txt`
+- runs a background echo accept loop for the probe ALPN
+- exposes a one-shot connect probe that dials the stored remote ticket and performs an echo round trip
 
-This is intentionally only the pairing-state layer. It does not dial yet.
+This is still intentionally only a spike. It proves one-shot connectivity, but not a durable peer session yet.
+
+Current integration assessment:
+
+- saved `IpNetwork` is now proven for outbound TCP and outbound UDP reply flow
+- the remaining blocker is at the `iroh` library boundary, not the Sandstorm capability boundary
+- local inspection of `iroh 0.96.1` shows `Endpoint::builder()` still binds native `TransportConfig` entries into its internal socket layer and does not expose a public hook for a custom Sandstorm-backed packet/socket backend
+- local inspection of `iroh-quinn 0.16.1` does show a lower-level seam: `Endpoint::new_with_abstract_socket(...)` accepts a custom `AsyncUdpSocket`
+- local inspection of `iroh-quinn::AsyncUdpSocket` also shows the next exact blocker: receive-side QUIC integration needs per-datagram source-address metadata
+- the vendored Sandstorm `ip.capnp` definitions do not expose that metadata today: both outbound `IpRemoteHost.getUdpPort()` and inbound `IpInterface.listenUdp()` terminate at `UdpPort`, whose only method is `send(message, returnPort)`
+- that means the current Sandstorm UDP surface can move bytes and receive replies, but it does not surface sender address, destination address, ECN, or interface metadata needed by QUIC's abstract socket layer
 
 ### 5. Cap'n Proto RPC session over iroh
 
@@ -217,16 +235,17 @@ The following are already demonstrated in this repo:
 
 ## Open questions
 
-1. Is `IpNetwork` alone enough for `iroh`, or does practical operation inside Sandstorm also require `IpInterface` for inbound UDP?
-2. What is the cleanest query model for the “pick a capability” UX: empty queries, typed queries, or a curated set?
-3. What is the cleanest UX for exposing a received capability back into Sandstorm: direct app object links, offers, or both?
-4. Do we need relay-only `iroh` mode as a compatibility fallback if direct UDP is unavailable?
+1. Does Sandstorm expose any future UDP capability richer than today's `UdpPort` callback shape, with source/destination packet metadata?
+2. How should stock `iroh` be adapted to Sandstorm’s capability-gated network surface, given that the current probe still assumes ambient sockets?
+3. What is the cleanest query model for the “pick a capability” UX: empty queries, typed queries, or a curated set?
+4. What is the cleanest UX for exposing a received capability back into Sandstorm: direct app object links, offers, or both?
+5. Do we need relay-only `iroh` mode as a compatibility fallback if direct UDP is unavailable?
 
 ## Feasibility gates
 
 Do not commit to the full app until these are proven:
 
 1. packaged grain can obtain the required Sandstorm networking capability
-2. `iroh` can connect acceptably inside that sandbox
+2. `iroh` can connect acceptably through that capability surface rather than through assumed ambient sockets
 3. `capnp-rpc` works over the chosen `iroh` stream abstraction
 4. a received capability can be re-exported via `MainView.restore()`

@@ -13,7 +13,7 @@ Reduce uncertainty before building the full app.
 3. Prototype a Powerbox request from browser JS and server-side claim flow.
 4. Test whether an empty Powerbox query is accepted.
 5. Test requesting `IpNetwork` through the Powerbox.
-6. Test whether `IpInterface` is also needed for inbound UDP behavior.
+6. Inspect whether vendored Sandstorm networking schemas expose any UDP receive surface richer than `UdpPort`.
 7. Build a standalone Rust prototype of `capnp-rpc` over an `iroh` stream outside Sandstorm.
 8. Repeat the transport test inside a packaged grain.
 
@@ -21,7 +21,8 @@ Reduce uncertainty before building the full app.
 
 - one capability can be claimed and saved
 - one saved capability can be restored again
-- one peer connection can be established
+- one `IpNetwork` capability can be claimed and saved
+- one peer connection can be established through Sandstorm's capability-gated networking surface
 - one live capability can cross the transport boundary
 
 ## Phase 1: package skeleton
@@ -59,13 +60,15 @@ Let a user acquire and manage local capabilities.
 4. Redeem and save capabilities server-side.
 5. Store metadata in the registry.
 6. Add restore probe against saved tokens.
-7. Add list and enable/disable controls in the UI.
+7. Add typed `IpNetwork` request path.
+8. Add list and enable/disable controls in the UI.
 
 ### Exit criteria
 
 - user can add a capability
 - capability metadata is persisted
 - saved capability can be restored on demand
+- `IpNetwork` can be requested, claimed, and saved
 - user can mark it for sharing
 
 ## Phase 3: peer connectivity
@@ -82,10 +85,11 @@ Pair two grains and establish a tunnel.
 4. Connect to the remote peer.
 5. Expose detailed connection state in the UI.
 6. Persist peer configuration.
+7. Replace the ambient-socket probe with one that actually uses the saved `IpNetwork` capability.
 
 ### Exit criteria
 
-- two grains can pair manually
+- two grains can exchange a local ticket and complete one probe round trip through the intended Sandstorm networking capability path
 - reconnect works after process restart
 
 ## Phase 4: capability tunnel
@@ -168,15 +172,14 @@ Validate the model under realistic grain lifecycle events.
 
 ### High risk
 
-- Sandstorm networking capability may not be sufficient for `iroh`, especially if inbound UDP behavior requires more than `IpNetwork`.
-- The Powerbox may require typed queries rather than an empty generic query.
+- Sandstorm networking capability may not be sufficient for `iroh`, because vendored `UdpPort` does not expose the packet metadata `iroh-quinn` expects on receive.
 - Raw capability re-export may have edge cases around persistence and lifetimes.
 
 ### Medium risk
 
 - Grain suspension may make the product feel less "tunnel-like" than expected.
 - Cap'n Proto RPC transport adaptation over `iroh` may need custom glue.
-- Empty Powerbox queries appear unreliable enough that typed queries may be required in practice.
+- Empty Powerbox queries appear unreliable enough that typed queries are likely required in practice.
 
 ### Low risk
 
@@ -185,6 +188,17 @@ Validate the model under realistic grain lifecycle events.
 ## Immediate next steps
 
 1. Keep the raw `UiView` / `MainView` baseline stable.
-2. Replace the temporary `ApiSession` query with the intended capability query model.
-3. Keep the current persisted `iroh` identity and remote-ticket layer stable.
-4. Move from relay-disabled local endpoint state to a real `iroh` connection spike.
+2. Keep the current persisted `iroh` identity and remote-ticket layer stable.
+3. Replace the current ambient-socket `iroh` probe with a capability-gated transport experiment.
+4. Characterize how far the Sandstorm `ByteStream` and `UdpPort` paths can be pushed toward transport-shaped traffic, including incremental session-style exchange rather than one-shot probes.
+
+## Progress notes
+
+- The first useful capability-gated probe is an outbound TCP/HTTP exchange over a restored `IpNetwork`.
+- Keep that probe separate from the ambient-socket `iroh` path until the Sandstorm network surface is proven on its own terms.
+- The saved `IpNetwork` capability is now proven in a real outbound network operation, and the next useful step is a generic TCP byte-stream probe rather than an HTTP-only check.
+- The current transport boundary now includes stateful saved-`IpNetwork` TCP sessions with explicit open/send/receive/close operations, which is closer to the shape a transport adapter will need than the earlier one-shot exchange path.
+- The current transport boundary also includes a saved-`IpNetwork` UDP probe using `IpRemoteHost.getUdpPort()` and a local `UdpPort` callback capability, which is a more relevant slice for `iroh` than TCP-only experiments.
+- Local inspection of `iroh 0.96.1` indicates the native `Endpoint::builder()` path is blocked: it binds native IP transports internally and does not expose a public custom transport backend hook for saved `IpNetwork`.
+- Local inspection of `iroh-quinn 0.16.1` reveals the next lower-level seam: `Endpoint::new_with_abstract_socket(...)` plus `AsyncUdpSocket`.
+- That seam is still blocked by vendored Sandstorm UDP callback shape: `AsyncUdpSocket::poll_recv(...)` needs packet metadata, while both `IpRemoteHost.getUdpPort()` and `IpInterface.listenUdp()` bottom out at `UdpPort.send(message, returnPort)`.
