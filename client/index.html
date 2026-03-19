@@ -142,6 +142,26 @@
         align-items: center;
         gap: 0.5rem;
       }
+      .stack {
+        display: grid;
+        gap: 0.8rem;
+      }
+      textarea {
+        width: 100%;
+        min-height: 7.5rem;
+        border: 1px solid var(--line);
+        border-radius: 0.85rem;
+        padding: 0.85rem 0.95rem;
+        background: rgba(20, 25, 37, 0.82);
+        color: var(--ink);
+        font: inherit;
+        resize: vertical;
+      }
+      .button-row {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.5rem;
+      }
       code {
         font-family: "Berkeley Mono", "SFMono-Regular", monospace;
         font-size: 0.84em;
@@ -181,9 +201,24 @@
         </section>
         <section class="panel panel-tall">
           <h2>Node Identity</h2>
-          <p class="muted">If this page renders, the raw Sandstorm RPC bootstrap is working.</p>
+          <p class="muted">Relay-disabled local endpoint state for the first pairing slice.</p>
           <p class="muted">Local iroh node id:</p>
           <p><code id="node-id">loading…</code></p>
+          <p class="muted">Local direct addresses:</p>
+          <p><code id="endpoint-addrs">loading…</code></p>
+          <p class="muted">Endpoint status:</p>
+          <p><code id="endpoint-status">loading…</code></p>
+        </section>
+        <section class="panel panel-full">
+          <h2>Pairing</h2>
+          <div class="stack">
+            <p class="muted">Paste a remote endpoint ticket or node-address blob here. For now this is persistent pairing state only; no live dial attempt happens yet.</p>
+            <textarea id="remote-ticket" spellcheck="false" placeholder="Remote node ticket"></textarea>
+            <div class="button-row">
+              <button id="save-ticket">Save Remote Ticket</button>
+              <button id="clear-ticket">Clear Remote Ticket</button>
+            </div>
+          </div>
         </section>
         <section class="panel panel-full">
           <h2>Saved Capabilities</h2>
@@ -195,7 +230,12 @@
       const statusEl = document.getElementById("status");
       const savedCapsEl = document.getElementById("saved-caps");
       const nodeIdEl = document.getElementById("node-id");
+      const endpointAddrsEl = document.getElementById("endpoint-addrs");
+      const endpointStatusEl = document.getElementById("endpoint-status");
+      const remoteTicketEl = document.getElementById("remote-ticket");
       const requestButton = document.getElementById("request-cap");
+      const saveTicketButton = document.getElementById("save-ticket");
+      const clearTicketButton = document.getElementById("clear-ticket");
       const TEMP_QUERY = ["EAZQAQEAABEBF1EEAQH_x80lxnnjecgAAAA"];
 
       function setStatus(text) {
@@ -262,8 +302,41 @@
         const response = await fetch("api/state");
         const data = await response.json();
         nodeIdEl.textContent = data.irohNodeId || "unavailable";
+        const endpoint = data.irohEndpoint || {};
+        const directAddrs = endpoint.directAddrs || [];
+        endpointAddrsEl.textContent = directAddrs.length ? directAddrs.join(", ") : "none";
+        endpointStatusEl.textContent = endpoint.error || (endpoint.bound ? "bound (relay disabled)" : "not bound");
+        remoteTicketEl.value = data.remoteTicket || "";
         renderSavedCaps(data.savedCaps || []);
       }
+
+      saveTicketButton.addEventListener("click", async () => {
+        setStatus("Saving remote ticket...");
+        const response = await fetch("api/pairing/remote-ticket", {
+          method: "POST",
+          headers: { "Content-Type": "text/plain" },
+          body: remoteTicketEl.value,
+        });
+        if (!response.ok) {
+          setStatus(`Remote ticket save failed with HTTP ${response.status}`);
+          return;
+        }
+        setStatus("Remote ticket saved.");
+        await refreshState();
+      });
+
+      clearTicketButton.addEventListener("click", async () => {
+        setStatus("Clearing remote ticket...");
+        const response = await fetch("api/pairing/remote-ticket", {
+          method: "PUT",
+        });
+        if (!response.ok) {
+          setStatus(`Remote ticket clear failed with HTTP ${response.status}`);
+          return;
+        }
+        setStatus("Remote ticket cleared.");
+        await refreshState();
+      });
 
       requestButton.addEventListener("click", () => {
         const rpcId = `iroh-tunnel-${Date.now()}-${Math.random().toString(16).slice(2)}`;

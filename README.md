@@ -17,19 +17,23 @@ This repository already contains a working raw Sandstorm baseline, not just desi
 Implemented today:
 
 - raw Sandstorm bootstrap as `UiView` / `WebSession`
+- raw `MainView(Text)` bootstrap with `restore()` / `drop()` hooks
 - packaged static UI served from `/opt/app/client`
 - browser-side Powerbox request flow via `window.parent.postMessage(...)`
 - server-side `SessionContext.claimRequest()`
 - server-side `SandstormApi.save()`
 - persisted saved-capability registry under `/var/iroh-tunnel`
 - restore probing through `SandstormApi.restore()`
+- persisted `iroh` node identity under `/var/iroh-tunnel/iroh-secret-key`
+- relay-disabled local `iroh` endpoint bind on startup
+- persisted remote-ticket field under `/var/iroh-tunnel/remote-ticket.txt`
 
 Not implemented yet:
 
-- `iroh` transport
-- app-owned persistent object IDs for exported capabilities
-- `MainView.restore()` / `drop()` for re-exporting received capabilities
-- peer pairing and remote capability exchange
+- live peer dialing over `iroh`
+- `capnp-rpc` over an `iroh` stream
+- remote capability import/export
+- re-export of received remote capabilities back into Sandstorm
 
 ## Goals
 
@@ -52,7 +56,7 @@ Not implemented yet:
 1. Sandstorm network access is capability-gated. The app likely needs `IpNetwork` or a related raw Cap'n Proto capability from the Powerbox. This must be validated in practice.
 2. `iroh` depends on QUIC and normally benefits from UDP. It is not yet proven that Sandstorm's networking capability surface is sufficient for `iroh` in a packaged grain.
 3. Empty generic Powerbox queries appear unreliable enough that typed queries may be required in practice.
-4. Re-exporting imported remote capabilities back into Sandstorm depends on a correct `MainView.restore()` / `drop()` implementation.
+4. Re-exporting imported remote capabilities back into Sandstorm depends on wiring the current `MainView.restore()` / `drop()` baseline to live imported capabilities rather than saved local ones.
 
 ## Current stack
 
@@ -99,8 +103,8 @@ The active package definition is [`.sandstorm/sandstorm-pkgdef.capnp`](/home/mic
 
 1. Keep the raw `UiView` baseline stable.
 2. Replace the temporary `ApiSession` Powerbox query with the intended query model.
-3. Introduce app-owned object IDs and implement `MainView.restore()` / `drop()`.
-4. Add `iroh` node identity and manual pairing UI.
+3. Keep the current app-owned object ID / `MainView.restore()` baseline stable.
+4. Move from persisted pairing state to a real `iroh` dial/accept path.
 5. Send one live capability over one `iroh` RPC connection.
 6. Re-export it on the remote side through app-managed persistent object IDs.
 

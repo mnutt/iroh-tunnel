@@ -184,7 +184,7 @@ Validate the model under realistic grain lifecycle events.
 
 ## Immediate next steps
 
-1. Keep the raw `UiView` baseline stable.
+1. Keep the raw `UiView` / `MainView` baseline stable.
 2. Replace the temporary `ApiSession` query with the intended capability query model.
-3. Promote saved capability records into app object IDs for `restore()` / `drop()`.
-4. Run an `iroh` transport spike before building remote export plumbing.
+3. Keep the current persisted `iroh` identity and remote-ticket layer stable.
+4. Move from relay-disabled local endpoint state to a real `iroh` connection spike.

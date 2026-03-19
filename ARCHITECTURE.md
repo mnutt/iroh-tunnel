@@ -82,12 +82,22 @@ This is the critical piece for re-exporting remote capabilities into the local S
 Responsibilities:
 
 - initialize or load the grain's persistent `iroh` node identity
-- display a local connection ticket
-- accept a remote ticket
-- establish and maintain a peer session
+- bind a local endpoint
+- display local addressing state
+- accept and persist a remote ticket
+- later establish and maintain a peer session
 - surface transport state to the UI
 
 State should be written under `/var`. Identity and pairing state must survive restarts.
+
+Current implementation:
+
+- persists the secret key at `/var/iroh-tunnel/iroh-secret-key`
+- attempts a relay-disabled `iroh::Endpoint` bind at startup
+- exposes local direct addresses through `GET /api/state`
+- persists a raw remote ticket string at `/var/iroh-tunnel/remote-ticket.txt`
+
+This is intentionally only the pairing-state layer. It does not dial yet.
 
 ### 5. Cap'n Proto RPC session over iroh
 
@@ -202,6 +212,8 @@ The following are already demonstrated in this repo:
 4. server-side `claimRequest()` works
 5. `SandstormApi.save()` persists the selected capability
 6. `SandstormApi.restore()` can probe the persisted token later
+7. `MainView.restore(objectId)` can resolve saved local capabilities by app object ID
+8. local `iroh` identity and relay-disabled endpoint state survive restart
 
 ## Open questions
 

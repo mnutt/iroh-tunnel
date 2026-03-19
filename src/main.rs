@@ -3,12 +3,13 @@ include!("sandstorm_capnp.rs");
 use std::fs::OpenOptions;
 use std::io::Write as _;
 use std::os::fd::FromRawFd;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use capnp::text;
 use capnp::capability::Promise;
 use capnp::traits::HasTypeId;
-use iroh::SecretKey;
+use iroh::{Endpoint, RelayMode, SecretKey, TransportAddr};
 use capnp_rpc::{new_client, pry, rpc_twoparty_capnp, twoparty, RpcSystem};
 use futures::AsyncReadExt;
 use futures::TryFutureExt;
@@ -19,7 +20,9 @@ const CLIENT_ROOT: &str = "/opt/app/client";
 const STATE_DIR: &str = "/var/iroh-tunnel";
 const SAVED_CAPS_PATH: &str = "/var/iroh-tunnel/saved-caps.tsv";
 const IROH_SECRET_KEY_PATH: &str = "/var/iroh-tunnel/iroh-secret-key";
+const REMOTE_TICKET_PATH: &str = "/var/iroh-tunnel/remote-ticket.txt";
 const WEB_SESSION_TYPE_ID: u64 = web_session_capnp::web_session::Client::TYPE_ID;
+const IROH_ALPN: &[u8] = b"dev.iroh-tunnel.capnp/1";
 
 fn main() {
     if let Err(err) = run() {
@@ -35,6 +38,7 @@ fn run() -> Result<(), String> {
         .map_err(|err| format!("failed to create tokio runtime: {err}"))?;
 
     runtime.block_on(async {
+        let app_state = Arc::new(Mutex::new(AppState::initialize().await?));
         let rpc_fd = 3;
 
         let stream: std::os::unix::net::UnixStream =
@@ -61,7 +65,7 @@ fn run() -> Result<(), String> {
             }));
 
         let client: grain_capnp::main_view::Client<text::Owned> =
-            new_client(UiViewImpl::new(sandstorm_api));
+            new_client(UiViewImpl::new(sandstorm_api, app_state));
 
         let mut rpc_system = RpcSystem::new(network, Some(client.client));
         let remote_api = rpc_system
@@ -77,13 +81,18 @@ fn run() -> Result<(), String> {
 }
 
 struct UiViewImpl {
-    _sandstorm_api: grain_capnp::sandstorm_api::Client<capnp::any_pointer::Owned>,
+    sandstorm_api: grain_capnp::sandstorm_api::Client<capnp::any_pointer::Owned>,
+    app_state: Arc<Mutex<AppState>>,
 }
 
 impl UiViewImpl {
-    fn new(sandstorm_api: grain_capnp::sandstorm_api::Client<capnp::any_pointer::Owned>) -> Self {
+    fn new(
+        sandstorm_api: grain_capnp::sandstorm_api::Client<capnp::any_pointer::Owned>,
+        app_state: Arc<Mutex<AppState>>,
+    ) -> Self {
         Self {
-            _sandstorm_api: sandstorm_api,
+            sandstorm_api,
+            app_state,
         }
     }
 }
@@ -155,24 +164,17 @@ impl grain_capnp::ui_view::Server for UiViewImpl {
             )));
         }
 
-        let session_params = pry!(params
+        let _session_params = pry!(params
             .get_session_params()
             .get_as::<web_session_capnp::web_session::params::Reader<'_>>());
         let user_info = pry!(params.get_user_info());
         let permissions = pry!(user_info.get_permissions());
         let can_manage = permissions.len() > 0 && permissions.get(0);
-        let base_path = session_params
-            .get_base_path()
-            .ok()
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or("")
-            .to_string();
-
         let session_client: web_session_capnp::web_session::Client = new_client(WebSessionImpl {
             can_manage,
-            base_path,
-            sandstorm_api: self._sandstorm_api.clone(),
+            sandstorm_api: self.sandstorm_api.clone(),
             session_context: pry!(params.get_context()),
+            app_state: self.app_state.clone(),
         });
         results.get().set_session(grain_capnp::ui_session::Client {
             client: session_client.client,
@@ -199,7 +201,7 @@ impl grain_capnp::main_view::Server<text::Owned> for UiViewImpl {
             Err(err) => return Promise::err(capnp::Error::failed(err)),
         };
 
-        let sandstorm_api = self._sandstorm_api.clone();
+        let sandstorm_api = self.sandstorm_api.clone();
         Promise::from_future(async move {
             let token = hex_decode(&saved_cap.saved_token)
                 .map_err(capnp::Error::failed)?;
@@ -234,9 +236,9 @@ impl grain_capnp::main_view::Server<text::Owned> for UiViewImpl {
 
 struct WebSessionImpl {
     can_manage: bool,
-    base_path: String,
     sandstorm_api: grain_capnp::sandstorm_api::Client<capnp::any_pointer::Owned>,
     session_context: grain_capnp::session_context::Client,
+    app_state: Arc<Mutex<AppState>>,
 }
 
 impl grain_capnp::ui_session::Server for WebSessionImpl {}
@@ -264,7 +266,7 @@ impl web_session_capnp::web_session::Server for WebSessionImpl {
         }
 
         if path == "api/state" {
-            let body = match render_state_json() {
+            let body = match render_state_json(&self.app_state) {
                 Ok(body) => body,
                 Err(err) => return Promise::err(capnp::Error::failed(err)),
             };
@@ -308,6 +310,54 @@ impl web_session_capnp::web_session::Server for WebSessionImpl {
         let path = pry!(params.get_path()).to_str().unwrap_or("").to_string();
         if let Err(err) = self.require_canonical_path(&path) {
             return Promise::err(err);
+        }
+
+        if path == "api/pairing/remote-ticket" {
+            if !self.can_manage {
+                let mut error = results.get().init_client_error();
+                error.set_status_code(
+                    web_session_capnp::web_session::response::ClientErrorCode::Forbidden,
+                );
+                return Promise::ok(());
+            }
+
+            let body = pry!(params.get_content()).get_content().unwrap_or(&[]).to_vec();
+            let remote_ticket = match std::str::from_utf8(&body) {
+                Ok(value) => value.trim().to_string(),
+                Err(err) => {
+                    let mut error = results.get().init_client_error();
+                    let description =
+                        format!("<!doctype html><title>Bad Request</title><p>{err}</p>");
+                    error.set_status_code(
+                        web_session_capnp::web_session::response::ClientErrorCode::BadRequest,
+                    );
+                    error.set_description_html(description.as_str().into());
+                    return Promise::ok(());
+                }
+            };
+
+            let outcome = update_remote_ticket(&self.app_state, remote_ticket);
+            match outcome {
+                Ok(()) => {
+                    let mut content = results.get().init_content();
+                    content.set_status_code(
+                        web_session_capnp::web_session::response::SuccessCode::Ok,
+                    );
+                    content.set_mime_type("application/json".into());
+                    content
+                        .init_body()
+                        .set_bytes(br#"{"ok":true}"#);
+                }
+                Err(err) => {
+                    let mut error = results.get().init_server_error();
+                    let description = format!(
+                        "<!doctype html><title>Pairing Update Failed</title><pre>{}</pre>",
+                        escape_html(&err)
+                    );
+                    error.set_description_html(description.as_str().into());
+                }
+            }
+            return Promise::ok(());
         }
 
         if path != "api/powerbox/claim" {
@@ -379,6 +429,31 @@ impl web_session_capnp::web_session::Server for WebSessionImpl {
         let path = pry!(params.get_path()).to_str().unwrap_or("").to_string();
         if let Err(err) = self.require_canonical_path(&path) {
             return Promise::err(err);
+        }
+
+        if path == "api/pairing/remote-ticket" {
+            if !self.can_manage {
+                let mut error = results.get().init_client_error();
+                error.set_status_code(
+                    web_session_capnp::web_session::response::ClientErrorCode::Forbidden,
+                );
+                return Promise::ok(());
+            }
+
+            match update_remote_ticket(&self.app_state, String::new()) {
+                Ok(()) => {
+                    results.get().init_no_content();
+                }
+                Err(err) => {
+                    let mut error = results.get().init_server_error();
+                    let description = format!(
+                        "<!doctype html><title>Pairing Delete Failed</title><pre>{}</pre>",
+                        escape_html(&err)
+                    );
+                    error.set_description_html(description.as_str().into());
+                }
+            }
+            return Promise::ok(());
         }
 
         if path != "api/saved-cap/restore" {
@@ -612,26 +687,6 @@ async fn restore_saved_capability(
     Ok(())
 }
 
-fn render_state_json() -> Result<String, String> {
-    let identity = load_or_create_iroh_identity()?;
-    let mut rows = Vec::new();
-    for row in load_saved_capabilities()? {
-        rows.push(format!(
-            "{{\"id\":\"{}\",\"objectId\":\"{}\",\"label\":\"{}\",\"savedToken\":\"{}\",\"createdAtMs\":{}}}",
-            json_escape(&row.id),
-            json_escape(&row.id),
-            json_escape(&row.label),
-            json_escape(&row.saved_token),
-            row.created_at_ms
-        ));
-    }
-    Ok(format!(
-        "{{\"irohNodeId\":\"{}\",\"savedCaps\":[{}]}}",
-        json_escape(&identity.node_id),
-        rows.join(",")
-    ))
-}
-
 fn load_saved_capabilities() -> Result<Vec<SavedCapability>, String> {
     let contents = match std::fs::read_to_string(SAVED_CAPS_PATH) {
         Ok(contents) => contents,
@@ -758,6 +813,37 @@ struct SavedCapability {
     created_at_ms: u64,
 }
 
+struct AppState {
+    iroh_identity: IrohIdentity,
+    iroh_endpoint: Option<Endpoint>,
+    iroh_endpoint_addr: IrohEndpointAddrSummary,
+    iroh_endpoint_error: Option<String>,
+    remote_ticket: Option<String>,
+}
+
+impl AppState {
+    async fn initialize() -> Result<Self, String> {
+        let iroh_identity = load_or_create_iroh_identity()?;
+        let remote_ticket = load_remote_ticket()?;
+        match bind_local_iroh_endpoint(&iroh_identity.secret_key).await {
+            Ok((endpoint, endpoint_addr)) => Ok(Self {
+                iroh_identity,
+                iroh_endpoint: Some(endpoint),
+                iroh_endpoint_addr: endpoint_addr,
+                iroh_endpoint_error: None,
+                remote_ticket,
+            }),
+            Err(err) => Ok(Self {
+                iroh_identity,
+                iroh_endpoint: None,
+                iroh_endpoint_addr: IrohEndpointAddrSummary::empty(),
+                iroh_endpoint_error: Some(err),
+                remote_ticket,
+            }),
+        }
+    }
+}
+
 fn make_saved_cap_id() -> String {
     format!("cap-{}", now_ms())
 }
@@ -804,6 +890,7 @@ fn load_or_create_iroh_identity() -> Result<IrohIdentity, String> {
 
     Ok(IrohIdentity {
         node_id: secret_key.public().to_string(),
+        secret_key,
     })
 }
 
@@ -818,4 +905,145 @@ fn fill_random(out: &mut [u8]) -> Result<(), String> {
 
 struct IrohIdentity {
     node_id: String,
+    secret_key: SecretKey,
+}
+
+struct IrohEndpointAddrSummary {
+    node_id: String,
+    relay_urls: Vec<String>,
+    direct_addrs: Vec<String>,
+}
+
+impl IrohEndpointAddrSummary {
+    fn empty() -> Self {
+        Self {
+            node_id: String::new(),
+            relay_urls: Vec::new(),
+            direct_addrs: Vec::new(),
+        }
+    }
+}
+
+async fn bind_local_iroh_endpoint(
+    secret_key: &SecretKey,
+) -> Result<(Endpoint, IrohEndpointAddrSummary), String> {
+    let endpoint = Endpoint::builder()
+        .alpns(vec![IROH_ALPN.to_vec()])
+        .secret_key(secret_key.clone())
+        .relay_mode(RelayMode::Disabled)
+        .bind()
+        .await
+        .map_err(|err| format!("failed to bind local iroh endpoint: {err}"))?;
+    let endpoint_addr = summarize_endpoint_addr(endpoint.addr());
+    Ok((endpoint, endpoint_addr))
+}
+
+fn summarize_endpoint_addr(endpoint_addr: iroh::EndpointAddr) -> IrohEndpointAddrSummary {
+    let mut relay_urls = Vec::new();
+    let mut direct_addrs = Vec::new();
+    for addr in endpoint_addr.addrs {
+        match addr {
+            TransportAddr::Relay(url) => relay_urls.push(url.to_string()),
+            TransportAddr::Ip(addr) => direct_addrs.push(addr.to_string()),
+            _ => {}
+        }
+    }
+    IrohEndpointAddrSummary {
+        node_id: endpoint_addr.id.to_string(),
+        relay_urls,
+        direct_addrs,
+    }
+}
+
+fn load_remote_ticket() -> Result<Option<String>, String> {
+    match std::fs::read_to_string(REMOTE_TICKET_PATH) {
+        Ok(value) => {
+            let trimmed = value.trim().to_string();
+            if trimmed.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(trimmed))
+            }
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(format!("failed to read remote ticket: {err}")),
+    }
+}
+
+fn update_remote_ticket(app_state: &Arc<Mutex<AppState>>, remote_ticket: String) -> Result<(), String> {
+    std::fs::create_dir_all(STATE_DIR)
+        .map_err(|err| format!("failed to create state directory: {err}"))?;
+    if remote_ticket.trim().is_empty() {
+        match std::fs::remove_file(REMOTE_TICKET_PATH) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(format!("failed to clear remote ticket: {err}")),
+        }
+    } else {
+        std::fs::write(REMOTE_TICKET_PATH, format!("{remote_ticket}\n"))
+            .map_err(|err| format!("failed to persist remote ticket: {err}"))?;
+    }
+
+    let mut guard = app_state
+        .lock()
+        .map_err(|_| "app state lock poisoned".to_string())?;
+    guard.remote_ticket = if remote_ticket.trim().is_empty() {
+        None
+    } else {
+        Some(remote_ticket)
+    };
+    Ok(())
+}
+
+fn render_state_json(app_state: &Arc<Mutex<AppState>>) -> Result<String, String> {
+    let guard = app_state
+        .lock()
+        .map_err(|_| "app state lock poisoned".to_string())?;
+    let mut rows = Vec::new();
+    for row in load_saved_capabilities()? {
+        rows.push(format!(
+            "{{\"id\":\"{}\",\"objectId\":\"{}\",\"label\":\"{}\",\"savedToken\":\"{}\",\"createdAtMs\":{}}}",
+            json_escape(&row.id),
+            json_escape(&row.id),
+            json_escape(&row.label),
+            json_escape(&row.saved_token),
+            row.created_at_ms
+        ));
+    }
+
+    let relay_urls = join_json_strings(&guard.iroh_endpoint_addr.relay_urls);
+    let direct_addrs = join_json_strings(&guard.iroh_endpoint_addr.direct_addrs);
+    let remote_ticket = match &guard.remote_ticket {
+        Some(value) => format!("\"{}\"", json_escape(value)),
+        None => "null".to_string(),
+    };
+    let endpoint_error = match &guard.iroh_endpoint_error {
+        Some(value) => format!("\"{}\"", json_escape(value)),
+        None => "null".to_string(),
+    };
+    let endpoint_bound = if guard.iroh_endpoint.is_some() {
+        "true"
+    } else {
+        "false"
+    };
+
+    Ok(format!(
+        "{{\"irohNodeId\":\"{}\",\"irohEndpoint\":{{\"bound\":{},\"nodeId\":\"{}\",\"relayUrls\":[{}],\"directAddrs\":[{}],\"error\":{}}},\"remoteTicket\":{},\"savedCaps\":[{}]}}",
+        json_escape(&guard.iroh_identity.node_id),
+        endpoint_bound,
+        json_escape(&guard.iroh_endpoint_addr.node_id),
+        relay_urls,
+        direct_addrs,
+        endpoint_error,
+        remote_ticket,
+        rows.join(",")
+    ))
+}
+
+fn join_json_strings(values: &[String]) -> String {
+    values
+        .iter()
+        .map(|value| format!("\"{}\"", json_escape(value)))
+        .collect::<Vec<_>>()
+        .join(",")
 }
