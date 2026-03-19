@@ -213,7 +213,7 @@
           const item = document.createElement("li");
           item.className = "saved-row";
           const label = document.createElement("span");
-          label.innerHTML = `${entry.label}: <code>${entry.savedToken}</code>`;
+          label.innerHTML = `${entry.label}: <code>${entry.savedToken}</code> <span class="muted">object</span> <code>${entry.objectId || entry.id}</code>`;
           item.appendChild(label);
 
           const button = document.createElement("button");

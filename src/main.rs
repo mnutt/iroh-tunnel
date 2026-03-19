@@ -5,6 +5,7 @@ use std::io::Write as _;
 use std::os::fd::FromRawFd;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use capnp::text;
 use capnp::capability::Promise;
 use capnp::traits::HasTypeId;
 use capnp_rpc::{new_client, pry, rpc_twoparty_capnp, twoparty, RpcSystem};
@@ -57,7 +58,8 @@ fn run() -> Result<(), String> {
                 capnp::Error::failed("sandstorm api bootstrap channel was canceled".to_string())
             }));
 
-        let client: grain_capnp::ui_view::Client = new_client(UiViewImpl::new(sandstorm_api));
+        let client: grain_capnp::main_view::Client<text::Owned> =
+            new_client(UiViewImpl::new(sandstorm_api));
 
         let mut rpc_system = RpcSystem::new(network, Some(client.client));
         let remote_api = rpc_system
@@ -173,6 +175,57 @@ impl grain_capnp::ui_view::Server for UiViewImpl {
         results.get().set_session(grain_capnp::ui_session::Client {
             client: session_client.client,
         });
+        Promise::ok(())
+    }
+}
+
+impl grain_capnp::main_view::Server<text::Owned> for UiViewImpl {
+    fn restore(
+        &mut self,
+        params: grain_capnp::main_view::RestoreParams<text::Owned>,
+        mut results: grain_capnp::main_view::RestoreResults<text::Owned>,
+    ) -> Promise<(), capnp::Error> {
+        let params = pry!(params.get());
+        let object_id = pry!(params.get_object_id()).to_str().unwrap_or("").to_string();
+        let saved_cap = match load_saved_capability_by_id(&object_id) {
+            Ok(Some(saved_cap)) => saved_cap,
+            Ok(None) => {
+                return Promise::err(capnp::Error::failed(format!(
+                    "unknown app object id: {object_id}"
+                )));
+            }
+            Err(err) => return Promise::err(capnp::Error::failed(err)),
+        };
+
+        let sandstorm_api = self._sandstorm_api.clone();
+        Promise::from_future(async move {
+            let token = hex_decode(&saved_cap.saved_token)
+                .map_err(capnp::Error::failed)?;
+            let mut restore_req = sandstorm_api.restore_request();
+            restore_req.get().set_token(&token);
+            let restore_resp = restore_req
+                .send()
+                .promise
+                .await
+                .map_err(|err| capnp::Error::failed(format!("SandstormApi.restore() failed: {err}")))?;
+            let restored_cap = restore_resp
+                .get()
+                .map_err(|err| capnp::Error::failed(format!("failed to decode restore() response: {err}")))?
+                .get_cap();
+            results
+                .get()
+                .get_cap()
+                .set_as(restored_cap)
+                .map_err(|err| capnp::Error::failed(format!("failed to set restore result capability: {err}")))?;
+            Ok(())
+        })
+    }
+
+    fn drop(
+        &mut self,
+        _: grain_capnp::main_view::DropParams<text::Owned>,
+        _: grain_capnp::main_view::DropResults<text::Owned>,
+    ) -> Promise<(), capnp::Error> {
         Promise::ok(())
     }
 }
@@ -513,7 +566,8 @@ fn render_state_json() -> Result<String, String> {
     let mut rows = Vec::new();
     for row in load_saved_capabilities()? {
         rows.push(format!(
-            "{{\"id\":\"{}\",\"label\":\"{}\",\"savedToken\":\"{}\",\"createdAtMs\":{}}}",
+            "{{\"id\":\"{}\",\"objectId\":\"{}\",\"label\":\"{}\",\"savedToken\":\"{}\",\"createdAtMs\":{}}}",
+            json_escape(&row.id),
             json_escape(&row.id),
             json_escape(&row.label),
             json_escape(&row.saved_token),
@@ -556,6 +610,15 @@ fn load_saved_capabilities() -> Result<Vec<SavedCapability>, String> {
         }
     }
     Ok(rows)
+}
+
+fn load_saved_capability_by_id(id: &str) -> Result<Option<SavedCapability>, String> {
+    for saved_cap in load_saved_capabilities()? {
+        if saved_cap.id == id {
+            return Ok(Some(saved_cap));
+        }
+    }
+    Ok(None)
 }
 
 fn persist_saved_capability(label: &str, saved_token: &str) -> Result<SavedCapability, String> {
