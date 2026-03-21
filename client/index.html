@@ -23,33 +23,6 @@
         background: var(--bg);
         color: var(--ink);
       }
-      body::before {
-        content: "";
-        position: fixed;
-        inset: 0;
-        background:
-          radial-gradient(circle at 12% 18%, rgba(255,255,255,0.92) 0 0.08rem, transparent 0.11rem),
-          radial-gradient(circle at 21% 74%, rgba(255,255,255,0.72) 0 0.07rem, transparent 0.1rem),
-          radial-gradient(circle at 37% 28%, rgba(255,255,255,0.9) 0 0.06rem, transparent 0.09rem),
-          radial-gradient(circle at 61% 17%, rgba(255,255,255,0.7) 0 0.08rem, transparent 0.11rem),
-          radial-gradient(circle at 82% 24%, rgba(255,255,255,0.96) 0 0.09rem, transparent 0.12rem),
-          radial-gradient(circle at 74% 82%, rgba(255,255,255,0.76) 0 0.07rem, transparent 0.1rem),
-          radial-gradient(circle at 51% 89%, rgba(255,255,255,0.85) 0 0.06rem, transparent 0.09rem),
-          radial-gradient(circle at 89% 66%, rgba(255,255,255,0.62) 0 0.08rem, transparent 0.11rem);
-        pointer-events: none;
-        opacity: 0.85;
-      }
-      body::after {
-        content: "";
-        position: fixed;
-        inset: 0;
-        background:
-          radial-gradient(circle at 58% 33%, transparent 0 3.5rem, rgba(236,242,255,0.13) 3.55rem 3.63rem, transparent 3.7rem 4.85rem, rgba(236,242,255,0.12) 4.9rem 4.98rem, transparent 5.06rem 6.5rem, rgba(236,242,255,0.1) 6.56rem 6.62rem, transparent 6.7rem 8.4rem, rgba(236,242,255,0.08) 8.47rem 8.53rem, transparent 8.6rem),
-          radial-gradient(ellipse at 58% 33%, rgba(5, 8, 16, 0.72) 0 9%, transparent 10%);
-        transform: rotate(-18deg);
-        pointer-events: none;
-        opacity: 0.7;
-      }
       main {
         position: relative;
         max-width: 64rem;
@@ -105,16 +78,17 @@
       .panel {
         background: var(--panel);
         border: 1px solid var(--line);
-        border-radius: 0.95rem;
+        border-radius: 0;
         padding: 1rem;
         backdrop-filter: blur(8px);
       }
       .panel-wide { grid-column: span 7; }
       .panel-tall { grid-column: span 5; }
       .panel-full { grid-column: 1 / -1; }
+      .panel-half { grid-column: span 6; }
       button {
         border: 0;
-        border-radius: 999px;
+        border-radius: 0;
         padding: 0.72rem 1rem;
         background: rgba(228, 235, 255, 0.92);
         color: #101626;
@@ -150,7 +124,7 @@
         width: 100%;
         min-height: 7.5rem;
         border: 1px solid var(--line);
-        border-radius: 0.85rem;
+        border-radius: 0;
         padding: 0.85rem 0.95rem;
         background: rgba(20, 25, 37, 0.82);
         color: var(--ink);
@@ -159,7 +133,7 @@
       }
       input {
         border: 1px solid var(--line);
-        border-radius: 999px;
+        border-radius: 0;
         padding: 0.72rem 1rem;
         background: rgba(20, 25, 37, 0.82);
         color: var(--ink);
@@ -170,16 +144,65 @@
         flex-wrap: wrap;
         gap: 0.5rem;
       }
+      .button-row.tight {
+        align-items: center;
+      }
       code {
         font-family: "Berkeley Mono", "SFMono-Regular", monospace;
         font-size: 0.84em;
         word-break: break-all;
+      }
+      .checklist {
+        margin: 0;
+        padding-left: 1.1rem;
+      }
+      .checklist li {
+        margin-top: 0.5rem;
+      }
+      .pill {
+        display: inline-flex;
+        align-items: center;
+        padding: 0.24rem 0.55rem;
+        border: 1px solid var(--line);
+        border-radius: 0;
+        font-size: 0.78rem;
+        letter-spacing: 0.03em;
+        text-transform: uppercase;
+        color: var(--accent);
+      }
+      .state-grid {
+        display: grid;
+        gap: 0.9rem;
+      }
+      .state-row {
+        display: grid;
+        gap: 0.24rem;
+      }
+      .state-row strong {
+        font-size: 0.8rem;
+        letter-spacing: 0.06em;
+        text-transform: uppercase;
+        color: var(--muted);
+      }
+      details.advanced {
+        border: 1px solid var(--line);
+        border-radius: 0;
+        padding: 0.85rem 0.95rem;
+        background: rgba(17, 22, 33, 0.55);
+      }
+      details.advanced summary {
+        cursor: pointer;
+        font-weight: 700;
+      }
+      details.advanced[open] summary {
+        margin-bottom: 0.8rem;
       }
       @media (max-width: 860px) {
         .cards {
           grid-template-columns: 1fr;
         }
         .panel-wide,
+        .panel-half,
         .panel-tall,
         .panel-full {
           grid-column: auto;
@@ -191,8 +214,7 @@
     <main>
       <section class="scene">
         <div class="hero-copy">
-          <div class="eyebrow">Iroh Tunnel</div>
-          <h1>Wormhole Gate</h1>
+          <h1>Iroh Tunnel</h1>
           <p class="lede">
             Request Sandstorm capabilities, save them into the grain, and verify that they can be
             restored on demand. This is the raw <code>UiView</code> baseline for the tunnel app.
@@ -202,32 +224,45 @@
 
       <section class="cards">
         <section class="panel panel-wide">
-          <h2>Powerbox Intake</h2>
-          <p class="muted">Request a known-good <code>ApiSession</code> capability or ask Sandstorm for raw outbound networking via <code>IpNetwork</code>.</p>
-          <div class="button-row">
-            <button id="request-cap">Request Capability</button>
-            <button id="request-ip-network">Request IP Network</button>
+          <h2>RawUdp Path</h2>
+          <p class="muted">This view is optimized for one task: bind Sandstorm RawUdp, exchange tickets, and probe the <code>iroh</code> connection over the custom transport.</p>
+          <ol class="checklist">
+            <li>Click <code>Request IP Interface</code> and save the capability.</li>
+            <li>In <code>Saved Capabilities</code>, click <code>Use for RawUdp</code>.</li>
+            <li>Wait until the ticket below contains a <code>custom:</code> line.</li>
+            <li>Copy each grain’s full local ticket into the other grain and click <code>Probe Connection</code>.</li>
+          </ol>
+          <div class="button-row tight">
+            <button id="request-ip-interface">Request IP Interface</button>
+            <span id="custom-transport-pill" class="pill">Custom Transport Missing</span>
           </div>
           <p id="status" class="status-line muted"></p>
         </section>
         <section class="panel panel-tall">
-          <h2>Node Identity</h2>
-          <p class="muted">Relay-disabled local endpoint state for the first pairing slice.</p>
-          <p class="muted">Local iroh node id:</p>
-          <p><code id="node-id">loading…</code></p>
-          <p class="muted">Local direct addresses:</p>
-          <p><code id="endpoint-addrs">loading…</code></p>
-          <p class="muted">Endpoint status:</p>
-          <p><code id="endpoint-status">loading…</code></p>
-        </section>
-        <section class="panel panel-full">
-          <h2>Transport Assessment</h2>
-          <p id="transport-assessment" class="muted">loading…</p>
+          <h2>Endpoint State</h2>
+          <div class="state-grid">
+            <div class="state-row">
+              <strong>Node ID</strong>
+              <code id="node-id">loading…</code>
+            </div>
+            <div class="state-row">
+              <strong>Endpoint Status</strong>
+              <code id="endpoint-status">loading…</code>
+            </div>
+            <div class="state-row">
+              <strong>Configured RawUdp Interface</strong>
+              <code id="raw-udp-interface">loading…</code>
+            </div>
+            <div class="state-row">
+              <strong>Advertised Addresses</strong>
+              <code id="endpoint-addrs">loading…</code>
+            </div>
+          </div>
         </section>
         <section class="panel panel-full">
           <h2>Pairing</h2>
           <div class="stack">
-            <p class="muted">Copy the local ticket from one grain into the remote ticket field of the other. The probe path uses one echo round trip over a real <code>iroh</code> connection.</p>
+            <p class="muted">The local ticket is generated automatically from current endpoint state. For the Sandstorm RawUdp path, this box must contain a <code>custom:</code> line before you try the probe.</p>
             <textarea id="local-ticket" spellcheck="false" readonly></textarea>
             <textarea id="remote-ticket" spellcheck="false" placeholder="Remote node ticket"></textarea>
             <div class="button-row">
@@ -237,49 +272,63 @@
             </div>
           </div>
         </section>
-        <section class="panel panel-full">
+        <section class="panel panel-half">
           <h2>Saved Capabilities</h2>
           <div class="stack">
-            <p class="muted">Capability-gated HTTP probe target.</p>
-            <div class="button-row">
-              <input id="network-probe-host" type="text" value="neverssl.com" placeholder="Host">
-              <input id="network-probe-port" type="number" value="80" min="1" max="65535" placeholder="Port">
-              <input id="network-probe-path" type="text" value="/" placeholder="Path">
-            </div>
-            <p class="muted">Raw TCP probe target and payload.</p>
-            <div class="button-row">
-              <input id="tcp-probe-host" type="text" value="neverssl.com" placeholder="Host">
-              <input id="tcp-probe-port" type="number" value="80" min="1" max="65535" placeholder="Port">
-            </div>
-            <textarea id="tcp-probe-payload" spellcheck="false">GET / HTTP/1.0
+            <p class="muted">The only capability you need for this path is a saved <code>IpInterface</code>. After saving it, click <code>Use for RawUdp</code>. Once active, the local ticket should pick up a <code>custom:</code> address.</p>
+          </div>
+          <ul id="saved-caps"></ul>
+        </section>
+        <section class="panel panel-half">
+          <h2>Reference</h2>
+          <p id="transport-assessment" class="muted">loading…</p>
+          <details class="advanced">
+            <summary>Advanced Tools</summary>
+            <div class="stack">
+              <div class="button-row">
+                <button id="request-cap">Request Capability</button>
+                <button id="request-ip-network">Request IP Network</button>
+              </div>
+              <p class="muted">Capability-gated HTTP probe target.</p>
+              <div class="button-row">
+                <input id="network-probe-host" type="text" value="neverssl.com" placeholder="Host">
+                <input id="network-probe-port" type="number" value="80" min="1" max="65535" placeholder="Port">
+                <input id="network-probe-path" type="text" value="/" placeholder="Path">
+              </div>
+              <p class="muted">Raw TCP probe target and payload.</p>
+              <div class="button-row">
+                <input id="tcp-probe-host" type="text" value="neverssl.com" placeholder="Host">
+                <input id="tcp-probe-port" type="number" value="80" min="1" max="65535" placeholder="Port">
+              </div>
+              <textarea id="tcp-probe-payload" spellcheck="false">GET / HTTP/1.0
 Host: neverssl.com
 
 </textarea>
-            <p class="muted">Generic binary exchange target. Request and response payloads are base64-encoded so this can drive non-text experiments.</p>
-            <div class="button-row">
-              <input id="exchange-host" type="text" value="neverssl.com" placeholder="Host">
-              <input id="exchange-port" type="number" value="80" min="1" max="65535" placeholder="Port">
+              <p class="muted">Generic binary exchange target. Request and response payloads are base64-encoded so this can drive non-text experiments.</p>
+              <div class="button-row">
+                <input id="exchange-host" type="text" value="neverssl.com" placeholder="Host">
+                <input id="exchange-port" type="number" value="80" min="1" max="65535" placeholder="Port">
+              </div>
+              <textarea id="exchange-payload" spellcheck="false">R0VUIC8gSFRUUC8xLjANCkhvc3Q6IG5ldmVyc3NsLmNvbQ0KDQo=</textarea>
+              <p class="muted">UDP probe target. Payload is base64-encoded and the app waits for one return packet delivered through Sandstorm's <code>UdpPort</code> callback path.</p>
+              <div class="button-row">
+                <input id="udp-probe-host" type="text" value="1.1.1.1" placeholder="Host">
+                <input id="udp-probe-port" type="number" value="53" min="1" max="65535" placeholder="Port">
+                <input id="udp-probe-wait" type="number" value="1000" min="0" placeholder="Wait ms">
+              </div>
+              <textarea id="udp-probe-payload" spellcheck="false">AAABAAABAAAAAAAAB2V4YW1wbGUDY29tAAABAAE=</textarea>
+              <p class="muted">Stateful TCP session target and payload. Payloads use base64 so you can send partial frames without the one-shot exchange closing the stream.</p>
+              <div class="button-row">
+                <input id="session-host" type="text" value="neverssl.com" placeholder="Host">
+                <input id="session-port" type="number" value="80" min="1" max="65535" placeholder="Port">
+                <input id="session-read-max" type="number" value="4096" min="1" placeholder="Read bytes">
+                <input id="session-read-wait" type="number" value="250" min="0" placeholder="Wait ms">
+              </div>
+              <textarea id="session-payload" spellcheck="false">R0VUIC8gSFRUUC8xLjANCkhvc3Q6IG5ldmVyc3NsLmNvbQ0KDQo=</textarea>
+              <h2>Active TCP Sessions</h2>
+              <ul id="active-tcp-sessions"></ul>
             </div>
-            <textarea id="exchange-payload" spellcheck="false">R0VUIC8gSFRUUC8xLjANCkhvc3Q6IG5ldmVyc3NsLmNvbQ0KDQo=</textarea>
-            <p class="muted">UDP probe target. Payload is base64-encoded and the app waits for one return packet delivered through Sandstorm's <code>UdpPort</code> callback path.</p>
-            <div class="button-row">
-              <input id="udp-probe-host" type="text" value="1.1.1.1" placeholder="Host">
-              <input id="udp-probe-port" type="number" value="53" min="1" max="65535" placeholder="Port">
-              <input id="udp-probe-wait" type="number" value="1000" min="0" placeholder="Wait ms">
-            </div>
-            <textarea id="udp-probe-payload" spellcheck="false">AAABAAABAAAAAAAAB2V4YW1wbGUDY29tAAABAAE=</textarea>
-            <p class="muted">Stateful TCP session target and payload. Payloads use base64 so you can send partial frames without the one-shot exchange closing the stream.</p>
-            <div class="button-row">
-              <input id="session-host" type="text" value="neverssl.com" placeholder="Host">
-              <input id="session-port" type="number" value="80" min="1" max="65535" placeholder="Port">
-              <input id="session-read-max" type="number" value="4096" min="1" placeholder="Read bytes">
-              <input id="session-read-wait" type="number" value="250" min="0" placeholder="Wait ms">
-            </div>
-            <textarea id="session-payload" spellcheck="false">R0VUIC8gSFRUUC8xLjANCkhvc3Q6IG5ldmVyc3NsLmNvbQ0KDQo=</textarea>
-          </div>
-          <ul id="saved-caps"></ul>
-          <h2>Active TCP Sessions</h2>
-          <ul id="active-tcp-sessions"></ul>
+          </details>
         </section>
       </section>
     </main>
@@ -289,11 +338,14 @@ Host: neverssl.com
       const nodeIdEl = document.getElementById("node-id");
       const endpointAddrsEl = document.getElementById("endpoint-addrs");
       const endpointStatusEl = document.getElementById("endpoint-status");
+      const rawUdpInterfaceEl = document.getElementById("raw-udp-interface");
       const transportAssessmentEl = document.getElementById("transport-assessment");
+      const customTransportPillEl = document.getElementById("custom-transport-pill");
       const localTicketEl = document.getElementById("local-ticket");
       const remoteTicketEl = document.getElementById("remote-ticket");
       const requestButton = document.getElementById("request-cap");
       const requestIpNetworkButton = document.getElementById("request-ip-network");
+      const requestIpInterfaceButton = document.getElementById("request-ip-interface");
       const saveTicketButton = document.getElementById("save-ticket");
       const clearTicketButton = document.getElementById("clear-ticket");
       const probeTicketButton = document.getElementById("probe-ticket");
@@ -319,6 +371,7 @@ Host: neverssl.com
       let powerboxQueries = {
         apiSession: "",
         ipNetwork: "",
+        ipInterface: "",
       };
 
       function setStatus(text) {
@@ -442,7 +495,7 @@ Host: neverssl.com
         }
       }
 
-      function renderSavedCaps(items) {
+      function renderSavedCaps(items, rawUdpInterface) {
         savedCapsEl.innerHTML = "";
         if (!items.length) {
           const item = document.createElement("li");
@@ -457,6 +510,41 @@ Host: neverssl.com
           const label = document.createElement("span");
           label.innerHTML = `${entry.label}: <code>${entry.savedToken}</code> <span class="muted">object</span> <code>${entry.objectId || entry.id}</code>`;
           item.appendChild(label);
+
+          const isConfiguredRawUdp =
+            rawUdpInterface && rawUdpInterface.savedToken === entry.savedToken;
+
+          const bindButton = document.createElement("button");
+          bindButton.textContent = isConfiguredRawUdp ? "RawUdp Active" : "Use for RawUdp";
+          bindButton.disabled = !!isConfiguredRawUdp;
+          bindButton.addEventListener("click", async () => {
+            setStatus(`Configuring RawUdp bind with ${entry.savedToken}...`);
+            const response = await fetch("api/endpoint/raw-udp-interface", {
+              method: "POST",
+              headers: { "Content-Type": "text/plain" },
+              body: entry.savedToken,
+            });
+
+            if (!response.ok) {
+              const body = await response.text();
+              const text = body.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+              setStatus(`RawUdp bind update failed with HTTP ${response.status}: ${text}`);
+              return;
+            }
+
+            setStatus(`RawUdp bind configured from ${entry.label}.`);
+            await refreshState();
+          });
+          item.appendChild(bindButton);
+
+          const advanced = document.createElement("details");
+          advanced.className = "advanced";
+          const summary = document.createElement("summary");
+          summary.textContent = "Advanced capability actions";
+          advanced.appendChild(summary);
+
+          const advancedRow = document.createElement("div");
+          advancedRow.className = "button-row";
 
           const button = document.createElement("button");
           button.textContent = "Restore Probe";
@@ -474,7 +562,7 @@ Host: neverssl.com
               setStatus(`Restore failed with HTTP ${response.status}`);
             }
           });
-          item.appendChild(button);
+          advancedRow.appendChild(button);
 
           const objectButton = document.createElement("button");
           objectButton.textContent = "Object Probe";
@@ -493,7 +581,7 @@ Host: neverssl.com
               setStatus(`Object restore failed with HTTP ${response.status}`);
             }
           });
-          item.appendChild(objectButton);
+          advancedRow.appendChild(objectButton);
 
           const networkButton = document.createElement("button");
           networkButton.textContent = "IP Network Probe";
@@ -518,7 +606,7 @@ Host: neverssl.com
             const result = await response.json();
             setStatus(`IP network probe to ${result.host}:${result.port}${result.path} succeeded: ${result.responsePreview} [${result.trace}]`);
           });
-          item.appendChild(networkButton);
+          advancedRow.appendChild(networkButton);
 
           const tcpButton = document.createElement("button");
           tcpButton.textContent = "TCP Byte Probe";
@@ -543,7 +631,7 @@ Host: neverssl.com
             const result = await response.json();
             setStatus(`TCP byte probe to ${result.host}:${result.port} returned ${result.responseByteCount} bytes: ${result.responsePreview} [${result.trace}]`);
           });
-          item.appendChild(tcpButton);
+          advancedRow.appendChild(tcpButton);
 
           const exchangeButton = document.createElement("button");
           exchangeButton.textContent = "Binary Exchange";
@@ -569,7 +657,7 @@ Host: neverssl.com
             const preview = previewBase64Payload(result.responseBase64);
             setStatus(`Binary exchange to ${result.host}:${result.port} returned ${result.responseByteCount} bytes: ${preview} [${result.trace}]`);
           });
-          item.appendChild(exchangeButton);
+          advancedRow.appendChild(exchangeButton);
 
           const udpButton = document.createElement("button");
           udpButton.textContent = "UDP Probe";
@@ -613,7 +701,7 @@ Host: neverssl.com
             const preview = previewBase64Payload(result.responseBase64);
             setStatus(`UDP probe to ${result.host}:${result.port} returned ${result.responseByteCount} bytes in ${result.responsePacketCount} packet(s): ${preview} [${result.trace}]`);
           });
-          item.appendChild(udpButton);
+          advancedRow.appendChild(udpButton);
 
           const sessionButton = document.createElement("button");
           sessionButton.textContent = "Open TCP Session";
@@ -638,7 +726,32 @@ Host: neverssl.com
             setStatus(`Opened TCP session ${result.sessionId} to ${result.host}:${result.port} [${result.trace}]`);
             await refreshState();
           });
-          item.appendChild(sessionButton);
+          advancedRow.appendChild(sessionButton);
+
+          advanced.appendChild(advancedRow);
+          item.appendChild(advanced);
+
+          if (isConfiguredRawUdp) {
+            const clearBindButton = document.createElement("button");
+            clearBindButton.textContent = "Clear RawUdp";
+            clearBindButton.addEventListener("click", async () => {
+              setStatus("Clearing RawUdp bind configuration...");
+              const response = await fetch("api/endpoint/raw-udp-interface", {
+                method: "PUT",
+              });
+
+              if (!response.ok) {
+                const body = await response.text();
+                const text = body.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+                setStatus(`RawUdp bind clear failed with HTTP ${response.status}: ${text}`);
+                return;
+              }
+
+              setStatus("RawUdp bind configuration cleared.");
+              await refreshState();
+            });
+            item.appendChild(clearBindButton);
+          }
           savedCapsEl.appendChild(item);
         }
       }
@@ -650,12 +763,20 @@ Host: neverssl.com
         powerboxQueries = data.powerboxQueries || powerboxQueries;
         const endpoint = data.irohEndpoint || {};
         const directAddrs = endpoint.directAddrs || [];
-        endpointAddrsEl.textContent = directAddrs.length ? directAddrs.join(", ") : "none";
+        const customAddrs = endpoint.customAddrs || [];
+        const hasCustomTicket = (endpoint.localTicket || "").split("\n").some((line) => line.startsWith("custom:"));
+        endpointAddrsEl.textContent = [...directAddrs, ...customAddrs].length
+          ? [...directAddrs, ...customAddrs].join(", ")
+          : "none";
         endpointStatusEl.textContent = endpoint.error || (endpoint.bound ? "bound (relay disabled)" : "not bound");
+        rawUdpInterfaceEl.textContent = endpoint.rawUdpInterface
+          ? `${endpoint.rawUdpInterface.label} [${endpoint.rawUdpInterface.source}]`
+          : "not configured";
+        customTransportPillEl.textContent = hasCustomTicket ? "Custom Transport Ready" : "Custom Transport Missing";
         transportAssessmentEl.textContent = data.transportAssessment || "unavailable";
         localTicketEl.value = endpoint.localTicket || "";
         remoteTicketEl.value = data.remoteTicket || "";
-        renderSavedCaps(data.savedCaps || []);
+        renderSavedCaps(data.savedCaps || [], endpoint.rawUdpInterface || null);
         renderActiveTcpSessions(data.activeTcpSessions || []);
       }
 
@@ -767,6 +888,14 @@ Host: neverssl.com
           return;
         }
         requestPowerboxCapability(powerboxQueries.ipNetwork, "IpNetwork capability");
+      });
+
+      requestIpInterfaceButton.addEventListener("click", () => {
+        if (!powerboxQueries.ipInterface) {
+          setStatus("IpInterface query is not loaded yet.");
+          return;
+        }
+        requestPowerboxCapability(powerboxQueries.ipInterface, "IpInterface capability");
       });
 
       refreshState().catch((error) => {

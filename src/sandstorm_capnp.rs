@@ -3,7 +3,7 @@ pub mod stream_capnp {
 }
 pub mod persistent_capnp {
     pub mod persistent {
-        pub trait Server<SturdyRef, Owner>
+        pub trait Server<SturdyRef, Owner>: 'static
         where
             SturdyRef: ::capnp::traits::Owned,
             Owner: ::capnp::traits::Owned,
@@ -11,7 +11,7 @@ pub mod persistent_capnp {
         }
 
         pub struct ServerDispatch<_T, SturdyRef, Owner> {
-            pub server: _T,
+            pub server: ::capnp::capability::Rc<_T>,
             _phantom: ::core::marker::PhantomData<(SturdyRef, Owner)>,
         }
 
@@ -21,14 +21,17 @@ pub mod persistent_capnp {
             Owner: ::capnp::traits::Owned,
         {
             pub fn dispatch_call_internal(
-                _server: &mut _T,
+                _server: ::capnp::capability::Rc<_T>,
                 _method_id: u16,
                 _params: ::capnp::capability::Params<::capnp::any_pointer::Owned>,
                 _results: ::capnp::capability::Results<::capnp::any_pointer::Owned>,
-            ) -> ::capnp::capability::Promise<(), ::capnp::Error> {
-                ::capnp::capability::Promise::err(::capnp::Error::unimplemented(
-                    "persistent capability server dispatch not implemented".to_string(),
-                ))
+            ) -> ::capnp::capability::DispatchCallResult {
+                ::capnp::capability::DispatchCallResult::new(
+                    ::capnp::capability::Promise::err(::capnp::Error::unimplemented(
+                        "persistent capability server dispatch not implemented".to_string(),
+                    )),
+                    false,
+                )
             }
         }
     }

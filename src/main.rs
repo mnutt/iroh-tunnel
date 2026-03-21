@@ -1,4 +1,13 @@
+#![allow(refining_impl_trait)]
+
 include!("sandstorm_capnp.rs");
+
+#[allow(dead_code)]
+mod quinn_adapter;
+#[allow(dead_code)]
+mod raw_udp_capnp;
+#[allow(dead_code)]
+mod sandstorm_custom_transport;
 
 use base64::Engine as _;
 use std::collections::HashMap;
@@ -9,27 +18,38 @@ use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use capnp::capability::Promise;
+use capnp::capability::{Promise, Rc};
 use capnp::text;
 use capnp::traits::HasTypeId;
 use capnp_rpc::{RpcSystem, new_client, pry, rpc_twoparty_capnp, twoparty};
 use futures::AsyncReadExt;
 use futures::TryFutureExt;
-use iroh::{Endpoint, RelayMode, SecretKey, TransportAddr};
+use iroh::{Endpoint, RelayMode, SecretKey, TransportAddr, endpoint::presets};
+use iroh_base::CustomAddr;
 use serde_json::json;
 use tokio::runtime::Builder;
 use tokio::sync::Notify;
+use tokio::task::LocalSet;
 use tokio::time::{Duration, timeout};
 use tokio_util::compat::TokioAsyncReadCompatExt;
+
+use crate::raw_udp_capnp::{get_local_endpoint, new_capnp_raw_udp_custom_transport};
+use crate::sandstorm_custom_transport::{
+    socket_addr_to_custom_addr, SANDSTORM_RAW_UDP_TRANSPORT_ID,
+};
 
 const CLIENT_ROOT: &str = "/opt/app/client";
 const STATE_DIR: &str = "/var/iroh-tunnel";
 const SAVED_CAPS_PATH: &str = "/var/iroh-tunnel/saved-caps.tsv";
+const RAW_UDP_INTERFACE_TOKEN_PATH: &str = "/var/iroh-tunnel/raw-udp-interface-token";
+const RAW_UDP_PORT_PATH: &str = "/var/iroh-tunnel/raw-udp-port";
 const IROH_SECRET_KEY_PATH: &str = "/var/iroh-tunnel/iroh-secret-key";
 const REMOTE_TICKET_PATH: &str = "/var/iroh-tunnel/remote-ticket.txt";
 const WEB_SESSION_TYPE_ID: u64 = web_session_capnp::web_session::Client::TYPE_ID;
 const IROH_ALPN: &[u8] = b"dev.iroh-tunnel.capnp/1";
-const IROH_TRANSPORT_ASSESSMENT: &str = "Saved IpNetwork is proven for outbound TCP and UDP. Native iroh 0.96.1 Endpoint::builder() still binds native IP transports internally. Lower-level iroh-quinn 0.16.1 does expose Endpoint::new_with_abstract_socket(...) and AsyncUdpSocket, but its recv path requires per-datagram source-address metadata. The vendored Sandstorm ip.capnp surface does not provide that today: IpRemoteHost.getUdpPort() and IpInterface.listenUdp() both operate on UdpPort, and UdpPort only exposes send(message, returnPort) callbacks with message bytes rather than packet source/destination metadata. The next blocker is missing UDP packet metadata, not missing outbound UDP send capability.";
+const IROH_TRANSPORT_ASSESSMENT: &str = "Saved IpNetwork is proven for outbound TCP and UDP. Native iroh 0.97.0 now exposes custom transports behind unstable-custom-transports, and this prototype has both a proxy-based Quinn RawUdp adapter and a native iroh CustomTransport scaffold for Sandstorm RawUdp. The remaining work is application plumbing: restore an IpInterface capability early enough to bind RawUdp, publish custom transport addresses in tickets, and decide how Sandstorm mode is configured and discovered.";
+const IROH_SANDSTORM_RAW_UDP_INTERFACE_TOKEN_ENV: &str = "IROH_SANDSTORM_RAW_UDP_INTERFACE_TOKEN";
+const IROH_SANDSTORM_RAW_UDP_PORT_ENV: &str = "IROH_SANDSTORM_RAW_UDP_PORT";
 
 fn main() {
     if let Err(err) = run() {
@@ -44,9 +64,9 @@ fn run() -> Result<(), String> {
         .enable_time()
         .build()
         .map_err(|err| format!("failed to create tokio runtime: {err}"))?;
+    let local_set = LocalSet::new();
 
-    runtime.block_on(async {
-        let app_state = Arc::new(Mutex::new(AppState::initialize().await?));
+    runtime.block_on(local_set.run_until(async {
         let rpc_fd = 3;
 
         let stream: std::os::unix::net::UnixStream =
@@ -68,24 +88,37 @@ fn run() -> Result<(), String> {
 
         let (tx, rx) = futures::channel::oneshot::channel();
         let sandstorm_api: grain_capnp::sandstorm_api::Client<capnp::any_pointer::Owned> =
-            capnp_rpc::new_promise_client(rx.map_err(|_| {
+            capnp_rpc::new_future_client(rx.map_err(|_| {
                 capnp::Error::failed("sandstorm api bootstrap channel was canceled".to_string())
             }));
+        let app_state = Arc::new(Mutex::new(AppState::initialize()?));
 
         let client: grain_capnp::main_view::Client<text::Owned> =
-            new_client(UiViewImpl::new(sandstorm_api, app_state));
+            new_client(UiViewImpl::new(sandstorm_api.clone(), app_state.clone()));
 
         let mut rpc_system = RpcSystem::new(network, Some(client.client));
         let remote_api = rpc_system
             .bootstrap::<grain_capnp::sandstorm_api::Client<capnp::any_pointer::Owned>>(
                 rpc_twoparty_capnp::Side::Server,
             );
-        let _ = tx.send(remote_api.client);
+        let _ = tx.send(remote_api);
+        tokio::task::spawn_local({
+            let app_state = app_state.clone();
+            let sandstorm_api = sandstorm_api.clone();
+            async move {
+                eprintln!("iroh startup: beginning background endpoint initialization");
+                if let Err(err) = initialize_iroh_endpoint(app_state, sandstorm_api).await {
+                    eprintln!("iroh startup: endpoint initialization failed: {err}");
+                } else {
+                    eprintln!("iroh startup: endpoint initialization finished");
+                }
+            }
+        });
 
         rpc_system
             .await
             .map_err(|err| format!("rpc system failed: {err}"))
-    })
+    }))
 }
 
 struct UiViewImpl {
@@ -107,7 +140,7 @@ impl UiViewImpl {
 
 impl grain_capnp::ui_view::Server for UiViewImpl {
     fn get_view_info(
-        &mut self,
+        self: Rc<Self>,
         _: grain_capnp::ui_view::GetViewInfoParams,
         mut results: grain_capnp::ui_view::GetViewInfoResults,
     ) -> Promise<(), capnp::Error> {
@@ -117,7 +150,7 @@ impl grain_capnp::ui_view::Server for UiViewImpl {
         let mut permissions = view_info.reborrow().init_permissions(2);
         {
             let mut permission = permissions.reborrow().get(0);
-            permission.set_name("manageTunnel".into());
+            permission.set_name("manageTunnel");
             init_localized_text(permission.reborrow().init_title(), "manage tunnel");
             init_localized_text(
                 permission.init_description(),
@@ -126,7 +159,7 @@ impl grain_capnp::ui_view::Server for UiViewImpl {
         }
         {
             let mut permission = permissions.get(1);
-            permission.set_name("useReceivedCaps".into());
+            permission.set_name("useReceivedCaps");
             init_localized_text(
                 permission.reborrow().init_title(),
                 "use received capabilities",
@@ -162,7 +195,7 @@ impl grain_capnp::ui_view::Server for UiViewImpl {
     }
 
     fn new_session(
-        &mut self,
+        self: Rc<Self>,
         params: grain_capnp::ui_view::NewSessionParams,
         mut results: grain_capnp::ui_view::NewSessionResults,
     ) -> Promise<(), capnp::Error> {
@@ -198,7 +231,7 @@ impl grain_capnp::ui_view::Server for UiViewImpl {
 
 impl grain_capnp::main_view::Server<text::Owned> for UiViewImpl {
     fn restore(
-        &mut self,
+        self: Rc<Self>,
         params: grain_capnp::main_view::RestoreParams<text::Owned>,
         mut results: grain_capnp::main_view::RestoreResults<text::Owned>,
     ) -> Promise<(), capnp::Error> {
@@ -243,7 +276,7 @@ impl grain_capnp::main_view::Server<text::Owned> for UiViewImpl {
     }
 
     fn drop(
-        &mut self,
+        self: Rc<Self>,
         _: grain_capnp::main_view::DropParams<text::Owned>,
         _: grain_capnp::main_view::DropResults<text::Owned>,
     ) -> Promise<(), capnp::Error> {
@@ -262,7 +295,7 @@ impl grain_capnp::ui_session::Server for WebSessionImpl {}
 
 impl web_session_capnp::web_session::Server for WebSessionImpl {
     fn get(
-        &mut self,
+        self: Rc<Self>,
         params: web_session_capnp::web_session::GetParams,
         mut results: web_session_capnp::web_session::GetResults,
     ) -> Promise<(), capnp::Error> {
@@ -275,7 +308,7 @@ impl web_session_capnp::web_session::Server for WebSessionImpl {
 
         if path == ".can-write" {
             let mut response = results.get().init_content();
-            response.set_mime_type("text/plain".into());
+            response.set_mime_type("text/plain");
             response
                 .init_body()
                 .set_bytes(format!("{}", self.can_manage).as_bytes());
@@ -289,7 +322,7 @@ impl web_session_capnp::web_session::Server for WebSessionImpl {
             };
             let mut response = results.get().init_content();
             response.set_status_code(web_session_capnp::web_session::response::SuccessCode::Ok);
-            response.set_mime_type("application/json".into());
+            response.set_mime_type("application/json");
             response.init_body().set_bytes(body.as_bytes());
             return Promise::ok(());
         }
@@ -308,7 +341,7 @@ impl web_session_capnp::web_session::Server for WebSessionImpl {
             let location = format!("{path}/");
             redirect.set_is_permanent(true);
             redirect.set_switch_to_get(true);
-            redirect.set_location(location.as_str().into());
+            redirect.set_location(location.as_str());
             return Promise::ok(());
         }
 
@@ -319,7 +352,7 @@ impl web_session_capnp::web_session::Server for WebSessionImpl {
     }
 
     fn post(
-        &mut self,
+        self: Rc<Self>,
         params: web_session_capnp::web_session::PostParams,
         mut results: web_session_capnp::web_session::PostResults,
     ) -> Promise<(), capnp::Error> {
@@ -351,7 +384,7 @@ impl web_session_capnp::web_session::Server for WebSessionImpl {
                     error.set_status_code(
                         web_session_capnp::web_session::response::ClientErrorCode::BadRequest,
                     );
-                    error.set_description_html(description.as_str().into());
+                    error.set_description_html(description.as_str());
                     return Promise::ok(());
                 }
             };
@@ -362,7 +395,7 @@ impl web_session_capnp::web_session::Server for WebSessionImpl {
                     let mut content = results.get().init_content();
                     content
                         .set_status_code(web_session_capnp::web_session::response::SuccessCode::Ok);
-                    content.set_mime_type("application/json".into());
+                    content.set_mime_type("application/json");
                     content.init_body().set_bytes(br#"{"ok":true}"#);
                 }
                 Err(err) => {
@@ -371,7 +404,7 @@ impl web_session_capnp::web_session::Server for WebSessionImpl {
                         "<!doctype html><title>Pairing Update Failed</title><pre>{}</pre>",
                         escape_html(&err)
                     );
-                    error.set_description_html(description.as_str().into());
+                    error.set_description_html(description.as_str());
                 }
             }
             return Promise::ok(());
@@ -399,7 +432,7 @@ impl web_session_capnp::web_session::Server for WebSessionImpl {
                         content.set_status_code(
                             web_session_capnp::web_session::response::SuccessCode::Ok,
                         );
-                        content.set_mime_type("application/json".into());
+                        content.set_mime_type("application/json");
                         content.init_body().set_bytes(body.as_bytes());
                     }
                     Err(err) => {
@@ -409,7 +442,97 @@ impl web_session_capnp::web_session::Server for WebSessionImpl {
                             "<!doctype html><title>Probe Failed</title><pre>{}</pre>",
                             escape_html(&err)
                         );
-                        error.set_description_html(description.as_str().into());
+                        error.set_description_html(description.as_str());
+                    }
+                }
+                Ok(())
+            });
+        }
+
+        if path == "api/endpoint/raw-udp-interface" {
+            if !self.can_manage {
+                let mut error = results.get().init_client_error();
+                error.set_status_code(
+                    web_session_capnp::web_session::response::ClientErrorCode::Forbidden,
+                );
+                return Promise::ok(());
+            }
+
+            let body = pry!(params.get_content())
+                .get_content()
+                .unwrap_or(&[])
+                .to_vec();
+            let saved_token = match std::str::from_utf8(&body) {
+                Ok(value) => value.trim().to_string(),
+                Err(err) => {
+                    let mut error = results.get().init_client_error();
+                    let description =
+                        format!("<!doctype html><title>Bad Request</title><p>{err}</p>");
+                    error.set_status_code(
+                        web_session_capnp::web_session::response::ClientErrorCode::BadRequest,
+                    );
+                    error.set_description_html(description.as_str());
+                    return Promise::ok(());
+                }
+            };
+            if saved_token.is_empty() {
+                let mut error = results.get().init_client_error();
+                error.set_status_code(
+                    web_session_capnp::web_session::response::ClientErrorCode::BadRequest,
+                );
+                error.set_description_html("missing saved token");
+                return Promise::ok(());
+            }
+
+            let saved_cap = match require_saved_capability_by_token(&saved_token) {
+                Ok(saved_cap) => saved_cap,
+                Err(err) if err == "saved capability token not found" => {
+                    let mut error = results.get().init_client_error();
+                    error.set_status_code(
+                        web_session_capnp::web_session::response::ClientErrorCode::NotFound,
+                    );
+                    error.set_description_html(err.as_str());
+                    return Promise::ok(());
+                }
+                Err(err) => return Promise::err(capnp::Error::failed(err)),
+            };
+
+            let app_state = self.app_state.clone();
+            let sandstorm_api = self.sandstorm_api.clone();
+            return Promise::from_future(async move {
+                let validate_api = sandstorm_api.clone();
+                let rebind_api = sandstorm_api.clone();
+                let outcome = configure_raw_udp_interface_binding(
+                    &saved_cap,
+                    |saved_token| {
+                        let sandstorm_api = validate_api.clone();
+                        async move {
+                            restore_saved_ip_interface(sandstorm_api, &saved_token)
+                                .await
+                                .map(|_| ())
+                        }
+                    },
+                    persist_raw_udp_interface_token,
+                    || initialize_iroh_endpoint(app_state, rebind_api),
+                )
+                .await;
+
+                match outcome {
+                    Ok(()) => {
+                        let mut content = results.get().init_content();
+                        content.set_status_code(
+                            web_session_capnp::web_session::response::SuccessCode::Ok,
+                        );
+                        content.set_mime_type("application/json");
+                        content.init_body().set_bytes(br#"{"ok":true}"#);
+                    }
+                    Err(err) => {
+                        let mut error = results.get().init_server_error();
+                        let description = format!(
+                            "<!doctype html><title>Raw UDP Interface Update Failed</title><pre>{}</pre>",
+                            escape_html(&err)
+                        );
+                        error.set_description_html(description.as_str());
                     }
                 }
                 Ok(())
@@ -438,7 +561,7 @@ impl web_session_capnp::web_session::Server for WebSessionImpl {
                     error.set_status_code(
                         web_session_capnp::web_session::response::ClientErrorCode::BadRequest,
                     );
-                    error.set_description_html(description.as_str().into());
+                    error.set_description_html(description.as_str());
                     return Promise::ok(());
                 }
             };
@@ -451,7 +574,7 @@ impl web_session_capnp::web_session::Server for WebSessionImpl {
                     error.set_status_code(
                         web_session_capnp::web_session::response::ClientErrorCode::BadRequest,
                     );
-                    error.set_description_html(description.as_str().into());
+                    error.set_description_html(description.as_str());
                     return Promise::ok(());
                 }
             };
@@ -472,7 +595,7 @@ impl web_session_capnp::web_session::Server for WebSessionImpl {
                         content.set_status_code(
                             web_session_capnp::web_session::response::SuccessCode::Ok,
                         );
-                        content.set_mime_type("application/json".into());
+                        content.set_mime_type("application/json");
                         content.init_body().set_bytes(body.as_bytes());
                     }
                     Err(err) => {
@@ -482,7 +605,7 @@ impl web_session_capnp::web_session::Server for WebSessionImpl {
                             "<!doctype html><title>Network Probe Failed</title><pre>{}</pre>",
                             escape_html(&err)
                         );
-                        error.set_description_html(description.as_str().into());
+                        error.set_description_html(description.as_str());
                     }
                 }
                 Ok(())
@@ -511,7 +634,7 @@ impl web_session_capnp::web_session::Server for WebSessionImpl {
                     error.set_status_code(
                         web_session_capnp::web_session::response::ClientErrorCode::BadRequest,
                     );
-                    error.set_description_html(description.as_str().into());
+                    error.set_description_html(description.as_str());
                     return Promise::ok(());
                 }
             };
@@ -524,7 +647,7 @@ impl web_session_capnp::web_session::Server for WebSessionImpl {
                     error.set_status_code(
                         web_session_capnp::web_session::response::ClientErrorCode::BadRequest,
                     );
-                    error.set_description_html(description.as_str().into());
+                    error.set_description_html(description.as_str());
                     return Promise::ok(());
                 }
             };
@@ -550,7 +673,7 @@ impl web_session_capnp::web_session::Server for WebSessionImpl {
                         content.set_status_code(
                             web_session_capnp::web_session::response::SuccessCode::Ok,
                         );
-                        content.set_mime_type("application/json".into());
+                        content.set_mime_type("application/json");
                         content.init_body().set_bytes(body.as_bytes());
                     }
                     Err(err) => {
@@ -560,7 +683,7 @@ impl web_session_capnp::web_session::Server for WebSessionImpl {
                             "<!doctype html><title>TCP Probe Failed</title><pre>{}</pre>",
                             escape_html(&err)
                         );
-                        error.set_description_html(description.as_str().into());
+                        error.set_description_html(description.as_str());
                     }
                 }
                 Ok(())
@@ -589,7 +712,7 @@ impl web_session_capnp::web_session::Server for WebSessionImpl {
                     error.set_status_code(
                         web_session_capnp::web_session::response::ClientErrorCode::BadRequest,
                     );
-                    error.set_description_html(description.as_str().into());
+                    error.set_description_html(description.as_str());
                     return Promise::ok(());
                 }
             };
@@ -602,7 +725,7 @@ impl web_session_capnp::web_session::Server for WebSessionImpl {
                     error.set_status_code(
                         web_session_capnp::web_session::response::ClientErrorCode::BadRequest,
                     );
-                    error.set_description_html(description.as_str().into());
+                    error.set_description_html(description.as_str());
                     return Promise::ok(());
                 }
             };
@@ -640,7 +763,7 @@ impl web_session_capnp::web_session::Server for WebSessionImpl {
                         content.set_status_code(
                             web_session_capnp::web_session::response::SuccessCode::Ok,
                         );
-                        content.set_mime_type("application/json".into());
+                        content.set_mime_type("application/json");
                         content.init_body().set_bytes(body.as_bytes());
                     }
                     Ok(Err(err)) => {
@@ -650,7 +773,7 @@ impl web_session_capnp::web_session::Server for WebSessionImpl {
                             "<!doctype html><title>UDP Probe Failed</title><pre>{}</pre>",
                             escape_html(&err)
                         );
-                        error.set_description_html(description.as_str().into());
+                        error.set_description_html(description.as_str());
                     }
                     Err(_) => {
                         eprintln!(
@@ -662,7 +785,7 @@ impl web_session_capnp::web_session::Server for WebSessionImpl {
                             "<!doctype html><title>UDP Probe Failed</title><pre>UDP probe request timed out after {}ms before the server produced a response</pre>",
                             request_timeout_ms
                         );
-                        error.set_description_html(description.as_str().into());
+                        error.set_description_html(description.as_str());
                     }
                 }
                 Ok(())
@@ -691,7 +814,7 @@ impl web_session_capnp::web_session::Server for WebSessionImpl {
                     error.set_status_code(
                         web_session_capnp::web_session::response::ClientErrorCode::BadRequest,
                     );
-                    error.set_description_html(description.as_str().into());
+                    error.set_description_html(description.as_str());
                     return Promise::ok(());
                 }
             };
@@ -704,7 +827,7 @@ impl web_session_capnp::web_session::Server for WebSessionImpl {
                     error.set_status_code(
                         web_session_capnp::web_session::response::ClientErrorCode::BadRequest,
                     );
-                    error.set_description_html(description.as_str().into());
+                    error.set_description_html(description.as_str());
                     return Promise::ok(());
                 }
             };
@@ -743,7 +866,7 @@ impl web_session_capnp::web_session::Server for WebSessionImpl {
                                 content.set_status_code(
                                     web_session_capnp::web_session::response::SuccessCode::Ok,
                                 );
-                                content.set_mime_type("application/json".into());
+                                content.set_mime_type("application/json");
                                 content.init_body().set_bytes(body.as_bytes());
                             }
                             Err(err) => {
@@ -753,7 +876,7 @@ impl web_session_capnp::web_session::Server for WebSessionImpl {
                                     "<!doctype html><title>Network Exchange Failed</title><pre>{}</pre>",
                                     escape_html(&err)
                                 );
-                                error.set_description_html(description.as_str().into());
+                                error.set_description_html(description.as_str());
                             }
                         }
                     }
@@ -764,7 +887,7 @@ impl web_session_capnp::web_session::Server for WebSessionImpl {
                             "<!doctype html><title>Network Exchange Failed</title><pre>{}</pre>",
                             escape_html(&err)
                         );
-                        error.set_description_html(description.as_str().into());
+                        error.set_description_html(description.as_str());
                     }
                 }
                 Ok(())
@@ -793,7 +916,7 @@ impl web_session_capnp::web_session::Server for WebSessionImpl {
                     error.set_status_code(
                         web_session_capnp::web_session::response::ClientErrorCode::BadRequest,
                     );
-                    error.set_description_html(description.as_str().into());
+                    error.set_description_html(description.as_str());
                     return Promise::ok(());
                 }
             };
@@ -806,7 +929,7 @@ impl web_session_capnp::web_session::Server for WebSessionImpl {
                     error.set_status_code(
                         web_session_capnp::web_session::response::ClientErrorCode::BadRequest,
                     );
-                    error.set_description_html(description.as_str().into());
+                    error.set_description_html(description.as_str());
                     return Promise::ok(());
                 }
             };
@@ -837,7 +960,7 @@ impl web_session_capnp::web_session::Server for WebSessionImpl {
                                     "<!doctype html><title>TCP Session Open Failed</title><pre>{}</pre>",
                                     escape_html(&err)
                                 );
-                                error.set_description_html(description.as_str().into());
+                                error.set_description_html(description.as_str());
                                 return Ok(());
                             }
                         };
@@ -854,7 +977,7 @@ impl web_session_capnp::web_session::Server for WebSessionImpl {
                                 content.set_status_code(
                                     web_session_capnp::web_session::response::SuccessCode::Ok,
                                 );
-                                content.set_mime_type("application/json".into());
+                                content.set_mime_type("application/json");
                                 content.init_body().set_bytes(body.as_bytes());
                             }
                             Err(err) => {
@@ -864,7 +987,7 @@ impl web_session_capnp::web_session::Server for WebSessionImpl {
                                     "<!doctype html><title>TCP Session Open Failed</title><pre>{}</pre>",
                                     escape_html(&err)
                                 );
-                                error.set_description_html(description.as_str().into());
+                                error.set_description_html(description.as_str());
                             }
                         }
                     }
@@ -875,7 +998,7 @@ impl web_session_capnp::web_session::Server for WebSessionImpl {
                             "<!doctype html><title>TCP Session Open Failed</title><pre>{}</pre>",
                             escape_html(&err)
                         );
-                        error.set_description_html(description.as_str().into());
+                        error.set_description_html(description.as_str());
                     }
                 }
                 Ok(())
@@ -904,7 +1027,7 @@ impl web_session_capnp::web_session::Server for WebSessionImpl {
                     error.set_status_code(
                         web_session_capnp::web_session::response::ClientErrorCode::BadRequest,
                     );
-                    error.set_description_html(description.as_str().into());
+                    error.set_description_html(description.as_str());
                     return Promise::ok(());
                 }
             };
@@ -917,7 +1040,7 @@ impl web_session_capnp::web_session::Server for WebSessionImpl {
                     error.set_status_code(
                         web_session_capnp::web_session::response::ClientErrorCode::BadRequest,
                     );
-                    error.set_description_html(description.as_str().into());
+                    error.set_description_html(description.as_str());
                     return Promise::ok(());
                 }
             };
@@ -937,7 +1060,7 @@ impl web_session_capnp::web_session::Server for WebSessionImpl {
                                             "<!doctype html><title>TCP Session Send Failed</title><pre>{}</pre>",
                                             escape_html(&err)
                                         );
-                                        error.set_description_html(description.as_str().into());
+                                        error.set_description_html(description.as_str());
                                         return Ok(());
                                     }
                                 };
@@ -951,7 +1074,7 @@ impl web_session_capnp::web_session::Server for WebSessionImpl {
                                 content.set_status_code(
                                     web_session_capnp::web_session::response::SuccessCode::Ok,
                                 );
-                                content.set_mime_type("application/json".into());
+                                content.set_mime_type("application/json");
                                 content.init_body().set_bytes(body.as_bytes());
                             }
                             Err(err) => {
@@ -961,7 +1084,7 @@ impl web_session_capnp::web_session::Server for WebSessionImpl {
                                     "<!doctype html><title>TCP Session Send Failed</title><pre>{}</pre>",
                                     escape_html(&err)
                                 );
-                                error.set_description_html(description.as_str().into());
+                                error.set_description_html(description.as_str());
                             }
                         }
                     }
@@ -974,7 +1097,7 @@ impl web_session_capnp::web_session::Server for WebSessionImpl {
                             "<!doctype html><title>TCP Session Send Failed</title><pre>{}</pre>",
                             escape_html(&err)
                         );
-                        error.set_description_html(description.as_str().into());
+                        error.set_description_html(description.as_str());
                     }
                 }
                 Ok(())
@@ -1003,7 +1126,7 @@ impl web_session_capnp::web_session::Server for WebSessionImpl {
                     error.set_status_code(
                         web_session_capnp::web_session::response::ClientErrorCode::BadRequest,
                     );
-                    error.set_description_html(description.as_str().into());
+                    error.set_description_html(description.as_str());
                     return Promise::ok(());
                 }
             };
@@ -1016,7 +1139,7 @@ impl web_session_capnp::web_session::Server for WebSessionImpl {
                     error.set_status_code(
                         web_session_capnp::web_session::response::ClientErrorCode::BadRequest,
                     );
-                    error.set_description_html(description.as_str().into());
+                    error.set_description_html(description.as_str());
                     return Promise::ok(());
                 }
             };
@@ -1050,7 +1173,7 @@ impl web_session_capnp::web_session::Server for WebSessionImpl {
                             content.set_status_code(
                                 web_session_capnp::web_session::response::SuccessCode::Ok,
                             );
-                            content.set_mime_type("application/json".into());
+                            content.set_mime_type("application/json");
                             content.init_body().set_bytes(body.as_bytes());
                         }
                         Err(err) => {
@@ -1060,7 +1183,7 @@ impl web_session_capnp::web_session::Server for WebSessionImpl {
                                 "<!doctype html><title>TCP Session Receive Failed</title><pre>{}</pre>",
                                 escape_html(&err)
                             );
-                            error.set_description_html(description.as_str().into());
+                            error.set_description_html(description.as_str());
                         }
                     },
                     Err(err) => {
@@ -1072,7 +1195,7 @@ impl web_session_capnp::web_session::Server for WebSessionImpl {
                             "<!doctype html><title>TCP Session Receive Failed</title><pre>{}</pre>",
                             escape_html(&err)
                         );
-                        error.set_description_html(description.as_str().into());
+                        error.set_description_html(description.as_str());
                     }
                 }
                 Ok(())
@@ -1101,7 +1224,7 @@ impl web_session_capnp::web_session::Server for WebSessionImpl {
                     error.set_status_code(
                         web_session_capnp::web_session::response::ClientErrorCode::BadRequest,
                     );
-                    error.set_description_html(description.as_str().into());
+                    error.set_description_html(description.as_str());
                     return Promise::ok(());
                 }
             };
@@ -1114,7 +1237,7 @@ impl web_session_capnp::web_session::Server for WebSessionImpl {
                     error.set_status_code(
                         web_session_capnp::web_session::response::ClientErrorCode::BadRequest,
                     );
-                    error.set_description_html(description.as_str().into());
+                    error.set_description_html(description.as_str());
                     return Promise::ok(());
                 }
             };
@@ -1133,7 +1256,7 @@ impl web_session_capnp::web_session::Server for WebSessionImpl {
                                     "<!doctype html><title>TCP Session Close Failed</title><pre>{}</pre>",
                                     escape_html(&err)
                                 );
-                                error.set_description_html(description.as_str().into());
+                                error.set_description_html(description.as_str());
                                 return Ok(());
                             }
                         };
@@ -1149,7 +1272,7 @@ impl web_session_capnp::web_session::Server for WebSessionImpl {
                                 content.set_status_code(
                                     web_session_capnp::web_session::response::SuccessCode::Ok,
                                 );
-                                content.set_mime_type("application/json".into());
+                                content.set_mime_type("application/json");
                                 content.init_body().set_bytes(body.as_bytes());
                             }
                             Err(err) => {
@@ -1159,7 +1282,7 @@ impl web_session_capnp::web_session::Server for WebSessionImpl {
                                     "<!doctype html><title>TCP Session Close Failed</title><pre>{}</pre>",
                                     escape_html(&err)
                                 );
-                                error.set_description_html(description.as_str().into());
+                                error.set_description_html(description.as_str());
                             }
                         }
                     }
@@ -1172,7 +1295,7 @@ impl web_session_capnp::web_session::Server for WebSessionImpl {
                             "<!doctype html><title>TCP Session Close Failed</title><pre>{}</pre>",
                             escape_html(&err)
                         );
-                        error.set_description_html(description.as_str().into());
+                        error.set_description_html(description.as_str());
                     }
                 }
                 Ok(())
@@ -1199,7 +1322,7 @@ impl web_session_capnp::web_session::Server for WebSessionImpl {
                 error.set_status_code(
                     web_session_capnp::web_session::response::ClientErrorCode::BadRequest,
                 );
-                error.set_description_html(description.as_str().into());
+                error.set_description_html(description.as_str());
                 return Promise::ok(());
             }
         };
@@ -1229,7 +1352,7 @@ impl web_session_capnp::web_session::Server for WebSessionImpl {
                     let mut content = results.get().init_content();
                     content
                         .set_status_code(web_session_capnp::web_session::response::SuccessCode::Ok);
-                    content.set_mime_type("application/json".into());
+                    content.set_mime_type("application/json");
                     content.init_body().set_bytes(body.as_bytes());
                 }
                 Err(err) => {
@@ -1238,7 +1361,7 @@ impl web_session_capnp::web_session::Server for WebSessionImpl {
                         "<!doctype html><title>Powerbox Claim Failed</title><pre>{}</pre>",
                         escape_html(&err)
                     );
-                    error.set_description_html(description.as_str().into());
+                    error.set_description_html(description.as_str());
                 }
             }
 
@@ -1247,7 +1370,7 @@ impl web_session_capnp::web_session::Server for WebSessionImpl {
     }
 
     fn put(
-        &mut self,
+        self: Rc<Self>,
         params: web_session_capnp::web_session::PutParams,
         mut results: web_session_capnp::web_session::PutResults,
     ) -> Promise<(), capnp::Error> {
@@ -1276,10 +1399,48 @@ impl web_session_capnp::web_session::Server for WebSessionImpl {
                         "<!doctype html><title>Pairing Delete Failed</title><pre>{}</pre>",
                         escape_html(&err)
                     );
-                    error.set_description_html(description.as_str().into());
+                    error.set_description_html(description.as_str());
                 }
             }
             return Promise::ok(());
+        }
+
+        if path == "api/endpoint/raw-udp-interface" {
+            if !self.can_manage {
+                let mut error = results.get().init_client_error();
+                error.set_status_code(
+                    web_session_capnp::web_session::response::ClientErrorCode::Forbidden,
+                );
+                return Promise::ok(());
+            }
+
+            let app_state = self.app_state.clone();
+            let sandstorm_api = self.sandstorm_api.clone();
+            return Promise::from_future(async move {
+                let outcome = clear_raw_udp_interface_binding(
+                    || {
+                        clear_persisted_raw_udp_interface_token()?;
+                        clear_persisted_raw_udp_port()
+                    },
+                    || initialize_iroh_endpoint(app_state, sandstorm_api),
+                )
+                .await;
+
+                match outcome {
+                    Ok(()) => {
+                        results.get().init_no_content();
+                    }
+                    Err(err) => {
+                        let mut error = results.get().init_server_error();
+                        let description = format!(
+                            "<!doctype html><title>Raw UDP Interface Clear Failed</title><pre>{}</pre>",
+                            escape_html(&err)
+                        );
+                        error.set_description_html(description.as_str());
+                    }
+                }
+                Ok(())
+            });
         }
 
         if path != "api/saved-cap/restore" {
@@ -1297,7 +1458,7 @@ impl web_session_capnp::web_session::Server for WebSessionImpl {
                         error.set_status_code(
                             web_session_capnp::web_session::response::ClientErrorCode::BadRequest,
                         );
-                        error.set_description_html(description.as_str().into());
+                        error.set_description_html(description.as_str());
                         return Promise::ok(());
                     }
                 };
@@ -1328,7 +1489,7 @@ impl web_session_capnp::web_session::Server for WebSessionImpl {
                                 "<!doctype html><title>Resolve Failed</title><pre>{}</pre>",
                                 escape_html(&err)
                             );
-                            error.set_description_html(description.as_str().into());
+                            error.set_description_html(description.as_str());
                         }
                     }
                     Ok(())
@@ -1354,7 +1515,7 @@ impl web_session_capnp::web_session::Server for WebSessionImpl {
                 error.set_status_code(
                     web_session_capnp::web_session::response::ClientErrorCode::BadRequest,
                 );
-                error.set_description_html(description.as_str().into());
+                error.set_description_html(description.as_str());
                 return Promise::ok(());
             }
         };
@@ -1372,7 +1533,7 @@ impl web_session_capnp::web_session::Server for WebSessionImpl {
                         "<!doctype html><title>Restore Failed</title><pre>{}</pre>",
                         escape_html(&err)
                     );
-                    error.set_description_html(description.as_str().into());
+                    error.set_description_html(description.as_str());
                 }
             }
             Ok(())
@@ -1380,7 +1541,7 @@ impl web_session_capnp::web_session::Server for WebSessionImpl {
     }
 
     fn options(
-        &mut self,
+        self: Rc<Self>,
         _: web_session_capnp::web_session::OptionsParams,
         _: web_session_capnp::web_session::OptionsResults,
     ) -> Promise<(), capnp::Error> {
@@ -1390,7 +1551,7 @@ impl web_session_capnp::web_session::Server for WebSessionImpl {
     }
 
     fn open_web_socket(
-        &mut self,
+        self: Rc<Self>,
         _: web_session_capnp::web_session::OpenWebSocketParams,
         _: web_session_capnp::web_session::OpenWebSocketResults,
     ) -> Promise<(), capnp::Error> {
@@ -1439,7 +1600,7 @@ impl WebSessionImpl {
                 let size = file.metadata()?.len();
                 let mut content = results.get().init_content();
                 content.set_status_code(web_session_capnp::web_session::response::SuccessCode::Ok);
-                content.set_mime_type(content_type.into());
+                content.set_mime_type(content_type);
                 let mut body = content.init_body().init_bytes(size as u32);
                 std::io::copy(&mut file, &mut body)?;
                 Ok(())
@@ -1457,7 +1618,7 @@ impl WebSessionImpl {
 }
 
 fn init_localized_text(mut builder: util_capnp::localized_text::Builder<'_>, text: &str) {
-    builder.set_default_text(text.into());
+    builder.set_default_text(text);
     builder.init_localizations(0);
 }
 
@@ -1468,7 +1629,7 @@ async fn claim_and_save_capability(
     save_label: &str,
 ) -> Result<String, String> {
     let mut claim_req = session_context.claim_request_request();
-    claim_req.get().set_request_token(request_token.into());
+    claim_req.get().set_request_token(request_token);
     claim_req.get().init_required_permissions(0);
     let claim_resp = claim_req
         .send()
@@ -1540,6 +1701,27 @@ async fn restore_saved_ip_network(
         .get_cap()
         .get_as::<ip_capnp::ip_network::Client>()
         .map_err(|err| format!("restored capability is not an IpNetwork: {err}"))
+}
+
+async fn restore_saved_ip_interface(
+    sandstorm_api: grain_capnp::sandstorm_api::Client<capnp::any_pointer::Owned>,
+    saved_token_hex: &str,
+) -> Result<ip_capnp::ip_interface::Client, String> {
+    let token = hex_decode(saved_token_hex)?;
+    let mut restore_req = sandstorm_api.restore_request();
+    restore_req.get().set_token(&token);
+    let restore_resp = restore_req
+        .send()
+        .promise
+        .await
+        .map_err(|err| format!("SandstormApi.restore() failed: {err}"))?;
+    let restore_resp = restore_resp
+        .get()
+        .map_err(|err| format!("failed to decode restore() response: {err}"))?;
+    restore_resp
+        .get_cap()
+        .get_as::<ip_capnp::ip_interface::Client>()
+        .map_err(|err| format!("restored capability is not an IpInterface: {err}"))
 }
 
 fn load_saved_capabilities() -> Result<Vec<SavedCapability>, String> {
@@ -1673,6 +1855,7 @@ fn escape_html(value: &str) -> String {
         .replace('"', "&quot;")
 }
 
+#[derive(Debug)]
 struct SavedCapability {
     id: String,
     label: String,
@@ -1685,36 +1868,213 @@ struct AppState {
     iroh_endpoint: Option<Endpoint>,
     iroh_endpoint_addr: IrohEndpointAddrSummary,
     iroh_endpoint_error: Option<String>,
+    raw_udp_interface: Option<SavedCapability>,
+    raw_udp_interface_source: Option<String>,
     remote_ticket: Option<String>,
     active_tcp_sessions: HashMap<String, Arc<SavedIpNetworkTcpSession>>,
     next_tcp_session_id: u64,
 }
 
 impl AppState {
-    async fn initialize() -> Result<Self, String> {
+    fn initialize() -> Result<Self, String> {
         let iroh_identity = load_or_create_iroh_identity()?;
         let remote_ticket = load_remote_ticket()?;
-        match bind_local_iroh_endpoint(&iroh_identity.secret_key).await {
-            Ok((endpoint, endpoint_addr)) => Ok(Self {
-                iroh_identity,
-                iroh_endpoint: Some(endpoint.clone()),
-                iroh_endpoint_addr: endpoint_addr,
-                iroh_endpoint_error: None,
-                remote_ticket,
-                active_tcp_sessions: HashMap::new(),
-                next_tcp_session_id: 0,
-            }),
-            Err(err) => Ok(Self {
-                iroh_identity,
-                iroh_endpoint: None,
-                iroh_endpoint_addr: IrohEndpointAddrSummary::empty(),
-                iroh_endpoint_error: Some(err),
-                remote_ticket,
-                active_tcp_sessions: HashMap::new(),
-                next_tcp_session_id: 0,
-            }),
+        Ok(Self {
+            iroh_identity,
+            iroh_endpoint: None,
+            iroh_endpoint_addr: IrohEndpointAddrSummary::empty(),
+            iroh_endpoint_error: None,
+            raw_udp_interface: None,
+            raw_udp_interface_source: None,
+            remote_ticket,
+            active_tcp_sessions: HashMap::new(),
+            next_tcp_session_id: 0,
+        })
+    }
+}
+
+async fn initialize_iroh_endpoint(
+    app_state: Arc<Mutex<AppState>>,
+    sandstorm_api: grain_capnp::sandstorm_api::Client<capnp::any_pointer::Owned>,
+) -> Result<(), String> {
+    let (secret_key, old_endpoint) = {
+        let mut guard = app_state
+            .lock()
+            .map_err(|_| "app state lock poisoned".to_string())?;
+        (
+            guard.iroh_identity.secret_key.clone(),
+            guard.iroh_endpoint.take(),
+        )
+    };
+    if let Some(old_endpoint) = old_endpoint {
+        old_endpoint.close().await;
+    }
+
+    let bind_result = bind_local_iroh_endpoint(sandstorm_api, &secret_key).await;
+    let (raw_udp_interface, raw_udp_interface_source) =
+        load_configured_raw_udp_interface_state()?;
+    let mut guard = app_state
+        .lock()
+        .map_err(|_| "app state lock poisoned".to_string())?;
+    guard.raw_udp_interface = raw_udp_interface;
+    guard.raw_udp_interface_source = raw_udp_interface_source;
+    match bind_result {
+        Ok((endpoint, endpoint_addr)) => {
+            guard.iroh_endpoint = Some(endpoint);
+            guard.iroh_endpoint_addr = endpoint_addr;
+            guard.iroh_endpoint_error = None;
+        }
+        Err(err) => {
+            guard.iroh_endpoint = None;
+            guard.iroh_endpoint_addr = IrohEndpointAddrSummary::empty();
+            guard.iroh_endpoint_error = Some(err);
         }
     }
+    Ok(())
+}
+
+fn load_configured_raw_udp_interface_state() -> Result<(Option<SavedCapability>, Option<String>), String>
+{
+    if let Some(saved_token) = load_saved_raw_udp_interface_token()? {
+        return Ok((
+            load_saved_capability_by_token(&saved_token)?.or(Some(SavedCapability {
+                id: String::new(),
+                label: "Configured IpInterface".to_string(),
+                saved_token,
+                created_at_ms: 0,
+            })),
+            Some("saved".to_string()),
+        ));
+    }
+
+    match std::env::var(IROH_SANDSTORM_RAW_UDP_INTERFACE_TOKEN_ENV) {
+        Ok(token) if !token.trim().is_empty() => Ok((
+            Some(SavedCapability {
+                id: String::new(),
+                label: "Env-configured IpInterface".to_string(),
+                saved_token: token.trim().to_string(),
+                created_at_ms: 0,
+            }),
+            Some("env".to_string()),
+        )),
+        Ok(_) => Ok((None, None)),
+        Err(std::env::VarError::NotPresent) => Ok((None, None)),
+        Err(err) => Err(format!(
+            "failed to read {IROH_SANDSTORM_RAW_UDP_INTERFACE_TOKEN_ENV}: {err}"
+        )),
+    }
+}
+
+fn load_saved_raw_udp_interface_token() -> Result<Option<String>, String> {
+    match std::fs::read_to_string(RAW_UDP_INTERFACE_TOKEN_PATH) {
+        Ok(value) => {
+            let trimmed = value.trim().to_string();
+            if trimmed.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(trimmed))
+            }
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(format!(
+            "failed to read raw udp interface token: {err}"
+        )),
+    }
+}
+
+fn load_saved_raw_udp_port() -> Result<Option<u16>, String> {
+    match std::fs::read_to_string(RAW_UDP_PORT_PATH) {
+        Ok(value) => {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                Ok(None)
+            } else {
+                trimmed
+                    .parse::<u16>()
+                    .map(Some)
+                    .map_err(|_| format!("failed to parse persisted raw udp port: {trimmed:?}"))
+            }
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(format!("failed to read raw udp port: {err}")),
+    }
+}
+
+fn persist_raw_udp_interface_token(saved_token: &str) -> Result<(), String> {
+    std::fs::create_dir_all(STATE_DIR)
+        .map_err(|err| format!("failed to create state directory: {err}"))?;
+    std::fs::write(RAW_UDP_INTERFACE_TOKEN_PATH, format!("{saved_token}\n"))
+        .map_err(|err| format!("failed to persist raw udp interface token: {err}"))
+}
+
+fn persist_raw_udp_port(port: u16) -> Result<(), String> {
+    std::fs::create_dir_all(STATE_DIR)
+        .map_err(|err| format!("failed to create state directory: {err}"))?;
+    std::fs::write(RAW_UDP_PORT_PATH, format!("{port}\n"))
+        .map_err(|err| format!("failed to persist raw udp port: {err}"))
+}
+
+fn clear_persisted_raw_udp_interface_token() -> Result<(), String> {
+    match std::fs::remove_file(RAW_UDP_INTERFACE_TOKEN_PATH) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(format!("failed to clear raw udp interface token: {err}")),
+    }
+}
+
+fn clear_persisted_raw_udp_port() -> Result<(), String> {
+    match std::fs::remove_file(RAW_UDP_PORT_PATH) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(format!("failed to clear raw udp port: {err}")),
+    }
+}
+
+fn load_saved_capability_by_token(saved_token: &str) -> Result<Option<SavedCapability>, String> {
+    Ok(load_saved_capabilities()?
+        .into_iter()
+        .find(|saved_cap| saved_cap.saved_token == saved_token))
+}
+
+fn require_saved_capability_by_token(saved_token: &str) -> Result<SavedCapability, String> {
+    match load_saved_capability_by_token(saved_token)? {
+        Some(saved_cap) => Ok(saved_cap),
+        None => Err("saved capability token not found".to_string()),
+    }
+}
+
+async fn configure_raw_udp_interface_binding<
+    Validate,
+    ValidateFut,
+    Rebind,
+    RebindFut,
+>(
+    saved_cap: &SavedCapability,
+    validate: Validate,
+    persist: impl FnOnce(&str) -> Result<(), String>,
+    rebind: Rebind,
+) -> Result<(), String>
+where
+    Validate: FnOnce(String) -> ValidateFut,
+    ValidateFut: std::future::Future<Output = Result<(), String>>,
+    Rebind: FnOnce() -> RebindFut,
+    RebindFut: std::future::Future<Output = Result<(), String>>,
+{
+    validate(saved_cap.saved_token.clone()).await?;
+    persist(&saved_cap.saved_token)?;
+    rebind().await
+}
+
+async fn clear_raw_udp_interface_binding<Rebind, RebindFut>(
+    clear: impl FnOnce() -> Result<(), String>,
+    rebind: Rebind,
+) -> Result<(), String>
+where
+    Rebind: FnOnce() -> RebindFut,
+    RebindFut: std::future::Future<Output = Result<(), String>>,
+{
+    clear()?;
+    rebind().await
 }
 
 fn make_saved_cap_id() -> String {
@@ -1726,6 +2086,18 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis() as u64)
         .unwrap_or(0)
+}
+
+fn log_iroh_endpoint_summary(context: &str, endpoint_addr: &IrohEndpointAddrSummary) {
+    eprintln!(
+        "iroh endpoint {context}: node_id={} relay_addrs={} direct_addrs={} custom_addrs={} direct={:?} custom={:?}",
+        endpoint_addr.node_id,
+        endpoint_addr.relay_urls.len(),
+        endpoint_addr.direct_addrs.len(),
+        endpoint_addr.custom_addrs.len(),
+        endpoint_addr.direct_addrs,
+        endpoint_addr.custom_addrs,
+    );
 }
 
 fn load_or_create_iroh_identity() -> Result<IrohIdentity, String> {
@@ -1785,6 +2157,7 @@ struct IrohEndpointAddrSummary {
     node_id: String,
     relay_urls: Vec<String>,
     direct_addrs: Vec<String>,
+    custom_addrs: Vec<String>,
 }
 
 impl IrohEndpointAddrSummary {
@@ -1793,14 +2166,107 @@ impl IrohEndpointAddrSummary {
             node_id: String::new(),
             relay_urls: Vec::new(),
             direct_addrs: Vec::new(),
+            custom_addrs: Vec::new(),
         }
     }
 }
 
+#[derive(Debug)]
+struct SandstormRawUdpBindConfig {
+    interface_token_hex: String,
+    port: u16,
+}
+
+fn parse_sandstorm_raw_udp_bind_config(
+    interface_token_hex: Option<&str>,
+    port: Option<&str>,
+) -> Result<Option<SandstormRawUdpBindConfig>, String> {
+    let Some(interface_token_hex) = interface_token_hex else {
+        return Ok(None);
+    };
+    let interface_token_hex = interface_token_hex.trim().to_string();
+    if interface_token_hex.is_empty() {
+        return Err(format!(
+            "{IROH_SANDSTORM_RAW_UDP_INTERFACE_TOKEN_ENV} must not be empty"
+        ));
+    }
+
+    let port = match port {
+        Some(value) => value
+            .trim()
+            .parse::<u16>()
+            .map_err(|_| format!("invalid {IROH_SANDSTORM_RAW_UDP_PORT_ENV}: {value:?}"))?,
+        None => 0,
+    };
+
+    Ok(Some(SandstormRawUdpBindConfig {
+        interface_token_hex,
+        port,
+    }))
+}
+
+fn resolve_sandstorm_raw_udp_bind_config(
+    saved_token_hex: Option<&str>,
+    saved_port: Option<u16>,
+    env_interface_token_hex: Option<&str>,
+    env_port: Option<&str>,
+) -> Result<Option<SandstormRawUdpBindConfig>, String> {
+    if let Some(saved_token_hex) = saved_token_hex {
+        let saved_port_string = saved_port.map(|port| port.to_string());
+        return parse_sandstorm_raw_udp_bind_config(
+            Some(saved_token_hex),
+            saved_port_string.as_deref(),
+        );
+    }
+
+    parse_sandstorm_raw_udp_bind_config(env_interface_token_hex, env_port)
+}
+
+fn load_sandstorm_raw_udp_bind_config() -> Result<Option<SandstormRawUdpBindConfig>, String> {
+    let saved_token = load_saved_raw_udp_interface_token()?;
+    let saved_port = load_saved_raw_udp_port()?;
+
+    let interface_token_hex = match std::env::var(IROH_SANDSTORM_RAW_UDP_INTERFACE_TOKEN_ENV) {
+        Ok(value) => Some(value),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(err) => {
+            return Err(format!(
+                "failed to read {IROH_SANDSTORM_RAW_UDP_INTERFACE_TOKEN_ENV}: {err}"
+            ));
+        }
+    };
+    let port = match std::env::var(IROH_SANDSTORM_RAW_UDP_PORT_ENV) {
+        Ok(value) => Some(value),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(err) => {
+            return Err(format!(
+                "failed to read {IROH_SANDSTORM_RAW_UDP_PORT_ENV}: {err}"
+            ));
+        }
+    };
+    resolve_sandstorm_raw_udp_bind_config(
+        saved_token.as_deref(),
+        saved_port,
+        interface_token_hex.as_deref(),
+        port.as_deref(),
+    )
+}
+
 async fn bind_local_iroh_endpoint(
+    sandstorm_api: grain_capnp::sandstorm_api::Client<capnp::any_pointer::Owned>,
     secret_key: &SecretKey,
 ) -> Result<(Endpoint, IrohEndpointAddrSummary), String> {
-    let endpoint = Endpoint::builder()
+    if let Some(config) = load_sandstorm_raw_udp_bind_config()? {
+        eprintln!(
+            "iroh bind: using Sandstorm RawUdp interface token={} port={}",
+            config.interface_token_hex,
+            config.port
+        );
+        return bind_sandstorm_raw_udp_iroh_endpoint(sandstorm_api, secret_key, config).await;
+    }
+
+    eprintln!("iroh bind: using native ambient UDP transports");
+    let endpoint = Endpoint::builder(presets::N0)
         .alpns(vec![IROH_ALPN.to_vec()])
         .secret_key(secret_key.clone())
         .relay_mode(RelayMode::Disabled)
@@ -1809,16 +2275,71 @@ async fn bind_local_iroh_endpoint(
         .map_err(|err| format!("failed to bind local iroh endpoint: {err}"))?;
     tokio::spawn(run_echo_accept_loop(endpoint.clone()));
     let endpoint_addr = summarize_endpoint_addr(endpoint.addr());
+    log_iroh_endpoint_summary("bound(native)", &endpoint_addr);
+    Ok((endpoint, endpoint_addr))
+}
+
+async fn bind_sandstorm_raw_udp_iroh_endpoint(
+    sandstorm_api: grain_capnp::sandstorm_api::Client<capnp::any_pointer::Owned>,
+    secret_key: &SecretKey,
+    config: SandstormRawUdpBindConfig,
+) -> Result<(Endpoint, IrohEndpointAddrSummary), String> {
+    eprintln!(
+        "iroh bind: restoring Sandstorm IpInterface token={} for raw UDP port={}",
+        config.interface_token_hex,
+        config.port
+    );
+    let ip_interface =
+        restore_saved_ip_interface(sandstorm_api, &config.interface_token_hex).await?;
+    let mut bind_req = ip_interface.bind_raw_udp_request();
+    bind_req.get().set_port_num(config.port);
+    let bind_resp = bind_req
+        .send()
+        .promise
+        .await
+        .map_err(|err| format!("IpInterface.bindRawUdp() failed: {err}"))?;
+    let raw_udp_socket = bind_resp
+        .get()
+        .map_err(|err| format!("failed to decode bindRawUdp() response: {err}"))?
+        .get_socket()
+        .map_err(|err| format!("bindRawUdp() returned no RawUdpSocket: {err}"))?;
+    eprintln!("iroh bind: IpInterface.bindRawUdp() returned a RawUdpSocket");
+    let raw_udp_local_addr = get_local_endpoint(&raw_udp_socket)
+        .await
+        .map_err(|err| format!("failed to read RawUdp local endpoint: {err}"))?;
+    eprintln!("iroh bind: RawUdp local endpoint is {raw_udp_local_addr}");
+    persist_raw_udp_port(raw_udp_local_addr.port())?;
+    let transport =
+        new_capnp_raw_udp_custom_transport(raw_udp_socket, SANDSTORM_RAW_UDP_TRANSPORT_ID)
+            .await
+            .map_err(|err| format!("failed to create Sandstorm custom transport: {err}"))?;
+    eprintln!("iroh bind: Sandstorm RawUdp custom transport initialized");
+
+    let endpoint = Endpoint::builder(presets::N0)
+        .alpns(vec![IROH_ALPN.to_vec()])
+        .secret_key(secret_key.clone())
+        .relay_mode(RelayMode::Disabled)
+        .clear_ip_transports()
+        .add_custom_transport(transport)
+        .bind()
+        .await
+        .map_err(|err| format!("failed to bind Sandstorm RawUdp iroh endpoint: {err}"))?;
+    tokio::spawn(run_echo_accept_loop(endpoint.clone()));
+    let endpoint_addr =
+        summarize_endpoint_addr_with_raw_udp_fallback(endpoint.addr(), raw_udp_local_addr);
+    log_iroh_endpoint_summary("bound(sandstorm-raw-udp)", &endpoint_addr);
     Ok((endpoint, endpoint_addr))
 }
 
 fn summarize_endpoint_addr(endpoint_addr: iroh::EndpointAddr) -> IrohEndpointAddrSummary {
     let mut relay_urls = Vec::new();
     let mut direct_addrs = Vec::new();
+    let mut custom_addrs = Vec::new();
     for addr in endpoint_addr.addrs {
         match addr {
             TransportAddr::Relay(url) => relay_urls.push(url.to_string()),
             TransportAddr::Ip(addr) => direct_addrs.push(addr.to_string()),
+            TransportAddr::Custom(addr) => custom_addrs.push(addr.to_string()),
             _ => {}
         }
     }
@@ -1826,6 +2347,35 @@ fn summarize_endpoint_addr(endpoint_addr: iroh::EndpointAddr) -> IrohEndpointAdd
         node_id: endpoint_addr.id.to_string(),
         relay_urls,
         direct_addrs,
+        custom_addrs,
+    }
+}
+
+fn summarize_endpoint_addr_with_raw_udp_fallback(
+    endpoint_addr: iroh::EndpointAddr,
+    raw_udp_local_addr: std::net::SocketAddr,
+) -> IrohEndpointAddrSummary {
+    let mut summary = summarize_endpoint_addr(endpoint_addr);
+    if summary.custom_addrs.is_empty() {
+        let advertised_addr = normalize_advertised_raw_udp_addr(raw_udp_local_addr);
+        summary.custom_addrs.push(
+            socket_addr_to_custom_addr(SANDSTORM_RAW_UDP_TRANSPORT_ID, advertised_addr)
+                .to_string(),
+        );
+    }
+
+    summary
+}
+
+fn normalize_advertised_raw_udp_addr(addr: std::net::SocketAddr) -> std::net::SocketAddr {
+    match addr {
+        std::net::SocketAddr::V4(addr) if addr.ip().is_unspecified() => {
+            std::net::SocketAddr::from(([127, 0, 0, 1], addr.port()))
+        }
+        std::net::SocketAddr::V6(addr) if addr.ip().is_unspecified() => {
+            std::net::SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], addr.port()))
+        }
+        _ => addr,
     }
 }
 
@@ -1851,11 +2401,7 @@ fn update_remote_ticket(
     std::fs::create_dir_all(STATE_DIR)
         .map_err(|err| format!("failed to create state directory: {err}"))?;
     if remote_ticket.trim().is_empty() {
-        match std::fs::remove_file(REMOTE_TICKET_PATH) {
-            Ok(()) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => return Err(format!("failed to clear remote ticket: {err}")),
-        }
+        clear_persisted_remote_ticket()?;
     } else {
         std::fs::write(REMOTE_TICKET_PATH, format!("{remote_ticket}\n"))
             .map_err(|err| format!("failed to persist remote ticket: {err}"))?;
@@ -1870,6 +2416,14 @@ fn update_remote_ticket(
         Some(remote_ticket)
     };
     Ok(())
+}
+
+fn clear_persisted_remote_ticket() -> Result<(), String> {
+    match std::fs::remove_file(REMOTE_TICKET_PATH) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(format!("failed to clear remote ticket: {err}")),
+    }
 }
 
 fn render_state_json(app_state: &Arc<Mutex<AppState>>) -> Result<String, String> {
@@ -1908,6 +2462,16 @@ fn render_state_json(app_state: &Arc<Mutex<AppState>>) -> Result<String, String>
 
     let relay_urls = join_json_strings(&guard.iroh_endpoint_addr.relay_urls);
     let direct_addrs = join_json_strings(&guard.iroh_endpoint_addr.direct_addrs);
+    let custom_addrs = join_json_strings(&guard.iroh_endpoint_addr.custom_addrs);
+    let raw_udp_interface = match &guard.raw_udp_interface {
+        Some(value) => format!(
+            "{{\"label\":\"{}\",\"savedToken\":\"{}\",\"source\":\"{}\"}}",
+            json_escape(&value.label),
+            json_escape(&value.saved_token),
+            json_escape(guard.raw_udp_interface_source.as_deref().unwrap_or("unknown"))
+        ),
+        None => "null".to_string(),
+    };
     let remote_ticket = match &guard.remote_ticket {
         Some(value) => format!("\"{}\"", json_escape(value)),
         None => "null".to_string(),
@@ -1927,20 +2491,25 @@ fn render_state_json(app_state: &Arc<Mutex<AppState>>) -> Result<String, String>
     };
 
     Ok(format!(
-        "{{\"powerboxQueries\":{{\"apiSession\":\"{}\",\"ipNetwork\":\"{}\"}},\"irohNodeId\":\"{}\",\"irohEndpoint\":{{\"bound\":{},\"nodeId\":\"{}\",\"relayUrls\":[{}],\"directAddrs\":[{}],\"error\":{},\"localTicket\":{}}},\"transportAssessment\":\"{}\",\"remoteTicket\":{},\"savedCaps\":[{}],\"activeTcpSessions\":[{}]}}",
+        "{{\"powerboxQueries\":{{\"apiSession\":\"{}\",\"ipNetwork\":\"{}\",\"ipInterface\":\"{}\"}},\"irohNodeId\":\"{}\",\"irohEndpoint\":{{\"bound\":{},\"nodeId\":\"{}\",\"relayUrls\":[{}],\"directAddrs\":[{}],\"customAddrs\":[{}],\"error\":{},\"localTicket\":{},\"rawUdpInterface\":{}}},\"transportAssessment\":\"{}\",\"remoteTicket\":{},\"savedCaps\":[{}],\"activeTcpSessions\":[{}]}}",
         json_escape(&powerbox_query_for_interface(
             api_session_capnp::api_session::Client::TYPE_ID
         )?),
         json_escape(&powerbox_query_for_interface(
             ip_capnp::ip_network::Client::TYPE_ID
         )?),
+        json_escape(&powerbox_query_for_interface(
+            ip_capnp::ip_interface::Client::TYPE_ID
+        )?),
         json_escape(&guard.iroh_identity.node_id),
         endpoint_bound,
         json_escape(&guard.iroh_endpoint_addr.node_id),
         relay_urls,
         direct_addrs,
+        custom_addrs,
         endpoint_error,
         local_ticket,
+        raw_udp_interface,
         json_escape(IROH_TRANSPORT_ASSESSMENT),
         remote_ticket,
         rows.join(","),
@@ -2204,7 +2773,24 @@ fn powerbox_query_for_interface(type_id: u64) -> Result<String, String> {
 
 fn format_local_ticket(endpoint_addr: &IrohEndpointAddrSummary) -> String {
     let mut lines = vec![endpoint_addr.node_id.clone()];
-    lines.extend(endpoint_addr.direct_addrs.iter().cloned());
+    lines.extend(
+        endpoint_addr
+            .relay_urls
+            .iter()
+            .map(|url| format!("relay:{url}")),
+    );
+    lines.extend(
+        endpoint_addr
+            .direct_addrs
+            .iter()
+            .map(|addr| format!("ip:{addr}")),
+    );
+    lines.extend(
+        endpoint_addr
+            .custom_addrs
+            .iter()
+            .map(|addr| format!("custom:{addr}")),
+    );
     lines.join("\n")
 }
 
@@ -2215,46 +2801,405 @@ fn parse_remote_ticket(value: &str) -> Result<iroh::EndpointAddr, String> {
         .ok_or_else(|| "remote ticket is empty".to_string())?;
     let endpoint_id = iroh::EndpointId::from_str(node_id)
         .map_err(|err| format!("invalid remote node id: {err}"))?;
-    let mut endpoint_addr = iroh::EndpointAddr::new(endpoint_id);
+    let mut addrs = Vec::new();
     for line in lines {
+        if let Some(rest) = line.strip_prefix("relay:") {
+            let relay_url = iroh::RelayUrl::from_str(rest)
+                .map_err(|err| format!("invalid remote relay url {line:?}: {err}"))?;
+            addrs.push(TransportAddr::Relay(relay_url));
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("ip:") {
+            let socket_addr = std::net::SocketAddr::from_str(rest)
+                .map_err(|err| format!("invalid remote socket address {line:?}: {err}"))?;
+            addrs.push(TransportAddr::Ip(socket_addr));
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("custom:") {
+            let custom_addr = CustomAddr::from_str(rest)
+                .map_err(|err| format!("invalid remote custom address {line:?}: {err}"))?;
+            addrs.push(TransportAddr::Custom(custom_addr));
+            continue;
+        }
+
         let socket_addr = std::net::SocketAddr::from_str(line)
-            .map_err(|err| format!("invalid remote socket address {line:?}: {err}"))?;
-        endpoint_addr = endpoint_addr.with_ip_addr(socket_addr);
+            .map_err(|err| format!("invalid remote address {line:?}: {err}"))?;
+        addrs.push(TransportAddr::Ip(socket_addr));
     }
+    let endpoint_addr = iroh::EndpointAddr::from_parts(endpoint_id, addrs);
     if endpoint_addr.is_empty() {
-        return Err("remote ticket has no direct addresses".to_string());
+        return Err("remote ticket has no transport addresses".to_string());
     }
     Ok(endpoint_addr)
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    fn test_endpoint_id(seed: u8) -> iroh::EndpointId {
+        iroh::SecretKey::from_bytes(&[seed; 32]).public()
+    }
+
+    fn run_async_test<F>(future: F)
+    where
+        F: std::future::Future<Output = ()>,
+    {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(future);
+    }
+
+    #[test]
+    fn parse_sandstorm_raw_udp_bind_config_defaults_port() {
+        let config = parse_sandstorm_raw_udp_bind_config(Some("deadbeef"), None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(config.interface_token_hex, "deadbeef");
+        assert_eq!(config.port, 0);
+    }
+
+    #[test]
+    fn parse_sandstorm_raw_udp_bind_config_rejects_empty_token() {
+        let err = parse_sandstorm_raw_udp_bind_config(Some("   "), None).unwrap_err();
+        assert!(err.contains(IROH_SANDSTORM_RAW_UDP_INTERFACE_TOKEN_ENV));
+    }
+
+    #[test]
+    fn parse_sandstorm_raw_udp_bind_config_rejects_invalid_port() {
+        let err = parse_sandstorm_raw_udp_bind_config(Some("deadbeef"), Some("nope")).unwrap_err();
+        assert!(err.contains(IROH_SANDSTORM_RAW_UDP_PORT_ENV));
+    }
+
+    #[test]
+    fn resolve_sandstorm_raw_udp_bind_config_prefers_saved_token_over_env() {
+        let config = resolve_sandstorm_raw_udp_bind_config(
+            Some("saved-token"),
+            Some(31337),
+            Some("env-token"),
+            Some("4242"),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(config.interface_token_hex, "saved-token");
+        assert_eq!(config.port, 31337);
+    }
+
+    #[test]
+    fn resolve_sandstorm_raw_udp_bind_config_uses_env_when_no_saved_token() {
+        let config =
+            resolve_sandstorm_raw_udp_bind_config(None, None, Some("env-token"), Some("4242"))
+                .unwrap()
+                .unwrap();
+        assert_eq!(config.interface_token_hex, "env-token");
+        assert_eq!(config.port, 4242);
+    }
+
+    #[test]
+    fn resolve_sandstorm_raw_udp_bind_config_returns_none_without_any_source() {
+        assert!(
+            resolve_sandstorm_raw_udp_bind_config(None, None, None, None)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn summarize_endpoint_addr_collects_all_transport_types() {
+        let endpoint_id = test_endpoint_id(1);
+        let endpoint_addr = iroh::EndpointAddr::from_parts(
+            endpoint_id,
+            [
+                TransportAddr::Relay(iroh::RelayUrl::from_str("https://relay.example").unwrap()),
+                TransportAddr::Ip(std::net::SocketAddr::from(([127, 0, 0, 1], 7777))),
+                TransportAddr::Custom(CustomAddr::from_parts(
+                    SANDSTORM_RAW_UDP_TRANSPORT_ID,
+                    &[0x01, 0x02, 0x03],
+                )),
+            ],
+        );
+
+        let summary = summarize_endpoint_addr(endpoint_addr);
+        assert_eq!(summary.node_id, endpoint_id.to_string());
+        assert_eq!(summary.relay_urls, vec!["https://relay.example/"]);
+        assert_eq!(summary.direct_addrs, vec!["127.0.0.1:7777"]);
+        assert_eq!(
+            summary.custom_addrs,
+            vec![CustomAddr::from_parts(SANDSTORM_RAW_UDP_TRANSPORT_ID, &[0x01, 0x02, 0x03])
+                .to_string()]
+        );
+    }
+
+    #[test]
+    fn summarize_endpoint_addr_with_raw_udp_fallback_adds_custom_addr_when_missing() {
+        let endpoint_id = test_endpoint_id(7);
+        let endpoint_addr = iroh::EndpointAddr::from_parts(endpoint_id, []);
+        let raw_udp_local_addr = std::net::SocketAddr::from(([0, 0, 0, 0], 4242));
+
+        let summary =
+            summarize_endpoint_addr_with_raw_udp_fallback(endpoint_addr, raw_udp_local_addr);
+
+        assert_eq!(summary.node_id, endpoint_id.to_string());
+        assert!(summary.direct_addrs.is_empty());
+        assert!(summary.relay_urls.is_empty());
+        assert_eq!(
+            summary.custom_addrs,
+            vec![socket_addr_to_custom_addr(
+                SANDSTORM_RAW_UDP_TRANSPORT_ID,
+                std::net::SocketAddr::from(([127, 0, 0, 1], 4242))
+            )
+            .to_string()]
+        );
+    }
+
+    #[test]
+    fn normalize_advertised_raw_udp_addr_rewrites_unspecified_to_loopback() {
+        assert_eq!(
+            normalize_advertised_raw_udp_addr(std::net::SocketAddr::from(([0, 0, 0, 0], 9999))),
+            std::net::SocketAddr::from(([127, 0, 0, 1], 9999))
+        );
+        assert_eq!(
+            normalize_advertised_raw_udp_addr("[::]:7777".parse().unwrap()),
+            "[::1]:7777".parse().unwrap()
+        );
+        assert_eq!(
+            normalize_advertised_raw_udp_addr(std::net::SocketAddr::from(([127, 0, 0, 1], 5555))),
+            std::net::SocketAddr::from(([127, 0, 0, 1], 5555))
+        );
+    }
+
+    #[test]
+    fn local_ticket_roundtrips_mixed_transports() {
+        let custom_addr =
+            CustomAddr::from_parts(SANDSTORM_RAW_UDP_TRANSPORT_ID, &[0xaa, 0xbb, 0xcc]);
+        let summary = IrohEndpointAddrSummary {
+            node_id: test_endpoint_id(2).to_string(),
+            relay_urls: vec!["https://relay.example/".to_string()],
+            direct_addrs: vec!["127.0.0.1:9000".to_string()],
+            custom_addrs: vec![custom_addr.to_string()],
+        };
+
+        let ticket = format_local_ticket(&summary);
+        let parsed = parse_remote_ticket(&ticket).unwrap();
+
+        assert_eq!(parsed.id.to_string(), summary.node_id);
+        assert!(parsed
+            .addrs
+            .contains(&TransportAddr::Relay(iroh::RelayUrl::from_str(
+                "https://relay.example/"
+            )
+            .unwrap())));
+        assert!(parsed
+            .addrs
+            .contains(&TransportAddr::Ip(std::net::SocketAddr::from((
+                [127, 0, 0, 1],
+                9000
+            )))));
+        assert!(parsed.addrs.contains(&TransportAddr::Custom(custom_addr)));
+    }
+
+    #[test]
+    fn parse_remote_ticket_accepts_legacy_bare_socket_addr() {
+        let node_id = test_endpoint_id(3).to_string();
+        let parsed = parse_remote_ticket(&format!("{node_id}\n127.0.0.1:4444")).unwrap();
+
+        assert!(parsed
+            .addrs
+            .contains(&TransportAddr::Ip(std::net::SocketAddr::from((
+                [127, 0, 0, 1],
+                4444
+            )))));
+    }
+
+    #[test]
+    fn parse_remote_ticket_accepts_custom_only_ticket() {
+        let node_id = test_endpoint_id(4).to_string();
+        let custom_addr =
+            CustomAddr::from_parts(SANDSTORM_RAW_UDP_TRANSPORT_ID, &[0xde, 0xad, 0xbe, 0xef]);
+        let parsed = parse_remote_ticket(&format!("{node_id}\ncustom:{custom_addr}")).unwrap();
+
+        assert_eq!(parsed.addrs.len(), 1);
+        assert!(parsed.addrs.contains(&TransportAddr::Custom(custom_addr)));
+    }
+
+    #[test]
+    fn parse_remote_ticket_rejects_invalid_custom_addr() {
+        let node_id = test_endpoint_id(5).to_string();
+        let err = parse_remote_ticket(&format!("{node_id}\ncustom:not-valid")).unwrap_err();
+        assert!(err.contains("invalid remote custom address"));
+    }
+
+    #[test]
+    fn require_saved_capability_by_token_reports_missing_token() {
+        let err = require_saved_capability_by_token("definitely-missing").unwrap_err();
+        assert_eq!(err, "saved capability token not found");
+    }
+
+    #[test]
+    fn configure_raw_udp_interface_binding_runs_validate_persist_then_rebind() {
+        run_async_test(async {
+            let log = Arc::new(Mutex::new(Vec::new()));
+            let saved_cap = SavedCapability {
+                id: "cap-1".to_string(),
+                label: "IpInterface capability".to_string(),
+                saved_token: "saved-token".to_string(),
+                created_at_ms: 1,
+            };
+
+            configure_raw_udp_interface_binding(
+                &saved_cap,
+                {
+                    let log = log.clone();
+                    move |saved_token| {
+                        let log = log.clone();
+                        async move {
+                            log.lock().unwrap().push(format!("validate:{saved_token}"));
+                            Ok(())
+                        }
+                    }
+                },
+                {
+                    let log = log.clone();
+                    move |saved_token| {
+                        log.lock().unwrap().push(format!("persist:{saved_token}"));
+                        Ok(())
+                    }
+                },
+                {
+                    let log = log.clone();
+                    move || {
+                        let log = log.clone();
+                        async move {
+                            log.lock().unwrap().push("rebind".to_string());
+                            Ok(())
+                        }
+                    }
+                },
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(
+                *log.lock().unwrap(),
+                vec![
+                    "validate:saved-token".to_string(),
+                    "persist:saved-token".to_string(),
+                    "rebind".to_string()
+                ]
+            );
+        });
+    }
+
+    #[test]
+    fn clear_raw_udp_interface_binding_runs_clear_then_rebind() {
+        run_async_test(async {
+            let log = Arc::new(Mutex::new(Vec::new()));
+
+            clear_raw_udp_interface_binding(
+                {
+                    let log = log.clone();
+                    move || {
+                        log.lock().unwrap().push("clear".to_string());
+                        Ok(())
+                    }
+                },
+                {
+                    let log = log.clone();
+                    move || {
+                        let log = log.clone();
+                        async move {
+                            log.lock().unwrap().push("rebind".to_string());
+                            Ok(())
+                        }
+                    }
+                },
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(
+                *log.lock().unwrap(),
+                vec!["clear".to_string(), "rebind".to_string()]
+            );
+        });
+    }
+
+    #[test]
+    fn render_state_json_includes_raw_udp_interface_and_ip_interface_query() {
+        let app_state = Arc::new(Mutex::new(AppState {
+            iroh_identity: IrohIdentity {
+                node_id: test_endpoint_id(6).to_string(),
+                secret_key: SecretKey::from_bytes(&[6; 32]),
+            },
+            iroh_endpoint: None,
+            iroh_endpoint_addr: IrohEndpointAddrSummary {
+                node_id: test_endpoint_id(6).to_string(),
+                relay_urls: vec![],
+                direct_addrs: vec!["127.0.0.1:7000".to_string()],
+                custom_addrs: vec!["1234_deadbeef".to_string()],
+            },
+            iroh_endpoint_error: Some("not bound".to_string()),
+            raw_udp_interface: Some(SavedCapability {
+                id: "cap-raw".to_string(),
+                label: "IpInterface capability".to_string(),
+                saved_token: "saved-raw-token".to_string(),
+                created_at_ms: 42,
+            }),
+            raw_udp_interface_source: Some("saved".to_string()),
+            remote_ticket: None,
+            active_tcp_sessions: HashMap::new(),
+            next_tcp_session_id: 0,
+        }));
+
+        let state_json = render_state_json(&app_state).unwrap();
+        assert!(state_json.contains("\"ipInterface\":\""));
+        assert!(state_json.contains("\"rawUdpInterface\":{"));
+        assert!(state_json.contains("saved-raw-token"));
+        assert!(state_json.contains("\"source\":\"saved\""));
+        assert!(state_json.contains("1234_deadbeef"));
+    }
+}
+
 async fn run_echo_accept_loop(endpoint: Endpoint) {
     while let Some(incoming) = endpoint.accept().await {
-        let result = async {
-            let connection = incoming
-                .accept()
-                .map_err(|err| format!("failed to accept incoming iroh connection: {err}"))?
-                .await
-                .map_err(|err| format!("incoming iroh connection failed: {err}"))?;
-            let (mut send, mut recv) = connection
-                .accept_bi()
-                .await
-                .map_err(|err| format!("failed to accept bi stream: {err}"))?;
-            let data = recv
-                .read_to_end(1024)
-                .await
-                .map_err(|err| format!("failed to read probe payload: {err}"))?;
-            send.write_all(&data)
-                .await
-                .map_err(|err| format!("failed to write probe response: {err}"))?;
-            send.finish()
-                .map_err(|err| format!("failed to finish probe response: {err}"))?;
-            Ok::<(), String>(())
-        }
-        .await;
+        tokio::spawn(async move {
+            let result = async {
+                eprintln!("iroh accept: incoming connection detected");
+                let connection = incoming
+                    .accept()
+                    .map_err(|err| format!("failed to accept incoming iroh connection: {err}"))?
+                    .await
+                    .map_err(|err| format!("incoming iroh connection failed: {err}"))?;
+                eprintln!("iroh accept: connection accepted");
+                let (mut send, mut recv) = connection
+                    .accept_bi()
+                    .await
+                    .map_err(|err| format!("failed to accept bi stream: {err}"))?;
+                eprintln!("iroh accept: bi stream accepted");
+                let data = recv
+                    .read_to_end(1024)
+                    .await
+                    .map_err(|err| format!("failed to read probe payload: {err}"))?;
+                eprintln!("iroh accept: received {} probe bytes", data.len());
+                send.write_all(&data)
+                    .await
+                    .map_err(|err| format!("failed to write probe response: {err}"))?;
+                send.finish()
+                    .map_err(|err| format!("failed to finish probe response: {err}"))?;
+                eprintln!("iroh accept: echoed {} probe bytes", data.len());
+                let close_reason = connection.closed().await;
+                eprintln!("iroh accept: connection closed: {close_reason}");
+                Ok::<(), String>(())
+            }
+            .await;
 
-        if let Err(err) = result {
-            eprintln!("iroh accept loop error: {err}");
-        }
+            if let Err(err) = result {
+                eprintln!("iroh accept loop error: {err}");
+            }
+        });
     }
 }
 
@@ -2429,24 +3374,39 @@ async fn probe_remote_connection(
 
     let remote_addr = parse_remote_ticket(&remote_ticket)?;
     let remote_node_id = remote_addr.id.to_string();
+    eprintln!(
+        "iroh probe: attempting connect to node_id={} transport_addrs={:?}",
+        remote_node_id,
+        remote_addr.addrs
+    );
     let connection = endpoint
         .connect(remote_addr, IROH_ALPN)
         .await
         .map_err(|err| format!("failed to connect to remote peer: {err}"))?;
+    eprintln!("iroh probe: connection established to node_id={remote_node_id}");
     let (mut send, mut recv) = connection
         .open_bi()
         .await
         .map_err(|err| format!("failed to open bi stream: {err}"))?;
+    eprintln!("iroh probe: bi stream opened");
     let payload = format!("iroh-tunnel probe {}", now_ms());
     send.write_all(payload.as_bytes())
         .await
         .map_err(|err| format!("failed to send probe payload: {err}"))?;
+    eprintln!("iroh probe: sent {} probe bytes", payload.len());
     send.finish()
         .map_err(|err| format!("failed to finish probe send: {err}"))?;
-    let response = recv
-        .read_to_end(1024)
-        .await
-        .map_err(|err| format!("failed to read probe response: {err}"))?;
+    eprintln!("iroh probe: finished probe send");
+    let response = match recv.read_to_end(1024).await {
+        Ok(response) => response,
+        Err(err) => {
+            let close_reason = connection.closed().await;
+            return Err(format!(
+                "failed to read probe response: {err}; connection closed: {close_reason}"
+            ));
+        }
+    };
+    eprintln!("iroh probe: received {} response bytes", response.len());
     connection.close(0u32.into(), b"probe complete");
     Ok(ProbeConnectionSummary {
         remote_node_id,
@@ -2462,9 +3422,8 @@ struct ByteStreamCollector {
 
 impl util_capnp::byte_stream::Server for ByteStreamCollector {
     fn write(
-        &mut self,
+        self: Rc<Self>,
         params: util_capnp::byte_stream::WriteParams,
-        _: util_capnp::byte_stream::WriteResults,
     ) -> Promise<(), capnp::Error> {
         let params = pry!(params.get());
         let data = pry!(params.get_data());
@@ -2484,7 +3443,7 @@ impl util_capnp::byte_stream::Server for ByteStreamCollector {
     }
 
     fn done(
-        &mut self,
+        self: Rc<Self>,
         _: util_capnp::byte_stream::DoneParams,
         _: util_capnp::byte_stream::DoneResults,
     ) -> Promise<(), capnp::Error> {
@@ -2499,7 +3458,7 @@ impl util_capnp::byte_stream::Server for ByteStreamCollector {
     }
 
     fn expect_size(
-        &mut self,
+        self: Rc<Self>,
         _: util_capnp::byte_stream::ExpectSizeParams,
         _: util_capnp::byte_stream::ExpectSizeResults,
     ) -> Promise<(), capnp::Error> {
@@ -2515,7 +3474,7 @@ struct UdpPacketCollector {
 
 impl ip_capnp::udp_port::Server for UdpPacketCollector {
     fn send(
-        &mut self,
+        self: Rc<Self>,
         params: ip_capnp::udp_port::SendParams,
         _: ip_capnp::udp_port::SendResults,
     ) -> Promise<(), capnp::Error> {
@@ -2545,7 +3504,6 @@ async fn write_to_byte_stream(
     write_req.get().set_data(data);
     write_req
         .send()
-        .promise
         .await
         .map_err(|err| format!("ByteStream.write() failed: {err}"))?;
     Ok(())
@@ -2573,7 +3531,7 @@ async fn connect_saved_ip_network_tcp(
     trace.push("restore:ok".to_string());
 
     let mut host_req = ip_network.get_remote_host_by_name_request();
-    host_req.get().set_address(host.into());
+    host_req.get().set_address(host);
     let host_resp = host_req
         .send()
         .promise
@@ -2653,7 +3611,7 @@ async fn restore_saved_ip_network_remote_host(
     trace.push("restore:ok".to_string());
 
     let mut host_req = ip_network.get_remote_host_by_name_request();
-    host_req.get().set_address(host.into());
+    host_req.get().set_address(host);
     let host_resp = host_req
         .send()
         .promise
