@@ -2,18 +2,22 @@
 
 include!("sandstorm_capnp.rs");
 
+mod app;
+mod backend;
 #[allow(dead_code)]
 mod quinn_adapter;
 #[allow(dead_code)]
 mod raw_udp_capnp;
 #[allow(dead_code)]
 mod sandstorm_custom_transport;
+mod storage;
+#[cfg(test)]
+mod test_support;
 
 use base64::Engine as _;
 use std::collections::HashMap;
-use std::fs::OpenOptions;
-use std::io::Write as _;
 use std::os::fd::FromRawFd;
+use std::path::Path;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -31,25 +35,58 @@ use tokio::runtime::Builder;
 use tokio::sync::Notify;
 use tokio::task::LocalSet;
 use tokio::time::{Duration, timeout};
-use tokio_util::compat::TokioAsyncReadCompatExt;
+use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
+use crate::backend::SandstormBackend;
+use crate::app::App;
 use crate::raw_udp_capnp::{get_local_endpoint, new_capnp_raw_udp_custom_transport};
 use crate::sandstorm_custom_transport::{
     socket_addr_to_custom_addr, SANDSTORM_RAW_UDP_TRANSPORT_ID,
 };
+use crate::storage::{
+    PersistedReceivedCapabilityRecord, ReceivedCapabilityKind, SavedCapabilityRecord, Storage,
+};
 
 const CLIENT_ROOT: &str = "/opt/app/client";
 const STATE_DIR: &str = "/var/iroh-tunnel";
-const SAVED_CAPS_PATH: &str = "/var/iroh-tunnel/saved-caps.tsv";
-const RAW_UDP_INTERFACE_TOKEN_PATH: &str = "/var/iroh-tunnel/raw-udp-interface-token";
-const RAW_UDP_PORT_PATH: &str = "/var/iroh-tunnel/raw-udp-port";
-const IROH_SECRET_KEY_PATH: &str = "/var/iroh-tunnel/iroh-secret-key";
-const REMOTE_TICKET_PATH: &str = "/var/iroh-tunnel/remote-ticket.txt";
 const WEB_SESSION_TYPE_ID: u64 = web_session_capnp::web_session::Client::TYPE_ID;
 const IROH_ALPN: &[u8] = b"dev.iroh-tunnel.capnp/1";
+const IROH_RPC_ALPN: &[u8] = b"dev.iroh-tunnel.capnp/rpc/1";
 const IROH_TRANSPORT_ASSESSMENT: &str = "Saved IpNetwork is proven for outbound TCP and UDP. Native iroh 0.97.0 now exposes custom transports behind unstable-custom-transports, and this prototype has both a proxy-based Quinn RawUdp adapter and a native iroh CustomTransport scaffold for Sandstorm RawUdp. The remaining work is application plumbing: restore an IpInterface capability early enough to bind RawUdp, publish custom transport addresses in tickets, and decide how Sandstorm mode is configured and discovered.";
 const IROH_SANDSTORM_RAW_UDP_INTERFACE_TOKEN_ENV: &str = "IROH_SANDSTORM_RAW_UDP_INTERFACE_TOKEN";
 const IROH_SANDSTORM_RAW_UDP_PORT_ENV: &str = "IROH_SANDSTORM_RAW_UDP_PORT";
+
+fn app_storage() -> Storage {
+    Storage::new(STATE_DIR)
+}
+
+fn app_core(app_state: &Arc<Mutex<AppState>>) -> App {
+    App::new(app_state.clone(), app_storage())
+}
+
+fn exported_ip_network_id_path() -> std::path::PathBuf {
+    app_storage().exported_ip_network_id_path()
+}
+
+fn exported_api_session_id_path() -> std::path::PathBuf {
+    app_storage().exported_api_session_id_path()
+}
+
+fn raw_udp_interface_token_path() -> std::path::PathBuf {
+    app_storage().raw_udp_interface_token_path()
+}
+
+fn raw_udp_port_path() -> std::path::PathBuf {
+    app_storage().raw_udp_port_path()
+}
+
+fn iroh_secret_key_path() -> std::path::PathBuf {
+    app_storage().iroh_secret_key_path()
+}
+
+fn remote_ticket_path() -> std::path::PathBuf {
+    app_storage().remote_ticket_path()
+}
 
 fn main() {
     if let Err(err) = run() {
@@ -240,47 +277,39 @@ impl grain_capnp::main_view::Server<text::Owned> for UiViewImpl {
             .to_str()
             .unwrap_or("")
             .to_string();
-        let saved_cap = match load_saved_capability_by_id(&object_id) {
-            Ok(Some(saved_cap)) => saved_cap,
-            Ok(None) => {
-                return Promise::err(capnp::Error::failed(format!(
-                    "unknown app object id: {object_id}"
-                )));
-            }
-            Err(err) => return Promise::err(capnp::Error::failed(err)),
-        };
-
         let sandstorm_api = self.sandstorm_api.clone();
+        let app_state = self.app_state.clone();
         Promise::from_future(async move {
-            let token = hex_decode(&saved_cap.saved_token).map_err(capnp::Error::failed)?;
-            let mut restore_req = sandstorm_api.restore_request();
-            restore_req.get().set_token(&token);
-            let restore_resp = restore_req.send().promise.await.map_err(|err| {
-                capnp::Error::failed(format!("SandstormApi.restore() failed: {err}"))
-            })?;
-            let restored_cap = restore_resp
-                .get()
-                .map_err(|err| {
-                    capnp::Error::failed(format!("failed to decode restore() response: {err}"))
-                })?
-                .get_cap();
+            let restored_cap =
+                restore_app_object_capability(sandstorm_api, &app_state, &object_id)
+                    .await
+                    .map_err(capnp::Error::failed)?;
             results
                 .get()
                 .get_cap()
-                .set_as(restored_cap)
-                .map_err(|err| {
-                    capnp::Error::failed(format!("failed to set restore result capability: {err}"))
-                })?;
+                .set_as_capability(restored_cap.hook);
             Ok(())
         })
     }
 
     fn drop(
         self: Rc<Self>,
-        _: grain_capnp::main_view::DropParams<text::Owned>,
+        params: grain_capnp::main_view::DropParams<text::Owned>,
         _: grain_capnp::main_view::DropResults<text::Owned>,
     ) -> Promise<(), capnp::Error> {
-        Promise::ok(())
+        let params = pry!(params.get());
+        let object_id = pry!(params.get_object_id())
+            .to_str()
+            .unwrap_or("")
+            .to_string();
+        let app_state = self.app_state.clone();
+        Promise::from_future(async move {
+            match drop_received_remote_capability(&app_state, &object_id) {
+                Ok(true) => Ok(()),
+                Ok(false) => Ok(()),
+                Err(err) => Err(capnp::Error::failed(err)),
+            }
+        })
     }
 }
 
@@ -530,6 +559,517 @@ impl web_session_capnp::web_session::Server for WebSessionImpl {
                         let mut error = results.get().init_server_error();
                         let description = format!(
                             "<!doctype html><title>Raw UDP Interface Update Failed</title><pre>{}</pre>",
+                            escape_html(&err)
+                        );
+                        error.set_description_html(description.as_str());
+                    }
+                }
+                Ok(())
+            });
+        }
+
+        if path == "api/tunnel/exported-ip-network" {
+            if !self.can_manage {
+                let mut error = results.get().init_client_error();
+                error.set_status_code(
+                    web_session_capnp::web_session::response::ClientErrorCode::Forbidden,
+                );
+                return Promise::ok(());
+            }
+
+            let body = pry!(params.get_content())
+                .get_content()
+                .unwrap_or(&[])
+                .to_vec();
+            let saved_cap_id = match std::str::from_utf8(&body) {
+                Ok(value) => value.trim().to_string(),
+                Err(err) => {
+                    let mut error = results.get().init_client_error();
+                    let description =
+                        format!("<!doctype html><title>Bad Request</title><p>{err}</p>");
+                    error.set_status_code(
+                        web_session_capnp::web_session::response::ClientErrorCode::BadRequest,
+                    );
+                    error.set_description_html(description.as_str());
+                    return Promise::ok(());
+                }
+            };
+
+            let app_state = self.app_state.clone();
+            let sandstorm_api = self.sandstorm_api.clone();
+            return Promise::from_future(async move {
+                match configure_exported_ip_network(&app_state, sandstorm_api, &saved_cap_id).await {
+                    Ok(()) => {
+                        let mut content = results.get().init_content();
+                        content.set_status_code(
+                            web_session_capnp::web_session::response::SuccessCode::Ok,
+                        );
+                        content.set_mime_type("application/json");
+                        content.init_body().set_bytes(br#"{"ok":true}"#);
+                    }
+                    Err(err) => {
+                        let mut error = results.get().init_server_error();
+                        let description = format!(
+                            "<!doctype html><title>Export Configuration Failed</title><pre>{}</pre>",
+                            escape_html(&err)
+                        );
+                        error.set_description_html(description.as_str());
+                    }
+                }
+                Ok(())
+            });
+        }
+
+        if path == "api/tunnel/exported-api-session" {
+            if !self.can_manage {
+                let mut error = results.get().init_client_error();
+                error.set_status_code(
+                    web_session_capnp::web_session::response::ClientErrorCode::Forbidden,
+                );
+                return Promise::ok(());
+            }
+
+            let body = pry!(params.get_content())
+                .get_content()
+                .unwrap_or(&[])
+                .to_vec();
+            let saved_cap_id = match std::str::from_utf8(&body) {
+                Ok(value) => value.trim().to_string(),
+                Err(err) => {
+                    let mut error = results.get().init_client_error();
+                    let description =
+                        format!("<!doctype html><title>Bad Request</title><p>{err}</p>");
+                    error.set_status_code(
+                        web_session_capnp::web_session::response::ClientErrorCode::BadRequest,
+                    );
+                    error.set_description_html(description.as_str());
+                    return Promise::ok(());
+                }
+            };
+
+            let app_state = self.app_state.clone();
+            let sandstorm_api = self.sandstorm_api.clone();
+            return Promise::from_future(async move {
+                match configure_exported_api_session(&app_state, sandstorm_api, &saved_cap_id).await
+                {
+                    Ok(()) => {
+                        let mut content = results.get().init_content();
+                        content.set_status_code(
+                            web_session_capnp::web_session::response::SuccessCode::Ok,
+                        );
+                        content.set_mime_type("application/json");
+                        content.init_body().set_bytes(br#"{"ok":true}"#);
+                    }
+                    Err(err) => {
+                        let mut error = results.get().init_server_error();
+                        let description = format!(
+                            "<!doctype html><title>Export Configuration Failed</title><pre>{}</pre>",
+                            escape_html(&err)
+                        );
+                        error.set_description_html(description.as_str());
+                    }
+                }
+                Ok(())
+            });
+        }
+
+        if path == "api/tunnel/rpc/connect" {
+            if !self.can_manage {
+                let mut error = results.get().init_client_error();
+                error.set_status_code(
+                    web_session_capnp::web_session::response::ClientErrorCode::Forbidden,
+                );
+                return Promise::ok(());
+            }
+
+            let app_state = self.app_state.clone();
+            let sandstorm_api = self.sandstorm_api.clone();
+            return Promise::from_future(async move {
+                match connect_peer_rpc_session(app_state, sandstorm_api).await {
+                    Ok((ip_network_exports, api_session_exports)) => {
+                        let ip_network_exports_json = ip_network_exports
+                            .iter()
+                            .map(|export| {
+                                format!(
+                                    "{{\"id\":\"{}\",\"label\":\"{}\"}}",
+                                    json_escape(&export.id),
+                                    json_escape(&export.label)
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .join(",");
+                        let api_session_exports_json = api_session_exports
+                            .iter()
+                            .map(|export| {
+                                format!(
+                                    "{{\"id\":\"{}\",\"label\":\"{}\"}}",
+                                    json_escape(&export.id),
+                                    json_escape(&export.label)
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .join(",");
+                        let body = format!(
+                            "{{\"ok\":true,\"ipNetworkExports\":[{}],\"apiSessionExports\":[{}]}}",
+                            ip_network_exports_json, api_session_exports_json
+                        );
+                        let mut content = results.get().init_content();
+                        content.set_status_code(
+                            web_session_capnp::web_session::response::SuccessCode::Ok,
+                        );
+                        content.set_mime_type("application/json");
+                        content.init_body().set_bytes(body.as_bytes());
+                    }
+                    Err(err) => {
+                        eprintln!("peer rpc connect failed: {err}");
+                        let mut error = results.get().init_server_error();
+                        let description = format!(
+                            "<!doctype html><title>Peer RPC Connect Failed</title><pre>{}</pre>",
+                            escape_html(&err)
+                        );
+                        error.set_description_html(description.as_str());
+                    }
+                }
+                Ok(())
+            });
+        }
+
+        if path == "api/tunnel/rpc/disconnect" {
+            if !self.can_manage {
+                let mut error = results.get().init_client_error();
+                error.set_status_code(
+                    web_session_capnp::web_session::response::ClientErrorCode::Forbidden,
+                );
+                return Promise::ok(());
+            }
+
+            match disconnect_peer_rpc_session(&self.app_state) {
+                Ok(()) => {
+                    let mut content = results.get().init_content();
+                    content
+                        .set_status_code(web_session_capnp::web_session::response::SuccessCode::Ok);
+                    content.set_mime_type("application/json");
+                    content.init_body().set_bytes(br#"{"ok":true}"#);
+                }
+                Err(err) => {
+                    let mut error = results.get().init_server_error();
+                    let description = format!(
+                        "<!doctype html><title>Peer RPC Disconnect Failed</title><pre>{}</pre>",
+                        escape_html(&err)
+                    );
+                    error.set_description_html(description.as_str());
+                }
+            }
+            return Promise::ok(());
+        }
+
+        if path == "api/tunnel/rpc/import-ip-network" {
+            if !self.can_manage {
+                let mut error = results.get().init_client_error();
+                error.set_status_code(
+                    web_session_capnp::web_session::response::ClientErrorCode::Forbidden,
+                );
+                return Promise::ok(());
+            }
+
+            let body = pry!(params.get_content())
+                .get_content()
+                .unwrap_or(&[])
+                .to_vec();
+            let export_id = match std::str::from_utf8(&body) {
+                Ok(value) => value.trim().to_string(),
+                Err(err) => {
+                    let mut error = results.get().init_client_error();
+                    let description =
+                        format!("<!doctype html><title>Bad Request</title><p>{err}</p>");
+                    error.set_status_code(
+                        web_session_capnp::web_session::response::ClientErrorCode::BadRequest,
+                    );
+                    error.set_description_html(description.as_str());
+                    return Promise::ok(());
+                }
+            };
+            if export_id.is_empty() {
+                let mut error = results.get().init_client_error();
+                error.set_status_code(
+                    web_session_capnp::web_session::response::ClientErrorCode::BadRequest,
+                );
+                error.set_description_html("missing remote export id");
+                return Promise::ok(());
+            }
+
+            let app_state = self.app_state.clone();
+            return Promise::from_future(async move {
+                match import_remote_ip_network_export(&app_state, &export_id).await {
+                    Ok((label, object_id)) => {
+                        let body = format!(
+                            "{{\"ok\":true,\"objectId\":\"{}\",\"exportId\":\"{}\",\"label\":\"{}\"}}",
+                            json_escape(&object_id),
+                            json_escape(&export_id),
+                            json_escape(&label)
+                        );
+                        let mut content = results.get().init_content();
+                        content.set_status_code(
+                            web_session_capnp::web_session::response::SuccessCode::Ok,
+                        );
+                        content.set_mime_type("application/json");
+                        content.init_body().set_bytes(body.as_bytes());
+                    }
+                    Err(err) => {
+                        eprintln!("peer rpc import failed: {err}");
+                        let mut error = results.get().init_server_error();
+                        let description = format!(
+                            "<!doctype html><title>Peer RPC Import Failed</title><pre>{}</pre>",
+                            escape_html(&err)
+                        );
+                        error.set_description_html(description.as_str());
+                    }
+                }
+                Ok(())
+            });
+        }
+
+        if path == "api/tunnel/rpc/import-api-session" {
+            if !self.can_manage {
+                let mut error = results.get().init_client_error();
+                error.set_status_code(
+                    web_session_capnp::web_session::response::ClientErrorCode::Forbidden,
+                );
+                return Promise::ok(());
+            }
+
+            let body = pry!(params.get_content())
+                .get_content()
+                .unwrap_or(&[])
+                .to_vec();
+            let export_id = match std::str::from_utf8(&body) {
+                Ok(value) => value.trim().to_string(),
+                Err(err) => {
+                    let mut error = results.get().init_client_error();
+                    let description =
+                        format!("<!doctype html><title>Bad Request</title><p>{err}</p>");
+                    error.set_status_code(
+                        web_session_capnp::web_session::response::ClientErrorCode::BadRequest,
+                    );
+                    error.set_description_html(description.as_str());
+                    return Promise::ok(());
+                }
+            };
+            if export_id.is_empty() {
+                let mut error = results.get().init_client_error();
+                error.set_status_code(
+                    web_session_capnp::web_session::response::ClientErrorCode::BadRequest,
+                );
+                error.set_description_html("missing remote export id");
+                return Promise::ok(());
+            }
+
+            let app_state = self.app_state.clone();
+            return Promise::from_future(async move {
+                match import_remote_api_session_export(&app_state, &export_id).await {
+                    Ok((label, object_id)) => {
+                        let body = format!(
+                            "{{\"ok\":true,\"objectId\":\"{}\",\"exportId\":\"{}\",\"label\":\"{}\"}}",
+                            json_escape(&object_id),
+                            json_escape(&export_id),
+                            json_escape(&label)
+                        );
+                        let mut content = results.get().init_content();
+                        content.set_status_code(
+                            web_session_capnp::web_session::response::SuccessCode::Ok,
+                        );
+                        content.set_mime_type("application/json");
+                        content.init_body().set_bytes(body.as_bytes());
+                    }
+                    Err(err) => {
+                        eprintln!("peer rpc api session import failed: {err}");
+                        let mut error = results.get().init_server_error();
+                        let description = format!(
+                            "<!doctype html><title>Peer RPC Import Failed</title><pre>{}</pre>",
+                            escape_html(&err)
+                        );
+                        error.set_description_html(description.as_str());
+                    }
+                }
+                Ok(())
+            });
+        }
+
+        if path == "api/tunnel/rpc/invoke-ip-network" {
+            if !self.can_manage {
+                let mut error = results.get().init_client_error();
+                error.set_status_code(
+                    web_session_capnp::web_session::response::ClientErrorCode::Forbidden,
+                );
+                return Promise::ok(());
+            }
+
+            let body = pry!(params.get_content())
+                .get_content()
+                .unwrap_or(&[])
+                .to_vec();
+            let request = match std::str::from_utf8(&body) {
+                Ok(value) => parse_remote_ip_network_invoke_request(value),
+                Err(err) => {
+                    let mut error = results.get().init_client_error();
+                    let description =
+                        format!("<!doctype html><title>Bad Request</title><p>{err}</p>");
+                    error.set_status_code(
+                        web_session_capnp::web_session::response::ClientErrorCode::BadRequest,
+                    );
+                    error.set_description_html(description.as_str());
+                    return Promise::ok(());
+                }
+            };
+            let request = match request {
+                Ok(value) => value,
+                Err(err) => {
+                    let mut error = results.get().init_client_error();
+                    let description = format!(
+                        "<!doctype html><title>Bad Request</title><p>{}</p>",
+                        escape_html(&err)
+                    );
+                    error.set_status_code(
+                        web_session_capnp::web_session::response::ClientErrorCode::BadRequest,
+                    );
+                    error.set_description_html(description.as_str());
+                    return Promise::ok(());
+                }
+            };
+
+            let app_state = self.app_state.clone();
+            return Promise::from_future(async move {
+                match invoke_imported_remote_ip_network(&app_state, &request.host, request.port).await {
+                    Ok(summary) => {
+                        let preview = String::from_utf8_lossy(&summary.response_bytes)
+                            .lines()
+                            .take(12)
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        let body = format!(
+                            "{{\"ok\":true,\"host\":\"{}\",\"port\":{},\"responseByteCount\":{},\"responsePreview\":\"{}\",\"trace\":\"{}\"}}",
+                            json_escape(&summary.host),
+                            summary.port,
+                            summary.response_bytes.len(),
+                            json_escape(&preview),
+                            json_escape(&summary.trace)
+                        );
+                        let mut content = results.get().init_content();
+                        content.set_status_code(
+                            web_session_capnp::web_session::response::SuccessCode::Ok,
+                        );
+                        content.set_mime_type("application/json");
+                        content.init_body().set_bytes(body.as_bytes());
+                    }
+                    Err(err) => {
+                        eprintln!("peer rpc invoke failed: {err}");
+                        let mut error = results.get().init_server_error();
+                        let description = format!(
+                            "<!doctype html><title>Peer RPC Invoke Failed</title><pre>{}</pre>",
+                            escape_html(&err)
+                        );
+                        error.set_description_html(description.as_str());
+                    }
+                }
+                Ok(())
+            });
+        }
+
+        if path == "api/tunnel/rpc/invoke-api-session" {
+            if !self.can_manage {
+                let mut error = results.get().init_client_error();
+                error.set_status_code(
+                    web_session_capnp::web_session::response::ClientErrorCode::Forbidden,
+                );
+                return Promise::ok(());
+            }
+
+            let body = pry!(params.get_content())
+                .get_content()
+                .unwrap_or(&[])
+                .to_vec();
+            let filename = match params.get_context() {
+                Ok(context) => match get_request_header(context, "x-sandstorm-app-filename") {
+                    Ok(Some(value)) => value,
+                    Ok(None) => String::new(),
+                    Err(err) => {
+                        let mut error = results.get().init_client_error();
+                        let description = format!(
+                            "<!doctype html><title>Bad Request</title><p>{}</p>",
+                            escape_html(&err)
+                        );
+                        error.set_status_code(
+                            web_session_capnp::web_session::response::ClientErrorCode::BadRequest,
+                        );
+                        error.set_description_html(description.as_str());
+                        return Promise::ok(());
+                    }
+                },
+                Err(err) => {
+                    let mut error = results.get().init_client_error();
+                    let description =
+                        format!("<!doctype html><title>Bad Request</title><p>{err}</p>");
+                    error.set_status_code(
+                        web_session_capnp::web_session::response::ClientErrorCode::BadRequest,
+                    );
+                    error.set_description_html(description.as_str());
+                    return Promise::ok(());
+                }
+            };
+            let request = match parse_remote_api_session_invoke_request(&filename, &body) {
+                Ok(value) => value,
+                Err(err) => {
+                    let mut error = results.get().init_client_error();
+                    let description = format!(
+                        "<!doctype html><title>Bad Request</title><p>{}</p>",
+                        escape_html(&err)
+                    );
+                    error.set_status_code(
+                        web_session_capnp::web_session::response::ClientErrorCode::BadRequest,
+                    );
+                    error.set_description_html(description.as_str());
+                    return Promise::ok(());
+                }
+            };
+
+            let app_state = self.app_state.clone();
+            return Promise::from_future(async move {
+                match invoke_imported_remote_api_session(
+                    &app_state,
+                    &request.filename,
+                    &request.payload,
+                )
+                .await
+                {
+                    Ok(summary) => {
+                        let preview = String::from_utf8_lossy(&summary.response_bytes)
+                            .lines()
+                            .take(12)
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        let body = format!(
+                            "{{\"ok\":true,\"status\":{},\"contentType\":\"{}\",\"responseByteCount\":{},\"responsePreview\":\"{}\",\"responsePreviewBase64\":\"{}\",\"trace\":\"{}\"}}",
+                            summary.status_code,
+                            json_escape(&summary.content_type),
+                            summary.response_bytes.len(),
+                            json_escape(&preview),
+                            json_escape(&base64::engine::general_purpose::STANDARD.encode(
+                                summary.response_bytes.iter().take(256).copied().collect::<Vec<_>>()
+                            )),
+                            json_escape(&summary.trace)
+                        );
+                        let mut content = results.get().init_content();
+                        content.set_status_code(
+                            web_session_capnp::web_session::response::SuccessCode::Ok,
+                        );
+                        content.set_mime_type("application/json");
+                        content.init_body().set_bytes(body.as_bytes());
+                    }
+                    Err(err) => {
+                        eprintln!("peer rpc api session invoke failed: {err}");
+                        let mut error = results.get().init_server_error();
+                        let description = format!(
+                            "<!doctype html><title>Peer RPC Invoke Failed</title><pre>{}</pre>",
                             escape_html(&err)
                         );
                         error.set_description_html(description.as_str());
@@ -1463,30 +2003,64 @@ impl web_session_capnp::web_session::Server for WebSessionImpl {
                     }
                 };
 
-                let saved_cap = match load_saved_capability_by_id(&object_id) {
-                    Ok(Some(saved_cap)) => saved_cap,
-                    Ok(None) => {
-                        let mut error = results.get().init_client_error();
-                        error.set_status_code(
-                            web_session_capnp::web_session::response::ClientErrorCode::NotFound,
-                        );
-                        return Promise::ok(());
-                    }
-                    Err(err) => return Promise::err(capnp::Error::failed(err)),
-                };
-
                 let sandstorm_api = self.sandstorm_api.clone();
+                let app_state = self.app_state.clone();
                 return Promise::from_future(async move {
                     let outcome =
-                        restore_saved_capability(sandstorm_api, &saved_cap.saved_token).await;
+                        restore_app_object_capability(sandstorm_api, &app_state, &object_id).await;
                     match outcome {
-                        Ok(()) => {
+                        Ok(_) => {
                             results.get().init_no_content();
+                        }
+                        Err(err) => {
+                            let mut error = results.get().init_client_error();
+                            error.set_status_code(
+                                web_session_capnp::web_session::response::ClientErrorCode::NotFound,
+                            );
+                            let description = format!(
+                                "<!doctype html><title>Resolve Failed</title><pre>{}</pre>",
+                                escape_html(&err)
+                            );
+                            error.set_description_html(description.as_str());
+                        }
+                    }
+                    Ok(())
+                });
+            } else if path == "api/saved-cap/drop-object" {
+                let body = pry!(params.get_content())
+                    .get_content()
+                    .unwrap_or(&[])
+                    .to_vec();
+                let object_id = match std::str::from_utf8(&body) {
+                    Ok(value) => value.trim().to_string(),
+                    Err(err) => {
+                        let mut error = results.get().init_client_error();
+                        let description =
+                            format!("<!doctype html><title>Bad Request</title><p>{err}</p>");
+                        error.set_status_code(
+                            web_session_capnp::web_session::response::ClientErrorCode::BadRequest,
+                        );
+                        error.set_description_html(description.as_str());
+                        return Promise::ok(());
+                    }
+                };
+
+                let app_state = self.app_state.clone();
+                return Promise::from_future(async move {
+                    match drop_received_remote_capability(&app_state, &object_id) {
+                        Ok(true) => {
+                            results.get().init_no_content();
+                        }
+                        Ok(false) => {
+                            let mut error = results.get().init_client_error();
+                            error.set_status_code(
+                                web_session_capnp::web_session::response::ClientErrorCode::NotFound,
+                            );
                         }
                         Err(err) => {
                             let mut error = results.get().init_server_error();
                             let description = format!(
-                                "<!doctype html><title>Resolve Failed</title><pre>{}</pre>",
+                                "<!doctype html><title>Drop Failed</title><pre>{}</pre>",
                                 escape_html(&err)
                             );
                             error.set_description_html(description.as_str());
@@ -1682,25 +2256,24 @@ async fn restore_saved_capability(
     Ok(())
 }
 
+async fn restore_app_object_capability(
+    sandstorm_api: grain_capnp::sandstorm_api::Client<capnp::any_pointer::Owned>,
+    app_state: &Arc<Mutex<AppState>>,
+    object_id: &str,
+) -> Result<capnp::capability::Client, String> {
+    app_core(app_state)
+        .restore_object_capability(sandstorm_api, object_id)
+        .await
+}
+
 async fn restore_saved_ip_network(
     sandstorm_api: grain_capnp::sandstorm_api::Client<capnp::any_pointer::Owned>,
     saved_token_hex: &str,
 ) -> Result<ip_capnp::ip_network::Client, String> {
     let token = hex_decode(saved_token_hex)?;
-    let mut restore_req = sandstorm_api.restore_request();
-    restore_req.get().set_token(&token);
-    let restore_resp = restore_req
-        .send()
-        .promise
+    SandstormBackend::new(sandstorm_api)
+        .restore_ip_network(&token)
         .await
-        .map_err(|err| format!("SandstormApi.restore() failed: {err}"))?;
-    let restore_resp = restore_resp
-        .get()
-        .map_err(|err| format!("failed to decode restore() response: {err}"))?;
-    restore_resp
-        .get_cap()
-        .get_as::<ip_capnp::ip_network::Client>()
-        .map_err(|err| format!("restored capability is not an IpNetwork: {err}"))
 }
 
 async fn restore_saved_ip_interface(
@@ -1708,55 +2281,32 @@ async fn restore_saved_ip_interface(
     saved_token_hex: &str,
 ) -> Result<ip_capnp::ip_interface::Client, String> {
     let token = hex_decode(saved_token_hex)?;
-    let mut restore_req = sandstorm_api.restore_request();
-    restore_req.get().set_token(&token);
-    let restore_resp = restore_req
-        .send()
-        .promise
+    SandstormBackend::new(sandstorm_api)
+        .restore_ip_interface(&token)
         .await
-        .map_err(|err| format!("SandstormApi.restore() failed: {err}"))?;
-    let restore_resp = restore_resp
-        .get()
-        .map_err(|err| format!("failed to decode restore() response: {err}"))?;
-    restore_resp
-        .get_cap()
-        .get_as::<ip_capnp::ip_interface::Client>()
-        .map_err(|err| format!("restored capability is not an IpInterface: {err}"))
+}
+
+async fn restore_saved_api_session(
+    sandstorm_api: grain_capnp::sandstorm_api::Client<capnp::any_pointer::Owned>,
+    saved_token_hex: &str,
+) -> Result<api_session_capnp::api_session::Client, String> {
+    let token = hex_decode(saved_token_hex)?;
+    SandstormBackend::new(sandstorm_api)
+        .restore_api_session(&token)
+        .await
 }
 
 fn load_saved_capabilities() -> Result<Vec<SavedCapability>, String> {
-    let contents = match std::fs::read_to_string(SAVED_CAPS_PATH) {
-        Ok(contents) => contents,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(err) => return Err(format!("failed to read saved capability registry: {err}")),
-    };
-
-    let mut rows = Vec::new();
-    for line in contents.lines() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let parts: Vec<_> = line.split('\t').collect();
-        if parts.len() >= 4 {
-            rows.push(SavedCapability {
-                id: parts[0].to_string(),
-                label: parts[1].to_string(),
-                saved_token: parts[2].to_string(),
-                created_at_ms: parts[3].parse().unwrap_or(0),
-            });
-            continue;
-        }
-
-        if parts.len() >= 2 {
-            rows.push(SavedCapability {
-                id: make_saved_cap_id(),
-                label: parts[0].to_string(),
-                saved_token: parts[1].to_string(),
-                created_at_ms: now_ms(),
-            });
-        }
-    }
-    Ok(rows)
+    Ok(app_storage()
+        .load_saved_capabilities()?
+        .into_iter()
+        .map(|row: SavedCapabilityRecord| SavedCapability {
+            id: row.id,
+            label: row.label,
+            saved_token: row.saved_token,
+            created_at_ms: row.created_at_ms,
+        })
+        .collect())
 }
 
 fn load_saved_capability_by_id(id: &str) -> Result<Option<SavedCapability>, String> {
@@ -1769,26 +2319,79 @@ fn load_saved_capability_by_id(id: &str) -> Result<Option<SavedCapability>, Stri
 }
 
 fn persist_saved_capability(label: &str, saved_token: &str) -> Result<SavedCapability, String> {
-    std::fs::create_dir_all(STATE_DIR)
-        .map_err(|err| format!("failed to create state directory: {err}"))?;
     let saved_cap = SavedCapability {
         id: make_saved_cap_id(),
         label: label.to_string(),
         saved_token: saved_token.to_string(),
         created_at_ms: now_ms(),
     };
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(SAVED_CAPS_PATH)
-        .map_err(|err| format!("failed to open saved capability registry: {err}"))?;
-    writeln!(
-        file,
-        "{}\t{}\t{}\t{}",
-        saved_cap.id, saved_cap.label, saved_cap.saved_token, saved_cap.created_at_ms
-    )
-    .map_err(|err| format!("failed to persist saved capability: {err}"))?;
+    app_storage().persist_saved_capability(&SavedCapabilityRecord {
+        id: saved_cap.id.clone(),
+        label: saved_cap.label.clone(),
+        saved_token: saved_cap.saved_token.clone(),
+        created_at_ms: saved_cap.created_at_ms,
+    })?;
     Ok(saved_cap)
+}
+
+fn load_configured_exported_capability(
+    path: &Path,
+    fallback_label: &str,
+) -> Result<Option<SavedCapability>, String> {
+    match app_storage().load_text_file(path)? {
+        Some(trimmed) => Ok(load_saved_capability_by_id(&trimmed)?.or(Some(SavedCapability {
+            id: trimmed,
+            label: fallback_label.to_string(),
+            saved_token: String::new(),
+            created_at_ms: 0,
+        }))),
+        None => Ok(None),
+    }
+}
+
+fn persist_configured_exported_capability(path: &Path, saved_cap_id: &str) -> Result<(), String> {
+    app_storage().persist_text_file(path, saved_cap_id)
+}
+
+fn clear_configured_exported_capability(path: &Path) -> Result<(), String> {
+    app_storage().clear_file(path)
+}
+
+fn load_persisted_received_capabilities() -> Result<
+    (
+        Option<PersistedReceivedCapability>,
+        Option<PersistedReceivedCapability>,
+    ),
+    String,
+> {
+    let (ip_network, api_session) = app_storage().load_persisted_received_capabilities()?;
+    let convert = |record: PersistedReceivedCapabilityRecord| PersistedReceivedCapability {
+        object_id: record.object_id,
+        export_id: record.export_id,
+        label: record.label,
+        kind: match record.kind {
+            ReceivedCapabilityKind::IpNetwork => ImportedRemoteCapabilityKind::IpNetwork,
+            ReceivedCapabilityKind::ApiSession => ImportedRemoteCapabilityKind::ApiSession,
+        },
+    };
+    Ok((ip_network.map(convert), api_session.map(convert)))
+}
+
+fn parse_remote_cap_numeric_suffix(object_id: &str) -> Option<u64> {
+    object_id
+        .strip_prefix("remote-cap-")
+        .and_then(|value| value.parse::<u64>().ok())
+}
+
+fn max_persisted_received_cap_id(
+    ip_network: Option<&PersistedReceivedCapability>,
+    api_session: Option<&PersistedReceivedCapability>,
+) -> Option<u64> {
+    [ip_network, api_session]
+        .into_iter()
+        .flatten()
+        .filter_map(|record| parse_remote_cap_numeric_suffix(&record.object_id))
+        .max()
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -1856,11 +2459,74 @@ fn escape_html(value: &str) -> String {
 }
 
 #[derive(Debug)]
+#[derive(Clone)]
 struct SavedCapability {
     id: String,
     label: String,
     saved_token: String,
     created_at_ms: u64,
+}
+
+#[derive(Clone)]
+struct PeerRpcExport {
+    id: String,
+    label: String,
+}
+
+struct PeerRpcSession {
+    session_id: u64,
+    remote_node_id: String,
+    connection: iroh::endpoint::Connection,
+    remote_bootstrap: tunnel_capnp::peer_bootstrap::Client,
+    ip_network_exports: Vec<PeerRpcExport>,
+    api_session_exports: Vec<PeerRpcExport>,
+}
+
+struct ImportedRemoteIpNetwork {
+    object_id: String,
+    export_id: String,
+    label: String,
+    client: ip_capnp::ip_network::Client,
+}
+
+struct ImportedRemoteApiSession {
+    object_id: String,
+    export_id: String,
+    label: String,
+    client: api_session_capnp::api_session::Client,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ImportedRemoteCapabilityKind {
+    IpNetwork,
+    ApiSession,
+}
+
+#[derive(Clone)]
+struct PersistedReceivedCapability {
+    object_id: String,
+    export_id: String,
+    label: String,
+    kind: ImportedRemoteCapabilityKind,
+}
+
+#[derive(Clone)]
+struct ImportedRemoteCapability {
+    object_id: String,
+    export_id: String,
+    label: String,
+    kind: ImportedRemoteCapabilityKind,
+    client: capnp::capability::Client,
+}
+
+struct ExportedIpNetworkState {
+    saved_cap: SavedCapability,
+    client: ip_capnp::ip_network::Client,
+}
+
+struct ExportedApiSessionState {
+    saved_cap: SavedCapability,
+    client: api_session_capnp::api_session::Client,
 }
 
 struct AppState {
@@ -1871,6 +2537,19 @@ struct AppState {
     raw_udp_interface: Option<SavedCapability>,
     raw_udp_interface_source: Option<String>,
     remote_ticket: Option<String>,
+    exported_ip_network: Option<SavedCapability>,
+    exported_api_session: Option<SavedCapability>,
+    exported_ip_network_live: Option<ExportedIpNetworkState>,
+    exported_api_session_live: Option<ExportedApiSessionState>,
+    peer_rpc_session: Option<PeerRpcSession>,
+    imported_remote_ip_network: Option<ImportedRemoteIpNetwork>,
+    imported_remote_api_session: Option<ImportedRemoteApiSession>,
+    imported_remote_caps: HashMap<String, ImportedRemoteCapability>,
+    persisted_received_ip_network: Option<PersistedReceivedCapability>,
+    persisted_received_api_session: Option<PersistedReceivedCapability>,
+    next_peer_rpc_session_id: u64,
+    next_imported_remote_cap_id: u64,
+    peer_rpc_error: Option<String>,
     active_tcp_sessions: HashMap<String, Arc<SavedIpNetworkTcpSession>>,
     next_tcp_session_id: u64,
 }
@@ -1879,6 +2558,22 @@ impl AppState {
     fn initialize() -> Result<Self, String> {
         let iroh_identity = load_or_create_iroh_identity()?;
         let remote_ticket = load_remote_ticket()?;
+        let exported_ip_network = load_configured_exported_capability(
+            exported_ip_network_id_path().as_path(),
+            "Configured IpNetwork export",
+        )?;
+        let exported_api_session = load_configured_exported_capability(
+            exported_api_session_id_path().as_path(),
+            "Configured ApiSession export",
+        )?;
+        let (persisted_received_ip_network, persisted_received_api_session) =
+            load_persisted_received_capabilities()?;
+        let next_imported_remote_cap_id =
+            max_persisted_received_cap_id(
+                persisted_received_ip_network.as_ref(),
+                persisted_received_api_session.as_ref(),
+            )
+            .unwrap_or(0);
         Ok(Self {
             iroh_identity,
             iroh_endpoint: None,
@@ -1887,6 +2582,19 @@ impl AppState {
             raw_udp_interface: None,
             raw_udp_interface_source: None,
             remote_ticket,
+            exported_ip_network,
+            exported_api_session,
+            exported_ip_network_live: None,
+            exported_api_session_live: None,
+            peer_rpc_session: None,
+            imported_remote_ip_network: None,
+            imported_remote_api_session: None,
+            imported_remote_caps: HashMap::new(),
+            persisted_received_ip_network,
+            persisted_received_api_session,
+            next_peer_rpc_session_id: 0,
+            next_imported_remote_cap_id,
+            peer_rpc_error: None,
             active_tcp_sessions: HashMap::new(),
             next_tcp_session_id: 0,
         })
@@ -1901,6 +2609,14 @@ async fn initialize_iroh_endpoint(
         let mut guard = app_state
             .lock()
             .map_err(|_| "app state lock poisoned".to_string())?;
+        if let Some(session) = guard.peer_rpc_session.take() {
+            session
+                .connection
+                .close(0u32.into(), b"local endpoint reinitialized");
+        }
+        guard.imported_remote_ip_network = None;
+        guard.imported_remote_api_session = None;
+        guard.peer_rpc_error = None;
         (
             guard.iroh_identity.secret_key.clone(),
             guard.iroh_endpoint.take(),
@@ -1910,7 +2626,7 @@ async fn initialize_iroh_endpoint(
         old_endpoint.close().await;
     }
 
-    let bind_result = bind_local_iroh_endpoint(sandstorm_api, &secret_key).await;
+    let bind_result = bind_local_iroh_endpoint(app_state.clone(), sandstorm_api, &secret_key).await;
     let (raw_udp_interface, raw_udp_interface_source) =
         load_configured_raw_udp_interface_state()?;
     let mut guard = app_state
@@ -1966,7 +2682,8 @@ fn load_configured_raw_udp_interface_state() -> Result<(Option<SavedCapability>,
 }
 
 fn load_saved_raw_udp_interface_token() -> Result<Option<String>, String> {
-    match std::fs::read_to_string(RAW_UDP_INTERFACE_TOKEN_PATH) {
+    let path = raw_udp_interface_token_path();
+    match std::fs::read_to_string(&path) {
         Ok(value) => {
             let trimmed = value.trim().to_string();
             if trimmed.is_empty() {
@@ -1976,14 +2693,13 @@ fn load_saved_raw_udp_interface_token() -> Result<Option<String>, String> {
             }
         }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(err) => Err(format!(
-            "failed to read raw udp interface token: {err}"
-        )),
+        Err(err) => Err(format!("failed to read raw udp interface token {}: {err}", path.display())),
     }
 }
 
 fn load_saved_raw_udp_port() -> Result<Option<u16>, String> {
-    match std::fs::read_to_string(RAW_UDP_PORT_PATH) {
+    let path = raw_udp_port_path();
+    match std::fs::read_to_string(&path) {
         Ok(value) => {
             let trimmed = value.trim();
             if trimmed.is_empty() {
@@ -1996,37 +2712,41 @@ fn load_saved_raw_udp_port() -> Result<Option<u16>, String> {
             }
         }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(err) => Err(format!("failed to read raw udp port: {err}")),
+        Err(err) => Err(format!("failed to read raw udp port {}: {err}", path.display())),
     }
 }
 
 fn persist_raw_udp_interface_token(saved_token: &str) -> Result<(), String> {
     std::fs::create_dir_all(STATE_DIR)
         .map_err(|err| format!("failed to create state directory: {err}"))?;
-    std::fs::write(RAW_UDP_INTERFACE_TOKEN_PATH, format!("{saved_token}\n"))
-        .map_err(|err| format!("failed to persist raw udp interface token: {err}"))
+    let path = raw_udp_interface_token_path();
+    std::fs::write(&path, format!("{saved_token}\n"))
+        .map_err(|err| format!("failed to persist raw udp interface token {}: {err}", path.display()))
 }
 
 fn persist_raw_udp_port(port: u16) -> Result<(), String> {
     std::fs::create_dir_all(STATE_DIR)
         .map_err(|err| format!("failed to create state directory: {err}"))?;
-    std::fs::write(RAW_UDP_PORT_PATH, format!("{port}\n"))
-        .map_err(|err| format!("failed to persist raw udp port: {err}"))
+    let path = raw_udp_port_path();
+    std::fs::write(&path, format!("{port}\n"))
+        .map_err(|err| format!("failed to persist raw udp port {}: {err}", path.display()))
 }
 
 fn clear_persisted_raw_udp_interface_token() -> Result<(), String> {
-    match std::fs::remove_file(RAW_UDP_INTERFACE_TOKEN_PATH) {
+    let path = raw_udp_interface_token_path();
+    match std::fs::remove_file(&path) {
         Ok(()) => Ok(()),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(format!("failed to clear raw udp interface token: {err}")),
+        Err(err) => Err(format!("failed to clear raw udp interface token {}: {err}", path.display())),
     }
 }
 
 fn clear_persisted_raw_udp_port() -> Result<(), String> {
-    match std::fs::remove_file(RAW_UDP_PORT_PATH) {
+    let path = raw_udp_port_path();
+    match std::fs::remove_file(&path) {
         Ok(()) => Ok(()),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(format!("failed to clear raw udp port: {err}")),
+        Err(err) => Err(format!("failed to clear raw udp port {}: {err}", path.display())),
     }
 }
 
@@ -2104,12 +2824,13 @@ fn load_or_create_iroh_identity() -> Result<IrohIdentity, String> {
     std::fs::create_dir_all(STATE_DIR)
         .map_err(|err| format!("failed to create state directory: {err}"))?;
 
-    let secret_key = match std::fs::read(IROH_SECRET_KEY_PATH) {
+    let secret_key_path = iroh_secret_key_path();
+    let secret_key = match std::fs::read(&secret_key_path) {
         Ok(bytes) => {
             if bytes.len() != 32 {
                 return Err(format!(
                     "invalid iroh secret key length at {}: expected 32 bytes, got {}",
-                    IROH_SECRET_KEY_PATH,
+                    secret_key_path.display(),
                     bytes.len()
                 ));
             }
@@ -2121,14 +2842,18 @@ fn load_or_create_iroh_identity() -> Result<IrohIdentity, String> {
             let mut raw = [0u8; 32];
             fill_random(&mut raw)?;
             let secret_key = SecretKey::from_bytes(&raw);
-            std::fs::write(IROH_SECRET_KEY_PATH, raw)
-                .map_err(|err| format!("failed to persist iroh secret key: {err}"))?;
+            std::fs::write(&secret_key_path, raw).map_err(|err| {
+                format!(
+                    "failed to persist iroh secret key {}: {err}",
+                    secret_key_path.display()
+                )
+            })?;
             secret_key
         }
         Err(err) => {
             return Err(format!(
                 "failed to read iroh secret key from {}: {err}",
-                IROH_SECRET_KEY_PATH
+                secret_key_path.display()
             ));
         }
     };
@@ -2253,6 +2978,7 @@ fn load_sandstorm_raw_udp_bind_config() -> Result<Option<SandstormRawUdpBindConf
 }
 
 async fn bind_local_iroh_endpoint(
+    app_state: Arc<Mutex<AppState>>,
     sandstorm_api: grain_capnp::sandstorm_api::Client<capnp::any_pointer::Owned>,
     secret_key: &SecretKey,
 ) -> Result<(Endpoint, IrohEndpointAddrSummary), String> {
@@ -2262,24 +2988,30 @@ async fn bind_local_iroh_endpoint(
             config.interface_token_hex,
             config.port
         );
-        return bind_sandstorm_raw_udp_iroh_endpoint(sandstorm_api, secret_key, config).await;
+        return bind_sandstorm_raw_udp_iroh_endpoint(app_state, sandstorm_api, secret_key, config)
+            .await;
     }
 
     eprintln!("iroh bind: using native ambient UDP transports");
     let endpoint = Endpoint::builder(presets::N0)
-        .alpns(vec![IROH_ALPN.to_vec()])
+        .alpns(vec![IROH_ALPN.to_vec(), IROH_RPC_ALPN.to_vec()])
         .secret_key(secret_key.clone())
         .relay_mode(RelayMode::Disabled)
         .bind()
         .await
         .map_err(|err| format!("failed to bind local iroh endpoint: {err}"))?;
-    tokio::spawn(run_echo_accept_loop(endpoint.clone()));
+    tokio::task::spawn_local(run_iroh_accept_loop(
+        endpoint.clone(),
+        app_state,
+        sandstorm_api,
+    ));
     let endpoint_addr = summarize_endpoint_addr(endpoint.addr());
     log_iroh_endpoint_summary("bound(native)", &endpoint_addr);
     Ok((endpoint, endpoint_addr))
 }
 
 async fn bind_sandstorm_raw_udp_iroh_endpoint(
+    app_state: Arc<Mutex<AppState>>,
     sandstorm_api: grain_capnp::sandstorm_api::Client<capnp::any_pointer::Owned>,
     secret_key: &SecretKey,
     config: SandstormRawUdpBindConfig,
@@ -2290,7 +3022,7 @@ async fn bind_sandstorm_raw_udp_iroh_endpoint(
         config.port
     );
     let ip_interface =
-        restore_saved_ip_interface(sandstorm_api, &config.interface_token_hex).await?;
+        restore_saved_ip_interface(sandstorm_api.clone(), &config.interface_token_hex).await?;
     let mut bind_req = ip_interface.bind_raw_udp_request();
     bind_req.get().set_port_num(config.port);
     let bind_resp = bind_req
@@ -2316,7 +3048,7 @@ async fn bind_sandstorm_raw_udp_iroh_endpoint(
     eprintln!("iroh bind: Sandstorm RawUdp custom transport initialized");
 
     let endpoint = Endpoint::builder(presets::N0)
-        .alpns(vec![IROH_ALPN.to_vec()])
+        .alpns(vec![IROH_ALPN.to_vec(), IROH_RPC_ALPN.to_vec()])
         .secret_key(secret_key.clone())
         .relay_mode(RelayMode::Disabled)
         .clear_ip_transports()
@@ -2324,7 +3056,11 @@ async fn bind_sandstorm_raw_udp_iroh_endpoint(
         .bind()
         .await
         .map_err(|err| format!("failed to bind Sandstorm RawUdp iroh endpoint: {err}"))?;
-    tokio::spawn(run_echo_accept_loop(endpoint.clone()));
+    tokio::task::spawn_local(run_iroh_accept_loop(
+        endpoint.clone(),
+        app_state,
+        sandstorm_api,
+    ));
     let endpoint_addr =
         summarize_endpoint_addr_with_raw_udp_fallback(endpoint.addr(), raw_udp_local_addr);
     log_iroh_endpoint_summary("bound(sandstorm-raw-udp)", &endpoint_addr);
@@ -2380,7 +3116,8 @@ fn normalize_advertised_raw_udp_addr(addr: std::net::SocketAddr) -> std::net::So
 }
 
 fn load_remote_ticket() -> Result<Option<String>, String> {
-    match std::fs::read_to_string(REMOTE_TICKET_PATH) {
+    let path = remote_ticket_path();
+    match std::fs::read_to_string(&path) {
         Ok(value) => {
             let trimmed = value.trim().to_string();
             if trimmed.is_empty() {
@@ -2390,7 +3127,7 @@ fn load_remote_ticket() -> Result<Option<String>, String> {
             }
         }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(err) => Err(format!("failed to read remote ticket: {err}")),
+        Err(err) => Err(format!("failed to read remote ticket {}: {err}", path.display())),
     }
 }
 
@@ -2403,8 +3140,9 @@ fn update_remote_ticket(
     if remote_ticket.trim().is_empty() {
         clear_persisted_remote_ticket()?;
     } else {
-        std::fs::write(REMOTE_TICKET_PATH, format!("{remote_ticket}\n"))
-            .map_err(|err| format!("failed to persist remote ticket: {err}"))?;
+        let path = remote_ticket_path();
+        std::fs::write(&path, format!("{remote_ticket}\n"))
+            .map_err(|err| format!("failed to persist remote ticket {}: {err}", path.display()))?;
     }
 
     let mut guard = app_state
@@ -2419,102 +3157,16 @@ fn update_remote_ticket(
 }
 
 fn clear_persisted_remote_ticket() -> Result<(), String> {
-    match std::fs::remove_file(REMOTE_TICKET_PATH) {
+    let path = remote_ticket_path();
+    match std::fs::remove_file(&path) {
         Ok(()) => Ok(()),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(format!("failed to clear remote ticket: {err}")),
+        Err(err) => Err(format!("failed to clear remote ticket {}: {err}", path.display())),
     }
 }
 
 fn render_state_json(app_state: &Arc<Mutex<AppState>>) -> Result<String, String> {
-    let guard = app_state
-        .lock()
-        .map_err(|_| "app state lock poisoned".to_string())?;
-    let active_tcp_sessions = guard
-        .active_tcp_sessions
-        .iter()
-        .map(|(session_id, session)| {
-            let summary = session.snapshot()?;
-            Ok(format!(
-                "{{\"sessionId\":\"{}\",\"host\":\"{}\",\"port\":{},\"bufferedBytes\":{},\"receivedBytes\":{},\"writeCalls\":{},\"done\":{},\"trace\":\"{}\"}}",
-                json_escape(session_id),
-                json_escape(&summary.host),
-                summary.port,
-                summary.buffered_bytes,
-                summary.received_bytes,
-                summary.write_calls,
-                if summary.done { "true" } else { "false" },
-                json_escape(&summary.trace)
-            ))
-        })
-        .collect::<Result<Vec<_>, String>>()?;
-    let mut rows = Vec::new();
-    for row in load_saved_capabilities()? {
-        rows.push(format!(
-            "{{\"id\":\"{}\",\"objectId\":\"{}\",\"label\":\"{}\",\"savedToken\":\"{}\",\"createdAtMs\":{}}}",
-            json_escape(&row.id),
-            json_escape(&row.id),
-            json_escape(&row.label),
-            json_escape(&row.saved_token),
-            row.created_at_ms
-        ));
-    }
-
-    let relay_urls = join_json_strings(&guard.iroh_endpoint_addr.relay_urls);
-    let direct_addrs = join_json_strings(&guard.iroh_endpoint_addr.direct_addrs);
-    let custom_addrs = join_json_strings(&guard.iroh_endpoint_addr.custom_addrs);
-    let raw_udp_interface = match &guard.raw_udp_interface {
-        Some(value) => format!(
-            "{{\"label\":\"{}\",\"savedToken\":\"{}\",\"source\":\"{}\"}}",
-            json_escape(&value.label),
-            json_escape(&value.saved_token),
-            json_escape(guard.raw_udp_interface_source.as_deref().unwrap_or("unknown"))
-        ),
-        None => "null".to_string(),
-    };
-    let remote_ticket = match &guard.remote_ticket {
-        Some(value) => format!("\"{}\"", json_escape(value)),
-        None => "null".to_string(),
-    };
-    let endpoint_error = match &guard.iroh_endpoint_error {
-        Some(value) => format!("\"{}\"", json_escape(value)),
-        None => "null".to_string(),
-    };
-    let local_ticket = format!(
-        "\"{}\"",
-        json_escape(&format_local_ticket(&guard.iroh_endpoint_addr))
-    );
-    let endpoint_bound = if guard.iroh_endpoint.is_some() {
-        "true"
-    } else {
-        "false"
-    };
-
-    Ok(format!(
-        "{{\"powerboxQueries\":{{\"apiSession\":\"{}\",\"ipNetwork\":\"{}\",\"ipInterface\":\"{}\"}},\"irohNodeId\":\"{}\",\"irohEndpoint\":{{\"bound\":{},\"nodeId\":\"{}\",\"relayUrls\":[{}],\"directAddrs\":[{}],\"customAddrs\":[{}],\"error\":{},\"localTicket\":{},\"rawUdpInterface\":{}}},\"transportAssessment\":\"{}\",\"remoteTicket\":{},\"savedCaps\":[{}],\"activeTcpSessions\":[{}]}}",
-        json_escape(&powerbox_query_for_interface(
-            api_session_capnp::api_session::Client::TYPE_ID
-        )?),
-        json_escape(&powerbox_query_for_interface(
-            ip_capnp::ip_network::Client::TYPE_ID
-        )?),
-        json_escape(&powerbox_query_for_interface(
-            ip_capnp::ip_interface::Client::TYPE_ID
-        )?),
-        json_escape(&guard.iroh_identity.node_id),
-        endpoint_bound,
-        json_escape(&guard.iroh_endpoint_addr.node_id),
-        relay_urls,
-        direct_addrs,
-        custom_addrs,
-        endpoint_error,
-        local_ticket,
-        raw_udp_interface,
-        json_escape(IROH_TRANSPORT_ASSESSMENT),
-        remote_ticket,
-        rows.join(","),
-        active_tcp_sessions.join(",")
-    ))
+    app_core(app_state).render_state_json()
 }
 
 fn join_json_strings(values: &[String]) -> String {
@@ -2523,6 +3175,376 @@ fn join_json_strings(values: &[String]) -> String {
         .map(|value| format!("\"{}\"", json_escape(value)))
         .collect::<Vec<_>>()
         .join(",")
+}
+
+fn imported_kind_label(kind: ImportedRemoteCapabilityKind) -> &'static str {
+    match kind {
+        ImportedRemoteCapabilityKind::IpNetwork => "IpNetwork",
+        ImportedRemoteCapabilityKind::ApiSession => "ApiSession",
+    }
+}
+
+fn drop_received_remote_capability(
+    app_state: &Arc<Mutex<AppState>>,
+    object_id: &str,
+) -> Result<bool, String> {
+    app_core(app_state).drop_received_remote_capability(object_id)
+}
+
+async fn configure_exported_ip_network(
+    app_state: &Arc<Mutex<AppState>>,
+    sandstorm_api: grain_capnp::sandstorm_api::Client<capnp::any_pointer::Owned>,
+    saved_cap_id: &str,
+) -> Result<(), String> {
+    app_core(app_state)
+        .configure_exported_ip_network(sandstorm_api, saved_cap_id)
+        .await
+}
+
+async fn configure_exported_api_session(
+    app_state: &Arc<Mutex<AppState>>,
+    sandstorm_api: grain_capnp::sandstorm_api::Client<capnp::any_pointer::Owned>,
+    saved_cap_id: &str,
+) -> Result<(), String> {
+    app_core(app_state)
+        .configure_exported_api_session(sandstorm_api, saved_cap_id)
+        .await
+}
+
+async fn validate_saved_ip_network_capability(
+    sandstorm_api: grain_capnp::sandstorm_api::Client<capnp::any_pointer::Owned>,
+    saved_token_hex: &str,
+) -> Result<ip_capnp::ip_network::Client, String> {
+    let ip_network = restore_saved_ip_network(sandstorm_api, saved_token_hex).await?;
+    let mut host_req = ip_network.get_remote_host_by_name_request();
+    host_req.get().set_address("127.0.0.1");
+    host_req
+        .send()
+        .promise
+        .await
+        .map_err(|err| format!("saved capability is not a usable IpNetwork: {err}"))?;
+    Ok(ip_network)
+}
+
+async fn validate_saved_api_session_capability(
+    sandstorm_api: grain_capnp::sandstorm_api::Client<capnp::any_pointer::Owned>,
+    saved_token_hex: &str,
+) -> Result<api_session_capnp::api_session::Client, String> {
+    restore_saved_api_session(sandstorm_api, saved_token_hex).await
+}
+
+async fn connect_ip_network_tcp_client(
+    ip_network: ip_capnp::ip_network::Client,
+    host: &str,
+    port: u16,
+) -> Result<SavedIpNetworkTcpConnection, String> {
+    let mut trace = vec!["remote-restore:ok".to_string()];
+
+    let mut host_req = ip_network.get_remote_host_by_name_request();
+    host_req.get().set_address(host);
+    let host_resp = host_req
+        .send()
+        .promise
+        .await
+        .map_err(|err| format!("IpNetwork.getRemoteHostByName() failed: {err}"))?;
+    trace.push("resolve-host:ok".to_string());
+    let remote_host = host_resp
+        .get()
+        .map_err(|err| format!("failed to decode getRemoteHostByName() response: {err}"))?
+        .get_host()
+        .map_err(|err| format!("getRemoteHostByName() returned no host: {err}"))?;
+
+    let mut port_req = remote_host.get_tcp_port_request();
+    port_req.get().set_port_num(port);
+    let port_resp = port_req
+        .send()
+        .promise
+        .await
+        .map_err(|err| format!("IpRemoteHost.getTcpPort() failed: {err}"))?;
+    trace.push("get-tcp-port:ok".to_string());
+    let tcp_port = port_resp
+        .get()
+        .map_err(|err| format!("failed to decode getTcpPort() response: {err}"))?
+        .get_port()
+        .map_err(|err| format!("getTcpPort() returned no port: {err}"))?;
+
+    let incoming = Arc::new(Mutex::new(TcpSessionBuffer {
+        bytes: Vec::new(),
+        read_offset: 0,
+        total_received_bytes: 0,
+        write_calls: 0,
+        saw_done: false,
+    }));
+    let trace = Arc::new(Mutex::new(trace));
+    let notify = Arc::new(Notify::new());
+    let downstream: util_capnp::byte_stream::Client = new_client(ByteStreamCollector {
+        incoming: incoming.clone(),
+        trace: trace.clone(),
+        notify: notify.clone(),
+    });
+
+    let mut connect_req = tcp_port.connect_request();
+    connect_req.get().set_downstream(downstream);
+    let connect_resp = connect_req
+        .send()
+        .promise
+        .await
+        .map_err(|err| format!("TcpPort.connect() failed: {err}"))?;
+    let upstream = connect_resp
+        .get()
+        .map_err(|err| format!("failed to decode connect() response: {err}"))?
+        .get_upstream()
+        .map_err(|err| format!("connect() returned no upstream stream: {err}"))?;
+
+    {
+        let mut trace_guard = trace
+            .lock()
+            .map_err(|_| "tcp session trace lock poisoned".to_string())?;
+        trace_guard.push("connect:ok".to_string());
+    }
+
+    Ok(SavedIpNetworkTcpConnection {
+        upstream,
+        incoming,
+        trace,
+        notify,
+    })
+}
+
+async fn list_remote_ip_network_exports(
+    remote_bootstrap: tunnel_capnp::peer_bootstrap::Client,
+) -> Result<Vec<PeerRpcExport>, String> {
+    let response = remote_bootstrap
+        .list_ip_network_exports_request()
+        .send()
+        .promise
+        .await
+        .map_err(|err| format!("PeerBootstrap.listIpNetworkExports() failed: {err}"))?;
+    let response = response
+        .get()
+        .map_err(|err| format!("failed to decode listIpNetworkExports() response: {err}"))?;
+    let exports = response
+        .get_exports()
+        .map_err(|err| format!("listIpNetworkExports() returned invalid exports: {err}"))?;
+    let mut values = Vec::new();
+    for export in exports.iter() {
+        values.push(PeerRpcExport {
+            id: export
+                .get_id()
+                .map_err(|err| format!("failed to read export id: {err}"))?
+                .to_str()
+                .unwrap_or("")
+                .to_string(),
+            label: export
+                .get_label()
+                .map_err(|err| format!("failed to read export label: {err}"))?
+                .to_str()
+                .unwrap_or("")
+                .to_string(),
+        });
+    }
+    Ok(values)
+}
+
+async fn list_remote_api_session_exports(
+    remote_bootstrap: tunnel_capnp::peer_bootstrap::Client,
+) -> Result<Vec<PeerRpcExport>, String> {
+    let response = remote_bootstrap
+        .list_api_session_exports_request()
+        .send()
+        .promise
+        .await
+        .map_err(|err| format!("PeerBootstrap.listApiSessionExports() failed: {err}"))?;
+    let response = response
+        .get()
+        .map_err(|err| format!("failed to decode listApiSessionExports() response: {err}"))?;
+    let exports = response
+        .get_exports()
+        .map_err(|err| format!("listApiSessionExports() returned invalid exports: {err}"))?;
+    let mut values = Vec::new();
+    for export in exports.iter() {
+        values.push(PeerRpcExport {
+            id: export
+                .get_id()
+                .map_err(|err| format!("failed to read export id: {err}"))?
+                .to_str()
+                .unwrap_or("")
+                .to_string(),
+            label: export
+                .get_label()
+                .map_err(|err| format!("failed to read export label: {err}"))?
+                .to_str()
+                .unwrap_or("")
+                .to_string(),
+        });
+    }
+    Ok(values)
+}
+
+async fn fetch_remote_ip_network_export(
+    remote_bootstrap: tunnel_capnp::peer_bootstrap::Client,
+    export_id: &str,
+) -> Result<(String, ip_capnp::ip_network::Client), String> {
+    let mut request = remote_bootstrap.get_ip_network_export_request();
+    request.get().set_id(export_id);
+    let response = request
+        .send()
+        .promise
+        .await
+        .map_err(|err| format!("PeerBootstrap.getIpNetworkExport() failed: {err}"))?;
+    let response = response
+        .get()
+        .map_err(|err| format!("failed to decode getIpNetworkExport() response: {err}"))?;
+    let label = response
+        .get_label()
+        .map_err(|err| format!("failed to read imported label: {err}"))?
+        .to_str()
+        .unwrap_or("")
+        .to_string();
+    let client = response
+        .get_cap()
+        .map_err(|err| format!("failed to read imported IpNetwork capability: {err}"))?;
+    Ok((label, client))
+}
+
+async fn fetch_remote_api_session_export(
+    remote_bootstrap: tunnel_capnp::peer_bootstrap::Client,
+    export_id: &str,
+) -> Result<(String, api_session_capnp::api_session::Client), String> {
+    let mut request = remote_bootstrap.get_api_session_export_request();
+    request.get().set_id(export_id);
+    let response = request
+        .send()
+        .promise
+        .await
+        .map_err(|err| format!("PeerBootstrap.getApiSessionExport() failed: {err}"))?;
+    let response = response
+        .get()
+        .map_err(|err| format!("failed to decode getApiSessionExport() response: {err}"))?;
+    let label = response
+        .get_label()
+        .map_err(|err| format!("failed to read imported label: {err}"))?
+        .to_str()
+        .unwrap_or("")
+        .to_string();
+    let client = response
+        .get_cap()
+        .map_err(|err| format!("failed to read imported ApiSession capability: {err}"))?;
+    Ok((label, client))
+}
+
+async fn connect_peer_rpc_session(
+    app_state: Arc<Mutex<AppState>>,
+    sandstorm_api: grain_capnp::sandstorm_api::Client<capnp::any_pointer::Owned>,
+) -> Result<(Vec<PeerRpcExport>, Vec<PeerRpcExport>), String> {
+    app_core(&app_state)
+        .connect_peer_rpc_session(sandstorm_api)
+        .await
+}
+
+fn disconnect_peer_rpc_session(app_state: &Arc<Mutex<AppState>>) -> Result<(), String> {
+    app_core(app_state).disconnect_peer_rpc_session()
+}
+
+async fn import_remote_ip_network_export(
+    app_state: &Arc<Mutex<AppState>>,
+    export_id: &str,
+) -> Result<(String, String), String> {
+    app_core(app_state)
+        .import_remote_ip_network_export(export_id)
+        .await
+}
+
+async fn import_remote_api_session_export(
+    app_state: &Arc<Mutex<AppState>>,
+    export_id: &str,
+) -> Result<(String, String), String> {
+    app_core(app_state)
+        .import_remote_api_session_export(export_id)
+        .await
+}
+
+async fn invoke_imported_remote_ip_network(
+    app_state: &Arc<Mutex<AppState>>,
+    host: &str,
+    port: u16,
+) -> Result<TcpProbeSummary, String> {
+    app_core(app_state)
+        .invoke_imported_remote_ip_network(host, port)
+        .await
+}
+
+fn api_session_as_web_session(
+    api_session: api_session_capnp::api_session::Client,
+) -> web_session_capnp::web_session::Client {
+    web_session_capnp::web_session::Client {
+        client: api_session.client,
+    }
+}
+
+async fn wait_for_byte_stream_completion(
+    incoming: &Arc<Mutex<TcpSessionBuffer>>,
+    notify: &Arc<Notify>,
+    timeout_ms: u64,
+) -> Result<(), String> {
+    loop {
+        {
+            let guard = incoming
+                .lock()
+                .map_err(|_| "byte stream buffer lock poisoned".to_string())?;
+            if guard.saw_done {
+                return Ok(());
+            }
+        }
+
+        timeout(Duration::from_millis(timeout_ms), notify.notified())
+            .await
+            .map_err(|_| format!("timed out waiting for streamed response after {timeout_ms}ms"))?;
+    }
+}
+
+fn response_success_code_to_status(
+    code: web_session_capnp::web_session::response::SuccessCode,
+) -> u16 {
+    match code {
+        web_session_capnp::web_session::response::SuccessCode::Ok => 200,
+        web_session_capnp::web_session::response::SuccessCode::Created => 201,
+        web_session_capnp::web_session::response::SuccessCode::Accepted => 202,
+        web_session_capnp::web_session::response::SuccessCode::NoContent => 204,
+        web_session_capnp::web_session::response::SuccessCode::PartialContent => 206,
+        web_session_capnp::web_session::response::SuccessCode::MultiStatus => 207,
+        web_session_capnp::web_session::response::SuccessCode::NotModified => 304,
+    }
+}
+
+fn response_client_error_code_to_status(
+    code: web_session_capnp::web_session::response::ClientErrorCode,
+) -> u16 {
+    match code {
+        web_session_capnp::web_session::response::ClientErrorCode::BadRequest => 400,
+        web_session_capnp::web_session::response::ClientErrorCode::Forbidden => 403,
+        web_session_capnp::web_session::response::ClientErrorCode::NotFound => 404,
+        web_session_capnp::web_session::response::ClientErrorCode::MethodNotAllowed => 405,
+        web_session_capnp::web_session::response::ClientErrorCode::NotAcceptable => 406,
+        web_session_capnp::web_session::response::ClientErrorCode::Conflict => 409,
+        web_session_capnp::web_session::response::ClientErrorCode::Gone => 410,
+        web_session_capnp::web_session::response::ClientErrorCode::PreconditionFailed => 412,
+        web_session_capnp::web_session::response::ClientErrorCode::RequestEntityTooLarge => 413,
+        web_session_capnp::web_session::response::ClientErrorCode::RequestUriTooLong => 414,
+        web_session_capnp::web_session::response::ClientErrorCode::UnsupportedMediaType => 415,
+        web_session_capnp::web_session::response::ClientErrorCode::ImATeapot => 418,
+        web_session_capnp::web_session::response::ClientErrorCode::UnprocessableEntity => 422,
+    }
+}
+
+async fn invoke_imported_remote_api_session(
+    app_state: &Arc<Mutex<AppState>>,
+    filename: &str,
+    payload: &[u8],
+) -> Result<ApiSessionInvokeSummary, String> {
+    app_core(app_state)
+        .invoke_imported_remote_api_session(filename, payload)
+        .await
 }
 
 fn parse_claim_payload(value: &str) -> (String, String) {
@@ -2675,6 +3697,67 @@ fn parse_udp_probe_request(value: &str) -> Result<UdpProbeRequest, String> {
         payload,
         wait_ms,
     })
+}
+
+fn parse_remote_ip_network_invoke_request(
+    value: &str,
+) -> Result<RemoteIpNetworkInvokeRequest, String> {
+    let mut lines = value.lines();
+    let host = lines.next().unwrap_or("").trim().to_string();
+    let port_text = lines.next().unwrap_or("80").trim();
+    if host.is_empty() {
+        return Err("missing remote invoke host".to_string());
+    }
+    let port = port_text
+        .parse::<u16>()
+        .map_err(|_| format!("invalid remote invoke port: {port_text:?}"))?;
+    if port == 0 {
+        return Err("remote invoke port must be non-zero".to_string());
+    }
+    Ok(RemoteIpNetworkInvokeRequest { host, port })
+}
+
+fn parse_remote_api_session_invoke_request(
+    filename: &str,
+    payload: &[u8],
+) -> Result<RemoteApiSessionInvokeRequest, String> {
+    let filename = filename.trim().to_string();
+    if filename.is_empty() {
+        return Err("missing x-sandstorm-app-filename header".to_string());
+    }
+    if payload.is_empty() {
+        return Err("request body is empty".to_string());
+    }
+    Ok(RemoteApiSessionInvokeRequest {
+        filename,
+        payload: payload.to_vec(),
+    })
+}
+
+fn get_request_header(
+    context: web_session_capnp::web_session::context::Reader<'_>,
+    name: &str,
+) -> Result<Option<String>, String> {
+    let headers = context
+        .get_additional_headers()
+        .map_err(|err| format!("failed to read request headers: {err}"))?;
+    for header in headers.iter() {
+        let header_name = header
+            .get_name()
+            .map_err(|err| format!("failed to read request header name: {err}"))?
+            .to_str()
+            .unwrap_or("");
+        if header_name.eq_ignore_ascii_case(name) {
+            let value = header
+                .get_value()
+                .map_err(|err| format!("failed to read request header value: {err}"))?
+                .to_str()
+                .unwrap_or("")
+                .to_string();
+            return Ok(Some(value));
+        }
+    }
+    Ok(None)
 }
 
 fn parse_tcp_session_open_request(value: &str) -> Result<TcpSessionOpenRequest, String> {
@@ -2837,6 +3920,7 @@ fn parse_remote_ticket(value: &str) -> Result<iroh::EndpointAddr, String> {
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
+    use crate::test_support::*;
 
     fn test_endpoint_id(seed: u8) -> iroh::EndpointId {
         iroh::SecretKey::from_bytes(&[seed; 32]).public()
@@ -2851,6 +3935,39 @@ mod tests {
             .build()
             .unwrap();
         runtime.block_on(future);
+    }
+
+    fn imported_api_session_object_id(app: &App) -> Option<String> {
+        let state = app.shared_state_for_test();
+        let guard = state.lock().unwrap();
+        guard
+            .imported_remote_api_session
+            .as_ref()
+            .map(|value| value.object_id.clone())
+    }
+
+    fn imported_ip_network_object_id(app: &App) -> Option<String> {
+        let state = app.shared_state_for_test();
+        let guard = state.lock().unwrap();
+        guard
+            .imported_remote_ip_network
+            .as_ref()
+            .map(|value| value.object_id.clone())
+    }
+
+    fn persisted_api_session_object_id(app: &App) -> Option<String> {
+        let state = app.shared_state_for_test();
+        let guard = state.lock().unwrap();
+        guard
+            .persisted_received_api_session
+            .as_ref()
+            .map(|value| value.object_id.clone())
+    }
+
+    fn imported_remote_cap_count(app: &App) -> usize {
+        let state = app.shared_state_for_test();
+        let guard = state.lock().unwrap();
+        guard.imported_remote_caps.len()
     }
 
     #[test]
@@ -3150,6 +4267,19 @@ mod tests {
             }),
             raw_udp_interface_source: Some("saved".to_string()),
             remote_ticket: None,
+            exported_ip_network: None,
+            exported_api_session: None,
+            exported_ip_network_live: None,
+            exported_api_session_live: None,
+            peer_rpc_session: None,
+            imported_remote_ip_network: None,
+            imported_remote_api_session: None,
+            imported_remote_caps: HashMap::new(),
+            persisted_received_ip_network: None,
+            persisted_received_api_session: None,
+            next_peer_rpc_session_id: 0,
+            next_imported_remote_cap_id: 0,
+            peer_rpc_error: None,
             active_tcp_sessions: HashMap::new(),
             next_tcp_session_id: 0,
         }));
@@ -3161,38 +4291,1183 @@ mod tests {
         assert!(state_json.contains("\"source\":\"saved\""));
         assert!(state_json.contains("1234_deadbeef"));
     }
+
+    #[test]
+    fn render_state_json_tracks_live_persisted_disconnected_and_cleared_states() {
+        run_local_async_test(async {
+            let (exporter_app, _, exporter_sandstorm_api) =
+                build_test_app("state-json-exporter", 121).await;
+            let (importer_app, _, importer_sandstorm_api) =
+                build_test_app("state-json-importer", 122).await;
+
+            exporter_app
+                .seed_exported_api_session_for_test(
+                    "preview-api",
+                    "Preview API",
+                    new_client(crate::test_support::FakePreviewApiSession {
+                        response_bytes: b"%PDF-STATE\n".to_vec(),
+                    }),
+                )
+                .unwrap();
+            importer_app
+                .set_remote_ticket_for_test(exporter_app.local_ticket_for_test().unwrap())
+                .unwrap();
+
+            let initial_state = importer_app.render_state_json().unwrap();
+            assert!(initial_state.contains("\"peerRpc\":{\"connected\":false"));
+            assert!(initial_state.contains("\"importedRemoteApiSession\":null"));
+            assert!(initial_state.contains("\"persistedReceivedCaps\":[]"));
+
+            importer_app
+                .connect_peer_rpc_session(importer_sandstorm_api.clone())
+                .await
+                .unwrap();
+            importer_app
+                .import_remote_api_session_export("preview-api")
+                .await
+                .unwrap();
+
+            let live_state = importer_app.render_state_json().unwrap();
+            assert!(live_state.contains("\"connected\":true"));
+            assert!(live_state.contains("\"exportedApiSession\":null"));
+            assert!(live_state.contains("\"importedRemoteApiSession\":{\"objectId\":\"remote-cap-1\""));
+            assert!(live_state.contains("\"persistedReceivedCaps\":[{\"objectId\":\"remote-cap-1\""));
+            assert!(live_state.contains("\"peerRpcError\":null"));
+
+            importer_app.disconnect_peer_rpc_session().unwrap();
+            let disconnected_state = importer_app.render_state_json().unwrap();
+            assert!(disconnected_state.contains("\"connected\":false"));
+            assert!(disconnected_state.contains("\"importedRemoteApiSession\":null"));
+            assert!(disconnected_state.contains("\"persistedReceivedCaps\":[{\"objectId\":\"remote-cap-1\""));
+            assert!(disconnected_state.contains("\"peerRpcError\":null"));
+
+            importer_app
+                .connect_peer_rpc_session(importer_sandstorm_api.clone())
+                .await
+                .unwrap();
+            exporter_app.clear_exported_api_session_for_test().unwrap();
+            importer_app.disconnect_peer_rpc_session().unwrap();
+            importer_app
+                .connect_peer_rpc_session(importer_sandstorm_api)
+                .await
+                .unwrap();
+            let cleared_state = importer_app.render_state_json().unwrap();
+            assert!(cleared_state.contains("\"connected\":true"));
+            assert!(cleared_state.contains("\"importedRemoteApiSession\":null"));
+            assert!(cleared_state.contains("\"persistedReceivedCaps\":[{\"objectId\":\"remote-cap-1\""));
+            assert!(cleared_state.contains("\"apiSessionExports\":[]"));
+
+            importer_app
+                .drop_received_remote_capability("remote-cap-1")
+                .unwrap();
+            let dropped_state = importer_app.render_state_json().unwrap();
+            assert!(dropped_state.contains("\"importedRemoteApiSession\":null"));
+            assert!(dropped_state.contains("\"persistedReceivedCaps\":[]"));
+
+            let _ = exporter_sandstorm_api;
+            importer_app.close_test_endpoint().await;
+            exporter_app.close_test_endpoint().await;
+        });
+    }
+
+    #[test]
+    fn load_persisted_received_capabilities_ignores_malformed_rows() {
+        let root = make_test_storage_root("malformed-received-caps");
+        let storage = Storage::new(&root);
+        std::fs::write(
+            storage.received_caps_path(),
+            concat!(
+                "NotAKind\tbad\tignored\trow\n",
+                "IpNetwork\tonly-two-columns\n",
+                "ApiSession\tremote-cap-9\texport-a\tPreview A\n",
+                "IpNetwork\tremote-cap-3\texport-net\tNetwork A\n",
+                "ApiSession\tremote-cap-10\texport-b\tPreview B\n"
+            ),
+        )
+        .unwrap();
+
+        let (ip_network, api_session) = storage.load_persisted_received_capabilities().unwrap();
+        let ip_network = ip_network.expect("expected ip network record");
+        let api_session = api_session.expect("expected api session record");
+
+        assert_eq!(ip_network.object_id, "remote-cap-3");
+        assert_eq!(ip_network.export_id, "export-net");
+        assert_eq!(ip_network.label, "Network A");
+        assert_eq!(ip_network.kind, ReceivedCapabilityKind::IpNetwork);
+
+        assert_eq!(api_session.object_id, "remote-cap-10");
+        assert_eq!(api_session.export_id, "export-b");
+        assert_eq!(api_session.label, "Preview B");
+        assert_eq!(api_session.kind, ReceivedCapabilityKind::ApiSession);
+    }
+
+    #[test]
+    fn drop_disconnect_and_restore_missing_are_idempotent() {
+        run_local_async_test(async {
+            let (exporter_app, _, exporter_sandstorm_api) =
+                build_test_app("idempotence-exporter", 131).await;
+            let (importer_app, _, importer_sandstorm_api) =
+                build_test_app("idempotence-importer", 132).await;
+
+            exporter_app
+                .seed_exported_api_session_for_test(
+                    "preview-api",
+                    "Preview API",
+                    new_client(crate::test_support::FakePreviewApiSession {
+                        response_bytes: b"%PDF-IDEMPOTENT\n".to_vec(),
+                    }),
+                )
+                .unwrap();
+            importer_app
+                .set_remote_ticket_for_test(exporter_app.local_ticket_for_test().unwrap())
+                .unwrap();
+            importer_app
+                .connect_peer_rpc_session(importer_sandstorm_api.clone())
+                .await
+                .unwrap();
+            let (_, object_id) = importer_app
+                .import_remote_api_session_export("preview-api")
+                .await
+                .unwrap();
+
+            assert!(importer_app.drop_received_remote_capability(&object_id).unwrap());
+            assert!(!importer_app.drop_received_remote_capability(&object_id).unwrap());
+
+            importer_app.disconnect_peer_rpc_session().unwrap();
+            importer_app.disconnect_peer_rpc_session().unwrap();
+
+            for missing_id in [&object_id[..], "remote-cap-does-not-exist", "cap-missing-local"] {
+                let err = match importer_app
+                    .restore_object_capability(importer_sandstorm_api.clone(), missing_id)
+                    .await
+                {
+                    Ok(_) => panic!("restore unexpectedly succeeded for {missing_id}"),
+                    Err(err) => err,
+                };
+                assert!(
+                    err.contains("unknown app object id") || err.contains("unknown saved capability"),
+                    "unexpected restore error: {err}"
+                );
+            }
+
+            let _ = exporter_sandstorm_api;
+            importer_app.close_test_endpoint().await;
+            exporter_app.close_test_endpoint().await;
+        });
+    }
+
+    #[test]
+    fn max_persisted_received_cap_id_uses_highest_remote_cap_suffix() {
+        let ip_network = PersistedReceivedCapability {
+            object_id: "remote-cap-4".to_string(),
+            export_id: "export-net".to_string(),
+            label: "Net".to_string(),
+            kind: ImportedRemoteCapabilityKind::IpNetwork,
+        };
+        let api_session = PersistedReceivedCapability {
+            object_id: "remote-cap-12".to_string(),
+            export_id: "export-api".to_string(),
+            label: "Api".to_string(),
+            kind: ImportedRemoteCapabilityKind::ApiSession,
+        };
+
+        assert_eq!(
+            max_persisted_received_cap_id(Some(&ip_network), Some(&api_session)),
+            Some(12)
+        );
+    }
+
+    #[test]
+    fn cross_kind_persisted_object_id_collision_preserves_both_records() {
+        let root = make_test_storage_root("cross-kind-collision");
+        let storage = Storage::new(&root);
+        std::fs::write(
+            storage.received_caps_path(),
+            concat!(
+                "IpNetwork\tremote-cap-7\texport-net\tShared Object\n",
+                "ApiSession\tremote-cap-7\texport-api\tShared Object\n"
+            ),
+        )
+        .unwrap();
+
+        let (ip_network, api_session) = storage.load_persisted_received_capabilities().unwrap();
+        let ip_network = ip_network.expect("expected ip network record");
+        let api_session = api_session.expect("expected api session record");
+
+        assert_eq!(ip_network.object_id, "remote-cap-7");
+        assert_eq!(api_session.object_id, "remote-cap-7");
+        assert_eq!(ip_network.kind, ReceivedCapabilityKind::IpNetwork);
+        assert_eq!(api_session.kind, ReceivedCapabilityKind::ApiSession);
+        assert_ne!(ip_network.export_id, api_session.export_id);
+    }
+
+    #[test]
+    fn connect_peer_rpc_session_requires_remote_ticket() {
+        run_local_async_test(async {
+            let (app, _, sandstorm_api) = build_test_app("missing-ticket", 141).await;
+            let err = match app.connect_peer_rpc_session(sandstorm_api).await {
+                Ok(_) => panic!("connect unexpectedly succeeded without remote ticket"),
+                Err(err) => err,
+            };
+            assert!(err.contains("no remote ticket configured"));
+            app.close_test_endpoint().await;
+        });
+    }
+
+    #[test]
+    fn import_requires_connected_peer_rpc_session() {
+        run_local_async_test(async {
+            let (app, _, _) = build_test_app("import-without-connect", 142).await;
+            let err = app
+                .import_remote_api_session_export("preview-api")
+                .await
+                .unwrap_err();
+            assert!(err.contains("peer rpc session is not connected"));
+            let err = app
+                .import_remote_ip_network_export("ip-network-export")
+                .await
+                .unwrap_err();
+            assert!(err.contains("peer rpc session is not connected"));
+            app.close_test_endpoint().await;
+        });
+    }
+
+    #[test]
+    fn reimporting_same_export_keeps_same_object_id_and_single_live_cap() {
+        run_local_async_test(async {
+            let (exporter_app, _, exporter_sandstorm_api) =
+                build_test_app("same-export-exporter", 151).await;
+            let (importer_app, _, importer_sandstorm_api) =
+                build_test_app("same-export-importer", 152).await;
+
+            exporter_app
+                .seed_exported_api_session_for_test(
+                    "preview-api",
+                    "Preview API",
+                    new_client(crate::test_support::FakePreviewApiSession {
+                        response_bytes: b"%PDF-SAME\n".to_vec(),
+                    }),
+                )
+                .unwrap();
+            importer_app
+                .set_remote_ticket_for_test(exporter_app.local_ticket_for_test().unwrap())
+                .unwrap();
+            importer_app
+                .connect_peer_rpc_session(importer_sandstorm_api.clone())
+                .await
+                .unwrap();
+
+            let (_, object_id_a) = importer_app
+                .import_remote_api_session_export("preview-api")
+                .await
+                .unwrap();
+            let (_, object_id_b) = importer_app
+                .import_remote_api_session_export("preview-api")
+                .await
+                .unwrap();
+
+            assert_eq!(object_id_a, "remote-cap-1");
+            assert_eq!(object_id_b, object_id_a);
+            assert_eq!(imported_remote_cap_count(&importer_app), 1);
+            let summary = importer_app
+                .invoke_imported_remote_api_session("same.docx", b"same")
+                .await
+                .unwrap();
+            assert_eq!(summary.response_bytes, b"%PDF-SAME\n".to_vec());
+
+            let _ = exporter_sandstorm_api;
+            importer_app.close_test_endpoint().await;
+            exporter_app.close_test_endpoint().await;
+        });
+    }
+
+    #[test]
+    fn restore_collision_between_persisted_kinds_currently_prefers_ip_network_record() {
+        run_local_async_test(async {
+            let app = App::new_for_test(
+                Storage::new(make_test_storage_root("restore-collision")),
+                SecretKey::from_bytes(&[0x99; 32]),
+            );
+            {
+                let state = app.shared_state_for_test();
+                let mut guard = state.lock().unwrap();
+                guard.persisted_received_ip_network = Some(PersistedReceivedCapability {
+                    object_id: "remote-cap-7".to_string(),
+                    export_id: "export-net".to_string(),
+                    label: "Net".to_string(),
+                    kind: ImportedRemoteCapabilityKind::IpNetwork,
+                });
+                guard.persisted_received_api_session = Some(PersistedReceivedCapability {
+                    object_id: "remote-cap-7".to_string(),
+                    export_id: "export-api".to_string(),
+                    label: "Api".to_string(),
+                    kind: ImportedRemoteCapabilityKind::ApiSession,
+                });
+            }
+
+            let err = app
+                .restore_object_capability(dummy_sandstorm_api_client(), "remote-cap-7")
+                .await;
+            let err = match err {
+                Ok(_) => panic!("restore unexpectedly succeeded for collided object id"),
+                Err(err) => err,
+            };
+            assert!(err.contains("received IpNetwork object remote-cap-7 is known"));
+        });
+    }
+
+    #[test]
+    fn acceptance_peer_rpc_api_session_flow_works_without_sandstorm() {
+        run_local_async_test(async {
+            let (exporter_app, _exporter_state, exporter_sandstorm_api) =
+                build_test_app("acceptance-exporter", 31).await;
+            let (importer_app, _importer_state, importer_sandstorm_api) =
+                build_test_app("acceptance-importer", 32).await;
+
+            let expected_pdf = b"%PDF-TEST remote preview\n".to_vec();
+            exporter_app
+                .seed_exported_api_session_for_test(
+                "preview-api",
+                "Preview API",
+                new_client(crate::test_support::FakePreviewApiSession {
+                    response_bytes: expected_pdf.clone(),
+                }),
+            )
+                .unwrap();
+            importer_app
+                .set_remote_ticket_for_test(exporter_app.local_ticket_for_test().unwrap())
+                .unwrap();
+
+            let (_ip_exports, api_exports) = importer_app
+                .connect_peer_rpc_session(importer_sandstorm_api.clone())
+                .await
+                .unwrap();
+            assert_eq!(api_exports.len(), 1);
+            assert_eq!(api_exports[0].id, "preview-api");
+
+            let (_label, object_id) = importer_app
+                .import_remote_api_session_export("preview-api")
+                .await
+                .unwrap();
+            assert_eq!(object_id, "remote-cap-1");
+
+            let imported_summary = importer_app
+                .invoke_imported_remote_api_session("document.docx", b"fake office bytes")
+                .await
+                .unwrap();
+            assert_eq!(imported_summary.status_code, 200);
+            assert_eq!(imported_summary.content_type, "application/pdf");
+            assert_eq!(imported_summary.response_bytes, expected_pdf);
+
+            let restored_summary = importer_app
+                .invoke_restored_api_session_for_test(
+                    importer_sandstorm_api.clone(),
+                    &object_id,
+                    "restored.docx",
+                    b"restored bytes",
+                )
+            .await
+            .unwrap();
+            assert_eq!(restored_summary.status_code, 200);
+            assert_eq!(restored_summary.content_type, "application/pdf");
+            assert_eq!(restored_summary.response_bytes, expected_pdf);
+
+            importer_app.disconnect_peer_rpc_session().unwrap();
+            let disconnected_err = match importer_app
+                .restore_object_capability(importer_sandstorm_api.clone(), &object_id)
+                .await
+            {
+                Ok(_) => panic!("restore unexpectedly succeeded while disconnected"),
+                Err(err) => err,
+            };
+            assert!(disconnected_err.contains("not currently connected"));
+
+            importer_app
+                .connect_peer_rpc_session(importer_sandstorm_api.clone())
+                .await
+                .unwrap();
+            let reimported_summary = importer_app
+                .invoke_imported_remote_api_session("reconnected.docx", b"reconnected bytes")
+                .await
+                .unwrap();
+            assert_eq!(reimported_summary.response_bytes, expected_pdf);
+
+            assert!(importer_app
+                .drop_received_remote_capability(&object_id)
+                .unwrap());
+            let dropped_err = match importer_app
+                .restore_object_capability(importer_sandstorm_api, &object_id)
+                .await
+            {
+                Ok(_) => panic!("restore unexpectedly succeeded after drop"),
+                Err(err) => err,
+            };
+            assert!(dropped_err.contains("unknown app object id"));
+
+            let _ = exporter_app;
+            let _ = exporter_sandstorm_api;
+            importer_app.close_test_endpoint().await;
+            exporter_app.close_test_endpoint().await;
+        });
+    }
+
+    #[test]
+    fn acceptance_peer_rpc_ip_network_flow_works_without_sandstorm() {
+        run_local_async_test(async {
+            let (exporter_app, _exporter_state, exporter_sandstorm_api) =
+                build_test_app("acceptance-ip-exporter", 41).await;
+            let (importer_app, _importer_state, importer_sandstorm_api) =
+                build_test_app("acceptance-ip-importer", 42).await;
+
+            let expected_response =
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nhello from fake ipnetwork"
+                    .to_vec();
+            exporter_app
+                .seed_exported_ip_network_for_test(
+                "ip-network-export",
+                "Fake IpNetwork",
+                new_client(crate::test_support::FakeIpNetwork {
+                    response_bytes: expected_response.clone(),
+                }),
+            )
+                .unwrap();
+            importer_app
+                .set_remote_ticket_for_test(exporter_app.local_ticket_for_test().unwrap())
+                .unwrap();
+
+            let (ip_exports, _api_exports) = importer_app
+                .connect_peer_rpc_session(importer_sandstorm_api.clone())
+                .await
+                .unwrap();
+            assert_eq!(ip_exports.len(), 1);
+            assert_eq!(ip_exports[0].id, "ip-network-export");
+
+            let (_label, object_id) = importer_app
+                .import_remote_ip_network_export("ip-network-export")
+                .await
+                .unwrap();
+            assert_eq!(object_id, "remote-cap-1");
+
+            let imported_summary = importer_app
+                .invoke_imported_remote_ip_network("example.test", 8080)
+                .await
+                .unwrap();
+            assert_eq!(imported_summary.response_bytes, expected_response);
+            assert!(imported_summary.trace.contains("connect:ok"));
+
+            let restored_summary = importer_app
+                .invoke_restored_ip_network_for_test(
+                    importer_sandstorm_api.clone(),
+                    &object_id,
+                    "restored.example",
+                    8080,
+                )
+            .await
+            .unwrap();
+            assert_eq!(restored_summary.response_bytes, expected_response);
+
+            importer_app.disconnect_peer_rpc_session().unwrap();
+            let disconnected_err = match importer_app
+                .restore_object_capability(importer_sandstorm_api.clone(), &object_id)
+                .await
+            {
+                Ok(_) => panic!("restore unexpectedly succeeded while disconnected"),
+                Err(err) => err,
+            };
+            assert!(disconnected_err.contains("not currently connected"));
+
+            importer_app
+                .connect_peer_rpc_session(importer_sandstorm_api.clone())
+                .await
+                .unwrap();
+            let reimported_summary = importer_app
+                .invoke_imported_remote_ip_network("reconnected.example", 8080)
+                .await
+                .unwrap();
+            assert_eq!(reimported_summary.response_bytes, expected_response);
+
+            assert!(importer_app
+                .drop_received_remote_capability(&object_id)
+                .unwrap());
+            let dropped_err = match importer_app
+                .restore_object_capability(importer_sandstorm_api, &object_id)
+                .await
+            {
+                Ok(_) => panic!("restore unexpectedly succeeded after drop"),
+                Err(err) => err,
+            };
+            assert!(dropped_err.contains("unknown app object id"));
+
+            let _ = exporter_app;
+            let _ = exporter_sandstorm_api;
+            importer_app.close_test_endpoint().await;
+            exporter_app.close_test_endpoint().await;
+        });
+    }
+
+    #[test]
+    fn reconnect_auto_reimports_same_api_session_object_id() {
+        run_local_async_test(async {
+            let (exporter_app, _, exporter_sandstorm_api) =
+                build_test_app("reimport-exporter", 51).await;
+            let (importer_app, _, importer_sandstorm_api) =
+                build_test_app("reimport-importer", 52).await;
+
+            exporter_app
+                .seed_exported_api_session_for_test(
+                    "preview-api",
+                    "Preview API",
+                    new_client(crate::test_support::FakePreviewApiSession {
+                        response_bytes: b"%PDF-REIMPORT\n".to_vec(),
+                    }),
+                )
+                .unwrap();
+            importer_app
+                .set_remote_ticket_for_test(exporter_app.local_ticket_for_test().unwrap())
+                .unwrap();
+
+            importer_app
+                .connect_peer_rpc_session(importer_sandstorm_api.clone())
+                .await
+                .unwrap();
+            let (_, object_id) = importer_app
+                .import_remote_api_session_export("preview-api")
+                .await
+                .unwrap();
+            assert_eq!(imported_api_session_object_id(&importer_app).as_deref(), Some("remote-cap-1"));
+
+            importer_app.disconnect_peer_rpc_session().unwrap();
+            assert_eq!(imported_api_session_object_id(&importer_app), None);
+
+            importer_app
+                .connect_peer_rpc_session(importer_sandstorm_api.clone())
+                .await
+                .unwrap();
+            assert_eq!(
+                imported_api_session_object_id(&importer_app).as_deref(),
+                Some(object_id.as_str())
+            );
+            let restored = importer_app
+                .invoke_restored_api_session_for_test(
+                    importer_sandstorm_api,
+                    &object_id,
+                    "same-id.docx",
+                    b"bytes",
+                )
+                .await
+                .unwrap();
+            assert_eq!(restored.response_bytes, b"%PDF-REIMPORT\n".to_vec());
+
+            let _ = exporter_sandstorm_api;
+            importer_app.close_test_endpoint().await;
+            exporter_app.close_test_endpoint().await;
+        });
+    }
+
+    #[test]
+    fn dropped_api_session_does_not_reappear_after_reconnect() {
+        run_local_async_test(async {
+            let (exporter_app, _, exporter_sandstorm_api) =
+                build_test_app("drop-exporter", 61).await;
+            let (importer_app, _, importer_sandstorm_api) =
+                build_test_app("drop-importer", 62).await;
+
+            exporter_app
+                .seed_exported_api_session_for_test(
+                    "preview-api",
+                    "Preview API",
+                    new_client(crate::test_support::FakePreviewApiSession {
+                        response_bytes: b"%PDF-DROP\n".to_vec(),
+                    }),
+                )
+                .unwrap();
+            importer_app
+                .set_remote_ticket_for_test(exporter_app.local_ticket_for_test().unwrap())
+                .unwrap();
+
+            importer_app
+                .connect_peer_rpc_session(importer_sandstorm_api.clone())
+                .await
+                .unwrap();
+            let (_, object_id) = importer_app
+                .import_remote_api_session_export("preview-api")
+                .await
+                .unwrap();
+            assert_eq!(persisted_api_session_object_id(&importer_app).as_deref(), Some(object_id.as_str()));
+
+            assert!(importer_app.drop_received_remote_capability(&object_id).unwrap());
+            assert_eq!(persisted_api_session_object_id(&importer_app), None);
+
+            importer_app.disconnect_peer_rpc_session().unwrap();
+            importer_app
+                .connect_peer_rpc_session(importer_sandstorm_api.clone())
+                .await
+                .unwrap();
+
+            assert_eq!(imported_api_session_object_id(&importer_app), None);
+            assert_eq!(persisted_api_session_object_id(&importer_app), None);
+            let err = match importer_app
+                .restore_object_capability(importer_sandstorm_api, &object_id)
+                .await
+            {
+                Ok(_) => panic!("restore unexpectedly succeeded after drop+reconnect"),
+                Err(err) => err,
+            };
+            assert!(err.contains("unknown app object id"));
+
+            let _ = exporter_sandstorm_api;
+            importer_app.close_test_endpoint().await;
+            exporter_app.close_test_endpoint().await;
+        });
+    }
+
+    #[test]
+    fn missing_export_on_reconnect_keeps_object_persisted_but_not_live() {
+        run_local_async_test(async {
+            let (exporter_app, _, exporter_sandstorm_api) =
+                build_test_app("missing-export-exporter", 71).await;
+            let (importer_app, _, importer_sandstorm_api) =
+                build_test_app("missing-export-importer", 72).await;
+
+            exporter_app
+                .seed_exported_api_session_for_test(
+                    "preview-api",
+                    "Preview API",
+                    new_client(crate::test_support::FakePreviewApiSession {
+                        response_bytes: b"%PDF-MISSING\n".to_vec(),
+                    }),
+                )
+                .unwrap();
+            importer_app
+                .set_remote_ticket_for_test(exporter_app.local_ticket_for_test().unwrap())
+                .unwrap();
+
+            importer_app
+                .connect_peer_rpc_session(importer_sandstorm_api.clone())
+                .await
+                .unwrap();
+            let (_, object_id) = importer_app
+                .import_remote_api_session_export("preview-api")
+                .await
+                .unwrap();
+
+            importer_app.disconnect_peer_rpc_session().unwrap();
+            exporter_app
+                .seed_exported_api_session_for_test(
+                    "preview-api-v2",
+                    "Preview API v2",
+                    new_client(crate::test_support::FakePreviewApiSession {
+                        response_bytes: b"%PDF-NEW\n".to_vec(),
+                    }),
+                )
+                .unwrap();
+
+            importer_app
+                .connect_peer_rpc_session(importer_sandstorm_api.clone())
+                .await
+                .unwrap();
+
+            assert_eq!(imported_api_session_object_id(&importer_app), None);
+            assert_eq!(
+                persisted_api_session_object_id(&importer_app).as_deref(),
+                Some(object_id.as_str())
+            );
+            let err = match importer_app
+                .restore_object_capability(importer_sandstorm_api, &object_id)
+                .await
+            {
+                Ok(_) => panic!("restore unexpectedly succeeded with missing export"),
+                Err(err) => err,
+            };
+            assert!(err.contains("not currently connected"));
+
+            let _ = exporter_sandstorm_api;
+            importer_app.close_test_endpoint().await;
+            exporter_app.close_test_endpoint().await;
+        });
+    }
+
+    #[test]
+    fn repeated_reconnect_does_not_duplicate_imported_caps() {
+        run_local_async_test(async {
+            let (exporter_app, _, exporter_sandstorm_api) =
+                build_test_app("churn-exporter", 81).await;
+            let (importer_app, _, importer_sandstorm_api) =
+                build_test_app("churn-importer", 82).await;
+
+            exporter_app
+                .seed_exported_ip_network_for_test(
+                    "ip-network-export",
+                    "Fake IpNetwork",
+                    new_client(crate::test_support::FakeIpNetwork {
+                        response_bytes: b"HTTP/1.1 200 OK\r\n\r\nchurn".to_vec(),
+                    }),
+                )
+                .unwrap();
+            importer_app
+                .set_remote_ticket_for_test(exporter_app.local_ticket_for_test().unwrap())
+                .unwrap();
+
+            importer_app
+                .connect_peer_rpc_session(importer_sandstorm_api.clone())
+                .await
+                .unwrap();
+            let (_, object_id) = importer_app
+                .import_remote_ip_network_export("ip-network-export")
+                .await
+                .unwrap();
+
+            for _ in 0..3 {
+                importer_app.disconnect_peer_rpc_session().unwrap();
+                importer_app
+                    .connect_peer_rpc_session(importer_sandstorm_api.clone())
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    imported_ip_network_object_id(&importer_app).as_deref(),
+                    Some(object_id.as_str())
+                );
+                assert_eq!(imported_remote_cap_count(&importer_app), 1);
+            }
+
+            let summary = importer_app
+                .invoke_imported_remote_ip_network("churn.example", 8080)
+                .await
+                .unwrap();
+            assert_eq!(summary.response_bytes, b"HTTP/1.1 200 OK\r\n\r\nchurn".to_vec());
+
+            let _ = exporter_sandstorm_api;
+            importer_app.close_test_endpoint().await;
+            exporter_app.close_test_endpoint().await;
+        });
+    }
+
+    #[test]
+    fn swapped_export_can_be_reimported_into_same_object_id() {
+        run_local_async_test(async {
+            let (exporter_app, _, exporter_sandstorm_api) =
+                build_test_app("swap-exporter", 91).await;
+            let (importer_app, _, importer_sandstorm_api) =
+                build_test_app("swap-importer", 92).await;
+
+            exporter_app
+                .seed_exported_api_session_for_test(
+                    "preview-api-v1",
+                    "Preview API v1",
+                    new_client(crate::test_support::FakePreviewApiSession {
+                        response_bytes: b"%PDF-V1\n".to_vec(),
+                    }),
+                )
+                .unwrap();
+            importer_app
+                .set_remote_ticket_for_test(exporter_app.local_ticket_for_test().unwrap())
+                .unwrap();
+
+            let (_, exports) = importer_app
+                .connect_peer_rpc_session(importer_sandstorm_api.clone())
+                .await
+                .unwrap();
+            assert_eq!(exports[0].id, "preview-api-v1");
+            let (_, object_id) = importer_app
+                .import_remote_api_session_export("preview-api-v1")
+                .await
+                .unwrap();
+            assert_eq!(object_id, "remote-cap-1");
+
+            importer_app.disconnect_peer_rpc_session().unwrap();
+            exporter_app
+                .seed_exported_api_session_for_test(
+                    "preview-api-v2",
+                    "Preview API v2",
+                    new_client(crate::test_support::FakePreviewApiSession {
+                        response_bytes: b"%PDF-V2\n".to_vec(),
+                    }),
+                )
+                .unwrap();
+
+            let (_, exports) = importer_app
+                .connect_peer_rpc_session(importer_sandstorm_api.clone())
+                .await
+                .unwrap();
+            assert_eq!(exports[0].id, "preview-api-v2");
+            let (_, new_object_id) = importer_app
+                .import_remote_api_session_export("preview-api-v2")
+                .await
+                .unwrap();
+            assert_eq!(new_object_id, object_id);
+
+            let summary = importer_app
+                .invoke_imported_remote_api_session("swap.docx", b"swap")
+                .await
+                .unwrap();
+            assert_eq!(summary.response_bytes, b"%PDF-V2\n".to_vec());
+
+            let _ = exporter_sandstorm_api;
+            importer_app.close_test_endpoint().await;
+            exporter_app.close_test_endpoint().await;
+        });
+    }
+
+    #[test]
+    fn cleared_export_stays_persisted_but_not_live_after_reconnect() {
+        run_local_async_test(async {
+            let (exporter_app, _, exporter_sandstorm_api) =
+                build_test_app("clear-exporter", 101).await;
+            let (importer_app, _, importer_sandstorm_api) =
+                build_test_app("clear-importer", 102).await;
+
+            exporter_app
+                .seed_exported_api_session_for_test(
+                    "preview-api",
+                    "Preview API",
+                    new_client(crate::test_support::FakePreviewApiSession {
+                        response_bytes: b"%PDF-CLEAR\n".to_vec(),
+                    }),
+                )
+                .unwrap();
+            importer_app
+                .set_remote_ticket_for_test(exporter_app.local_ticket_for_test().unwrap())
+                .unwrap();
+
+            importer_app
+                .connect_peer_rpc_session(importer_sandstorm_api.clone())
+                .await
+                .unwrap();
+            let (_, object_id) = importer_app
+                .import_remote_api_session_export("preview-api")
+                .await
+                .unwrap();
+
+            importer_app.disconnect_peer_rpc_session().unwrap();
+            exporter_app.clear_exported_api_session_for_test().unwrap();
+
+            let (_, exports) = importer_app
+                .connect_peer_rpc_session(importer_sandstorm_api.clone())
+                .await
+                .unwrap();
+            assert!(exports.is_empty());
+            assert_eq!(imported_api_session_object_id(&importer_app), None);
+            assert_eq!(
+                persisted_api_session_object_id(&importer_app).as_deref(),
+                Some(object_id.as_str())
+            );
+
+            let err = match importer_app
+                .restore_object_capability(importer_sandstorm_api, &object_id)
+                .await
+            {
+                Ok(_) => panic!("restore unexpectedly succeeded after export clear"),
+                Err(err) => err,
+            };
+            assert!(err.contains("not currently connected"));
+
+            let _ = exporter_sandstorm_api;
+            importer_app.close_test_endpoint().await;
+            exporter_app.close_test_endpoint().await;
+        });
+    }
+
+    #[test]
+    fn reconnecting_to_different_peer_reuses_object_id_when_export_id_matches() {
+        run_local_async_test(async {
+            let (exporter_a_app, _, exporter_a_sandstorm_api) =
+                build_test_app("peer-a-exporter", 111).await;
+            let (exporter_b_app, _, exporter_b_sandstorm_api) =
+                build_test_app("peer-b-exporter", 112).await;
+            let (importer_app, _, importer_sandstorm_api) =
+                build_test_app("peer-switch-importer", 113).await;
+
+            exporter_a_app
+                .seed_exported_api_session_for_test(
+                    "shared-export",
+                    "Shared Export A",
+                    new_client(crate::test_support::FakePreviewApiSession {
+                        response_bytes: b"%PDF-PEER-A\n".to_vec(),
+                    }),
+                )
+                .unwrap();
+            exporter_b_app
+                .seed_exported_api_session_for_test(
+                    "shared-export",
+                    "Shared Export B",
+                    new_client(crate::test_support::FakePreviewApiSession {
+                        response_bytes: b"%PDF-PEER-B\n".to_vec(),
+                    }),
+                )
+                .unwrap();
+
+            importer_app
+                .set_remote_ticket_for_test(exporter_a_app.local_ticket_for_test().unwrap())
+                .unwrap();
+            importer_app
+                .connect_peer_rpc_session(importer_sandstorm_api.clone())
+                .await
+                .unwrap();
+            let (_, object_id) = importer_app
+                .import_remote_api_session_export("shared-export")
+                .await
+                .unwrap();
+            let summary_a = importer_app
+                .invoke_imported_remote_api_session("peer-a.docx", b"a")
+                .await
+                .unwrap();
+            assert_eq!(summary_a.response_bytes, b"%PDF-PEER-A\n".to_vec());
+
+            importer_app.disconnect_peer_rpc_session().unwrap();
+            importer_app
+                .set_remote_ticket_for_test(exporter_b_app.local_ticket_for_test().unwrap())
+                .unwrap();
+            importer_app
+                .connect_peer_rpc_session(importer_sandstorm_api.clone())
+                .await
+                .unwrap();
+
+            assert_eq!(
+                imported_api_session_object_id(&importer_app).as_deref(),
+                Some(object_id.as_str())
+            );
+            let summary_b = importer_app
+                .invoke_imported_remote_api_session("peer-b.docx", b"b")
+                .await
+                .unwrap();
+            assert_eq!(summary_b.response_bytes, b"%PDF-PEER-B\n".to_vec());
+
+            let _ = exporter_a_sandstorm_api;
+            let _ = exporter_b_sandstorm_api;
+            importer_app.close_test_endpoint().await;
+            exporter_a_app.close_test_endpoint().await;
+            exporter_b_app.close_test_endpoint().await;
+        });
+    }
 }
 
-async fn run_echo_accept_loop(endpoint: Endpoint) {
+#[derive(Clone)]
+struct PeerBootstrapImpl {
+    sandstorm_api: grain_capnp::sandstorm_api::Client<capnp::any_pointer::Owned>,
+    app_state: Arc<Mutex<AppState>>,
+}
+
+impl tunnel_capnp::peer_bootstrap::Server for PeerBootstrapImpl {
+    fn list_ip_network_exports(
+        self: Rc<Self>,
+        _: tunnel_capnp::peer_bootstrap::ListIpNetworkExportsParams,
+        mut results: tunnel_capnp::peer_bootstrap::ListIpNetworkExportsResults,
+    ) -> Promise<(), capnp::Error> {
+        let export = match self.app_state.lock() {
+            Ok(guard) => guard
+                .exported_ip_network_live
+                .as_ref()
+                .map(|value| value.saved_cap.clone())
+                .or_else(|| guard.exported_ip_network.clone()),
+            Err(_) => {
+                return Promise::err(capnp::Error::failed(
+                    "app state lock poisoned".to_string(),
+                ));
+            }
+        };
+
+        let mut result = results.get();
+        let mut exports = result.reborrow().init_exports(if export.is_some() { 1 } else { 0 });
+        if let Some(export) = export {
+            let mut entry = exports.reborrow().get(0);
+            entry.set_id(&export.id);
+            entry.set_label(&export.label);
+        }
+        Promise::ok(())
+    }
+
+    fn get_ip_network_export(
+        self: Rc<Self>,
+        params: tunnel_capnp::peer_bootstrap::GetIpNetworkExportParams,
+        mut results: tunnel_capnp::peer_bootstrap::GetIpNetworkExportResults,
+    ) -> Promise<(), capnp::Error> {
+        let export = match self.app_state.lock() {
+            Ok(guard) => guard
+                .exported_ip_network_live
+                .as_ref()
+                .map(|value| value.saved_cap.clone())
+                .or_else(|| guard.exported_ip_network.clone()),
+            Err(_) => {
+                return Promise::err(capnp::Error::failed(
+                    "app state lock poisoned".to_string(),
+                ));
+            }
+        };
+        let requested_id = match params.get() {
+            Ok(params) => match params.get_id() {
+                Ok(value) => value.to_str().unwrap_or("").to_string(),
+                Err(err) => return Promise::err(err),
+            },
+            Err(err) => return Promise::err(err),
+        };
+
+        let Some(export) = export else {
+            return Promise::err(capnp::Error::failed(
+                "no IpNetwork export is configured".to_string(),
+            ));
+        };
+        if export.id != requested_id {
+            return Promise::err(capnp::Error::failed(format!(
+                "unknown IpNetwork export id: {requested_id}"
+            )));
+        }
+
+        let sandstorm_api = self.sandstorm_api.clone();
+        let app_state = self.app_state.clone();
+        Promise::from_future(async move {
+            let cap = {
+                let guard = app_state
+                    .lock()
+                    .map_err(|_| capnp::Error::failed("app state lock poisoned".to_string()))?;
+                guard
+                    .exported_ip_network_live
+                    .as_ref()
+                    .filter(|value| value.saved_cap.id == export.id)
+                    .map(|value| value.client.clone())
+            };
+            let cap = match cap {
+                Some(cap) => cap,
+                None => {
+                    let cap = restore_saved_ip_network(sandstorm_api, &export.saved_token)
+                        .await
+                        .map_err(capnp::Error::failed)?;
+                    if let Ok(mut guard) = app_state.lock() {
+                        guard.exported_ip_network_live = Some(ExportedIpNetworkState {
+                            saved_cap: export.clone(),
+                            client: cap.clone(),
+                        });
+                    }
+                    cap
+                }
+            };
+            let mut result = results.get();
+            result.set_label(&export.label);
+            result.set_cap(cap);
+            Ok(())
+        })
+    }
+
+    fn list_api_session_exports(
+        self: Rc<Self>,
+        _: tunnel_capnp::peer_bootstrap::ListApiSessionExportsParams,
+        mut results: tunnel_capnp::peer_bootstrap::ListApiSessionExportsResults,
+    ) -> Promise<(), capnp::Error> {
+        let export = match self.app_state.lock() {
+            Ok(guard) => guard
+                .exported_api_session_live
+                .as_ref()
+                .map(|value| value.saved_cap.clone())
+                .or_else(|| guard.exported_api_session.clone()),
+            Err(_) => {
+                return Promise::err(capnp::Error::failed(
+                    "app state lock poisoned".to_string(),
+                ));
+            }
+        };
+
+        let mut result = results.get();
+        let mut exports = result.reborrow().init_exports(if export.is_some() { 1 } else { 0 });
+        if let Some(export) = export {
+            let mut entry = exports.reborrow().get(0);
+            entry.set_id(&export.id);
+            entry.set_label(&export.label);
+        }
+        Promise::ok(())
+    }
+
+    fn get_api_session_export(
+        self: Rc<Self>,
+        params: tunnel_capnp::peer_bootstrap::GetApiSessionExportParams,
+        mut results: tunnel_capnp::peer_bootstrap::GetApiSessionExportResults,
+    ) -> Promise<(), capnp::Error> {
+        let export = match self.app_state.lock() {
+            Ok(guard) => guard
+                .exported_api_session_live
+                .as_ref()
+                .map(|value| value.saved_cap.clone())
+                .or_else(|| guard.exported_api_session.clone()),
+            Err(_) => {
+                return Promise::err(capnp::Error::failed(
+                    "app state lock poisoned".to_string(),
+                ));
+            }
+        };
+        let requested_id = match params.get() {
+            Ok(params) => match params.get_id() {
+                Ok(value) => value.to_str().unwrap_or("").to_string(),
+                Err(err) => return Promise::err(err),
+            },
+            Err(err) => return Promise::err(err),
+        };
+
+        let Some(export) = export else {
+            return Promise::err(capnp::Error::failed(
+                "no ApiSession export is configured".to_string(),
+            ));
+        };
+        if export.id != requested_id {
+            return Promise::err(capnp::Error::failed(format!(
+                "unknown ApiSession export id: {requested_id}"
+            )));
+        }
+
+        let sandstorm_api = self.sandstorm_api.clone();
+        let app_state = self.app_state.clone();
+        Promise::from_future(async move {
+            let cap = {
+                let guard = app_state
+                    .lock()
+                    .map_err(|_| capnp::Error::failed("app state lock poisoned".to_string()))?;
+                guard
+                    .exported_api_session_live
+                    .as_ref()
+                    .filter(|value| value.saved_cap.id == export.id)
+                    .map(|value| value.client.clone())
+            };
+            let cap = match cap {
+                Some(cap) => cap,
+                None => {
+                    let cap = restore_saved_api_session(sandstorm_api, &export.saved_token)
+                        .await
+                        .map_err(capnp::Error::failed)?;
+                    if let Ok(mut guard) = app_state.lock() {
+                        guard.exported_api_session_live = Some(ExportedApiSessionState {
+                            saved_cap: export.clone(),
+                            client: cap.clone(),
+                        });
+                    }
+                    cap
+                }
+            };
+            let mut result = results.get();
+            result.set_label(&export.label);
+            result.set_cap(cap);
+            Ok(())
+        })
+    }
+}
+
+async fn run_iroh_accept_loop(
+    endpoint: Endpoint,
+    app_state: Arc<Mutex<AppState>>,
+    sandstorm_api: grain_capnp::sandstorm_api::Client<capnp::any_pointer::Owned>,
+) {
     while let Some(incoming) = endpoint.accept().await {
-        tokio::spawn(async move {
+        let app_state = app_state.clone();
+        let sandstorm_api = sandstorm_api.clone();
+        tokio::task::spawn_local(async move {
             let result = async {
-                eprintln!("iroh accept: incoming connection detected");
-                let connection = incoming
+                let mut accepting = incoming
                     .accept()
-                    .map_err(|err| format!("failed to accept incoming iroh connection: {err}"))?
+                    .map_err(|err| format!("failed to begin accepting incoming iroh connection: {err}"))?;
+                let alpn = accepting
+                    .alpn()
                     .await
-                    .map_err(|err| format!("incoming iroh connection failed: {err}"))?;
-                eprintln!("iroh accept: connection accepted");
-                let (mut send, mut recv) = connection
-                    .accept_bi()
-                    .await
-                    .map_err(|err| format!("failed to accept bi stream: {err}"))?;
-                eprintln!("iroh accept: bi stream accepted");
-                let data = recv
-                    .read_to_end(1024)
-                    .await
-                    .map_err(|err| format!("failed to read probe payload: {err}"))?;
-                eprintln!("iroh accept: received {} probe bytes", data.len());
-                send.write_all(&data)
-                    .await
-                    .map_err(|err| format!("failed to write probe response: {err}"))?;
-                send.finish()
-                    .map_err(|err| format!("failed to finish probe response: {err}"))?;
-                eprintln!("iroh accept: echoed {} probe bytes", data.len());
-                let close_reason = connection.closed().await;
-                eprintln!("iroh accept: connection closed: {close_reason}");
-                Ok::<(), String>(())
+                    .map_err(|err| format!("failed to inspect incoming ALPN: {err}"))?;
+                if alpn == IROH_RPC_ALPN {
+                    return accept_peer_rpc_connection(accepting, app_state, sandstorm_api).await;
+                }
+                accept_probe_connection(accepting).await
             }
             .await;
 
@@ -3201,6 +5476,65 @@ async fn run_echo_accept_loop(endpoint: Endpoint) {
             }
         });
     }
+}
+
+async fn accept_probe_connection(
+    accepting: iroh::endpoint::Accepting,
+) -> Result<(), String> {
+    eprintln!("iroh accept: incoming probe connection detected");
+    let connection = accepting
+        .await
+        .map_err(|err| format!("incoming iroh connection failed: {err}"))?;
+    eprintln!("iroh accept: probe connection accepted");
+    let (mut send, mut recv) = connection
+        .accept_bi()
+        .await
+        .map_err(|err| format!("failed to accept probe bi stream: {err}"))?;
+    eprintln!("iroh accept: probe bi stream accepted");
+    let data = recv
+        .read_to_end(1024)
+        .await
+        .map_err(|err| format!("failed to read probe payload: {err}"))?;
+    eprintln!("iroh accept: received {} probe bytes", data.len());
+    send.write_all(&data)
+        .await
+        .map_err(|err| format!("failed to write probe response: {err}"))?;
+    send.finish()
+        .map_err(|err| format!("failed to finish probe response: {err}"))?;
+    eprintln!("iroh accept: echoed {} probe bytes", data.len());
+    let close_reason = connection.closed().await;
+    eprintln!("iroh accept: probe connection closed: {close_reason}");
+    Ok(())
+}
+
+async fn accept_peer_rpc_connection(
+    accepting: iroh::endpoint::Accepting,
+    app_state: Arc<Mutex<AppState>>,
+    sandstorm_api: grain_capnp::sandstorm_api::Client<capnp::any_pointer::Owned>,
+) -> Result<(), String> {
+    eprintln!("iroh rpc: incoming rpc connection detected");
+    let connection = accepting
+        .await
+        .map_err(|err| format!("incoming rpc connection failed: {err}"))?;
+    let peer_bootstrap: tunnel_capnp::peer_bootstrap::Client = new_client(PeerBootstrapImpl {
+        sandstorm_api,
+        app_state,
+    });
+    let (send, recv) = connection
+        .accept_bi()
+        .await
+        .map_err(|err| format!("failed to accept rpc bi stream: {err}"))?;
+    let network = Box::new(twoparty::VatNetwork::new(
+        recv.compat(),
+        send.compat_write(),
+        rpc_twoparty_capnp::Side::Server,
+        Default::default(),
+    ));
+    let rpc_system = RpcSystem::new(network, Some(peer_bootstrap.client));
+    rpc_system
+        .await
+        .map_err(|err| format!("peer rpc system failed: {err}"))?;
+    Ok(())
 }
 
 struct ProbeConnectionSummary {
@@ -3273,6 +5607,16 @@ struct TcpSessionCloseRequest {
     session_id: String,
 }
 
+struct RemoteIpNetworkInvokeRequest {
+    host: String,
+    port: u16,
+}
+
+struct RemoteApiSessionInvokeRequest {
+    filename: String,
+    payload: Vec<u8>,
+}
+
 struct TcpSessionBuffer {
     bytes: Vec<u8>,
     read_offset: usize,
@@ -3320,6 +5664,13 @@ struct SavedIpNetworkTcpConnection {
     incoming: Arc<Mutex<TcpSessionBuffer>>,
     trace: Arc<Mutex<Vec<String>>>,
     notify: Arc<Notify>,
+}
+
+struct ApiSessionInvokeSummary {
+    status_code: u16,
+    content_type: String,
+    response_bytes: Vec<u8>,
+    trace: String,
 }
 
 struct SavedIpNetworkTcpSession {

@@ -6,7 +6,7 @@
 
 - a human-facing browser UI served through raw `WebSession`
 - raw Cap'n Proto integration with the grain's bootstrapped supervisor capabilities
-- a future `iroh` transport layer between paired grains
+- an `iroh` transport layer between paired grains using Sandstorm `RawUdp`
 - an app-managed registry of locally saved and remotely received capabilities
 
 The app should not attempt to encode arbitrary interface semantics itself. It should transport live capabilities using Cap'n Proto RPC over an `iroh` stream.
@@ -70,16 +70,16 @@ This registry is intentionally small but already shaped to evolve into app-manag
 
 ### MainView-backed persistent exports
 
-The next major Sandstorm milestone is to extend the current bootstrap to support app-managed persistent exports through `MainView(AppObjectId)`.
+The next major Sandstorm milestone is to turn the now-working in-memory remote object mapping into a durable Sandstorm export layer through `MainView(AppObjectId)`.
 
 Responsibilities:
 
-- define stable app object IDs
-- map saved and received capabilities onto those IDs
-- implement `restore(objectId)` for app-exported capabilities
+- define stable app object IDs that survive reconnect and restart
+- persist metadata for received capabilities, not just local saved capabilities
+- implement `restore(objectId)` for app-exported capabilities after reconnect
 - implement `drop(objectId)` cleanup
 
-This is the critical piece for re-exporting remote capabilities into the local Sandstorm environment.
+This is the critical piece for durable re-export of remote capabilities into the local Sandstorm environment.
 
 ## Future transport components
 
@@ -99,23 +99,28 @@ State should be written under `/var`. Identity and pairing state must survive re
 Current implementation:
 
 - persists the secret key at `/var/iroh-tunnel/iroh-secret-key`
-- attempts a relay-disabled `iroh::Endpoint` bind at startup
-- exposes local direct addresses through `GET /api/state`
+- restores a saved `IpInterface` capability for raw UDP binding when configured
+- binds a Sandstorm `RawUdpSocket` via `IpInterface.bindRawUdp()`
+- injects a Sandstorm-backed custom transport into a relay-disabled `iroh::Endpoint`
+- exposes local direct addresses and custom transport addresses through `GET /api/state`
 - persists a raw remote ticket string at `/var/iroh-tunnel/remote-ticket.txt`
+- persists the selected raw UDP interface token and bound port under `/var/iroh-tunnel`
 - runs a background echo accept loop for the probe ALPN
 - exposes a one-shot connect probe that dials the stored remote ticket and performs an echo round trip
 
-This is still intentionally only a spike. It proves one-shot connectivity, but not a durable peer session yet.
+This is no longer only an ambient-socket spike. It proves that paired grains can exchange `iroh` traffic over Sandstorm's low-level raw UDP interface. It is still not a durable peer-session manager yet.
 
 Current integration assessment:
 
 - saved `IpNetwork` is now proven for outbound TCP and outbound UDP reply flow
-- the remaining blocker is at the `iroh` library boundary, not the Sandstorm capability boundary
-- local inspection of `iroh 0.96.1` shows `Endpoint::builder()` still binds native `TransportConfig` entries into its internal socket layer and does not expose a public hook for a custom Sandstorm-backed packet/socket backend
-- local inspection of `iroh-quinn 0.16.1` does show a lower-level seam: `Endpoint::new_with_abstract_socket(...)` accepts a custom `AsyncUdpSocket`
-- local inspection of `iroh-quinn::AsyncUdpSocket` also shows the next exact blocker: receive-side QUIC integration needs per-datagram source-address metadata
-- the vendored Sandstorm `ip.capnp` definitions do not expose that metadata today: both outbound `IpRemoteHost.getUdpPort()` and inbound `IpInterface.listenUdp()` terminate at `UdpPort`, whose only method is `send(message, returnPort)`
-- that means the current Sandstorm UDP surface can move bytes and receive replies, but it does not surface sender address, destination address, ECN, or interface metadata needed by QUIC's abstract socket layer
+- vendored Sandstorm networking definitions now include a `RawUdpSocket` surface with packet metadata
+- native `iroh 0.97.0` now exposes custom transports behind `unstable-custom-transports`
+- the app now restores a saved `IpInterface`, binds `RawUdp`, and injects a Sandstorm-backed custom transport into `iroh::Endpoint`
+- paired grains can now exchange tickets containing `custom:` transport addresses and complete a peer probe over that path
+- the remaining work is application plumbing and session management rather than transport feasibility:
+- restore and configure the right `IpInterface` automatically and early in startup
+- make Sandstorm-mode transport selection explicit rather than prototype-shaped
+- evolve the probe path into a durable peer session suitable for capability exchange
 
 ### 5. Cap'n Proto RPC session over iroh
 
@@ -130,6 +135,13 @@ Proposed model:
 - import remote capabilities from the peer
 
 This is preferable to inventing a custom proxy protocol because Cap'n Proto RPC already models capability references, pipelining, method calls, and cancellation.
+
+This is now proven in the current implementation:
+
+- paired grains can establish one live `capnp-rpc` session over an `iroh` stream carried by Sandstorm `RawUdp`
+- one grain can export a saved `IpNetwork` or `ApiSession`
+- the other grain can import that live capability and invoke it successfully
+- imported remote capabilities can now be assigned local app object IDs and restored through `MainView.restore(objectId)`
 
 ### 6. Remote capability registry
 
@@ -175,7 +187,7 @@ Suggested records:
 
 1. Peer connection comes up over `iroh`.
 2. Local grain exports enabled capabilities into the RPC connection.
-3. Remote grain imports those capabilities and records them in `received_caps`.
+3. Remote grain imports those capabilities and records them in an in-memory imported-cap registry.
 4. Remote grain maps each imported capability to a local app object ID.
 5. When Sandstorm asks `MainView.restore(objectId)`, the app returns the imported live capability.
 
@@ -232,11 +244,18 @@ The following are already demonstrated in this repo:
 6. `SandstormApi.restore()` can probe the persisted token later
 7. `MainView.restore(objectId)` can resolve saved local capabilities by app object ID
 8. local `iroh` identity and relay-disabled endpoint state survive restart
+9. Sandstorm `RawUdp` can bind through a saved `IpInterface` capability
+10. paired grains can run one live `capnp-rpc` session over `iroh` on Sandstorm `RawUdp`
+11. one grain can import and invoke a remote `IpNetwork` over that session
+12. one grain can import and invoke a remote HTTP bridge `ApiSession` over that session
+13. imported remote capabilities can be assigned app object IDs like `remote-cap-1`
+14. `MainView.restore(objectId)` can resolve those imported remote live capabilities in memory
+10. two grains can exchange `iroh` traffic over Sandstorm raw UDP custom transport addresses
 
 ## Open questions
 
-1. Does Sandstorm expose any future UDP capability richer than today's `UdpPort` callback shape, with source/destination packet metadata?
-2. How should stock `iroh` be adapted to Sandstorm’s capability-gated network surface, given that the current probe still assumes ambient sockets?
+1. What is the cleanest lifecycle for restoring and rebinding the chosen `IpInterface` capability on every startup without fragile manual setup?
+2. How should the app represent and persist peer/session state once the current one-shot `iroh` probe becomes a durable RPC connection?
 3. What is the cleanest query model for the “pick a capability” UX: empty queries, typed queries, or a curated set?
 4. What is the cleanest UX for exposing a received capability back into Sandstorm: direct app object links, offers, or both?
 5. Do we need relay-only `iroh` mode as a compatibility fallback if direct UDP is unavailable?

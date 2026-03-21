@@ -66,3 +66,6 @@ pub mod web_session_capnp {
 pub mod sandstorm_http_bridge_capnp {
     include!(concat!(env!("OUT_DIR"), "/sandstorm/sandstorm_http_bridge_capnp.rs"));
 }
+pub mod tunnel_capnp {
+    include!(concat!(env!("OUT_DIR"), "/tunnel_capnp.rs"));
+}

@@ -139,6 +139,14 @@
         color: var(--ink);
         font: inherit;
       }
+      select {
+        border: 1px solid var(--line);
+        border-radius: 0;
+        padding: 0.72rem 1rem;
+        background: rgba(20, 25, 37, 0.82);
+        color: var(--ink);
+        font: inherit;
+      }
       .button-row {
         display: flex;
         flex-wrap: wrap;
@@ -216,79 +224,153 @@
         <div class="hero-copy">
           <h1>Iroh Tunnel</h1>
           <p class="lede">
-            Request Sandstorm capabilities, save them into the grain, and verify that they can be
-            restored on demand. This is the raw <code>UiView</code> baseline for the tunnel app.
+            Pair two grains, choose which capabilities to share, and restore received remote
+            capabilities by stable object ID. The transport lab is still here, but it now lives in
+            <code>Advanced</code>.
           </p>
         </div>
       </section>
 
       <section class="cards">
-        <section class="panel panel-wide">
-          <h2>RawUdp Path</h2>
-          <p class="muted">This view is optimized for one task: bind Sandstorm RawUdp, exchange tickets, and probe the <code>iroh</code> connection over the custom transport.</p>
-          <ol class="checklist">
-            <li>Click <code>Request IP Interface</code> and save the capability.</li>
-            <li>In <code>Saved Capabilities</code>, click <code>Use for RawUdp</code>.</li>
-            <li>Wait until the ticket below contains a <code>custom:</code> line.</li>
-            <li>Copy each grain’s full local ticket into the other grain and click <code>Probe Connection</code>.</li>
-          </ol>
+        <section class="panel panel-full">
+          <h2>Status</h2>
+          <p class="muted">Main flow: bind RawUdp, pair grains, export one capability, import it on the other side, then restore or invoke it.</p>
           <div class="button-row tight">
-            <button id="request-ip-interface">Request IP Interface</button>
             <span id="custom-transport-pill" class="pill">Custom Transport Missing</span>
+            <span id="peer-rpc-pill" class="pill">Peer RPC Disconnected</span>
           </div>
           <p id="status" class="status-line muted"></p>
         </section>
-        <section class="panel panel-tall">
-          <h2>Endpoint State</h2>
-          <div class="state-grid">
-            <div class="state-row">
-              <strong>Node ID</strong>
-              <code id="node-id">loading…</code>
-            </div>
-            <div class="state-row">
-              <strong>Endpoint Status</strong>
-              <code id="endpoint-status">loading…</code>
-            </div>
-            <div class="state-row">
-              <strong>Configured RawUdp Interface</strong>
-              <code id="raw-udp-interface">loading…</code>
-            </div>
-            <div class="state-row">
-              <strong>Advertised Addresses</strong>
-              <code id="endpoint-addrs">loading…</code>
-            </div>
-          </div>
-        </section>
-        <section class="panel panel-full">
+        <section class="panel panel-half">
           <h2>Pairing</h2>
           <div class="stack">
-            <p class="muted">The local ticket is generated automatically from current endpoint state. For the Sandstorm RawUdp path, this box must contain a <code>custom:</code> line before you try the probe.</p>
+            <p class="muted">Start here. Save one <code>IpInterface</code>, use it for RawUdp, wait for a <code>custom:</code> ticket address, then exchange tickets with the other grain.</p>
+            <div class="button-row">
+              <button id="request-ip-interface">Request IP Interface</button>
+              <button id="probe-ticket">Probe Connection</button>
+            </div>
+            <div class="state-grid">
+              <div class="state-row">
+                <strong>Node ID</strong>
+                <code id="node-id">loading…</code>
+              </div>
+              <div class="state-row">
+                <strong>Endpoint Status</strong>
+                <code id="endpoint-status">loading…</code>
+              </div>
+              <div class="state-row">
+                <strong>Configured RawUdp Interface</strong>
+                <code id="raw-udp-interface">loading…</code>
+              </div>
+              <div class="state-row">
+                <strong>Advertised Addresses</strong>
+                <code id="endpoint-addrs">loading…</code>
+              </div>
+            </div>
             <textarea id="local-ticket" spellcheck="false" readonly></textarea>
             <textarea id="remote-ticket" spellcheck="false" placeholder="Remote node ticket"></textarea>
             <div class="button-row">
               <button id="save-ticket">Save Remote Ticket</button>
               <button id="clear-ticket">Clear Remote Ticket</button>
-              <button id="probe-ticket">Probe Connection</button>
             </div>
           </div>
         </section>
         <section class="panel panel-half">
-          <h2>Saved Capabilities</h2>
+          <h2>Sharing</h2>
           <div class="stack">
-            <p class="muted">The only capability you need for this path is a saved <code>IpInterface</code>. After saving it, click <code>Use for RawUdp</code>. Once active, the local ticket should pick up a <code>custom:</code> address.</p>
+            <p class="muted">Save local capabilities, then choose which ones this grain should export to its peer. Use <code>Export as HTTP API</code> for the file previewer capability.</p>
+            <div class="button-row">
+              <button id="request-cap">Request Capability</button>
+              <button id="request-ip-network">Request IP Network</button>
+            </div>
+            <div class="state-grid">
+              <div class="state-row">
+                <strong>Exported Local IpNetwork</strong>
+                <code id="exported-ip-network">loading…</code>
+              </div>
+              <div class="state-row">
+                <strong>Exported Local ApiSession</strong>
+                <code id="exported-api-session">loading…</code>
+              </div>
+            </div>
           </div>
           <ul id="saved-caps"></ul>
         </section>
-        <section class="panel panel-half">
-          <h2>Reference</h2>
+        <section class="panel panel-full">
+          <h2>Received</h2>
+          <div class="stack">
+            <p class="muted">Connect one peer RPC session, import remote capabilities, then restore or invoke them. Persisted received object IDs should remain stable across peer reconnects.</p>
+            <div class="button-row">
+              <button id="connect-peer-rpc">Connect Peer RPC</button>
+              <button id="disconnect-peer-rpc">Disconnect Peer RPC</button>
+            </div>
+            <div class="state-grid">
+              <div class="state-row">
+                <strong>Peer RPC Session</strong>
+                <code id="peer-rpc-status">loading…</code>
+              </div>
+              <div class="state-row">
+                <strong>Peer RPC Error</strong>
+                <code id="peer-rpc-error">none</code>
+              </div>
+              <div class="state-row">
+                <strong>Persisted Received Object IDs</strong>
+                <code id="persisted-received-caps">loading…</code>
+              </div>
+              <div class="state-row">
+                <strong>Imported Remote IpNetwork</strong>
+                <code id="imported-ip-network">loading…</code>
+              </div>
+              <div class="button-row">
+                <button id="restore-imported-ip-network">Restore Imported IpNetwork Object</button>
+                <button id="drop-imported-ip-network">Drop Imported IpNetwork Object</button>
+              </div>
+              <div class="state-row">
+                <strong>Imported Remote ApiSession</strong>
+                <code id="imported-api-session">loading…</code>
+              </div>
+              <div class="button-row">
+                <button id="restore-imported-api-session">Restore Imported ApiSession Object</button>
+                <button id="drop-imported-api-session">Drop Imported ApiSession Object</button>
+              </div>
+            </div>
+            <div class="state-row">
+              <strong>Remote IpNetwork Exports</strong>
+              <select id="remote-ip-network-export-select">
+                <option value="">No remote IpNetwork exports loaded</option>
+              </select>
+            </div>
+            <div class="button-row">
+              <button id="import-remote-ip-network">Import Selected Remote IpNetwork</button>
+            </div>
+            <div class="button-row">
+              <input id="remote-invoke-host" type="text" value="neverssl.com" placeholder="Host">
+              <input id="remote-invoke-port" type="number" value="80" min="1" max="65535" placeholder="Port">
+              <button id="invoke-remote-ip-network">Invoke Imported IpNetwork</button>
+            </div>
+            <div class="state-row">
+              <strong>Remote ApiSession Exports</strong>
+              <select id="remote-api-session-export-select">
+                <option value="">No remote ApiSession exports loaded</option>
+              </select>
+            </div>
+            <div class="button-row">
+              <button id="import-remote-api-session">Import Selected Remote ApiSession</button>
+            </div>
+            <div class="button-row">
+              <input id="remote-api-filename" type="text" value="sample.docx" placeholder="Filename">
+              <input id="remote-api-file" type="file">
+              <button id="invoke-remote-api-session">Invoke Imported ApiSession</button>
+            </div>
+          </div>
+        </section>
+        <section class="panel panel-full">
+          <h2>Advanced</h2>
           <p id="transport-assessment" class="muted">loading…</p>
           <details class="advanced">
-            <summary>Advanced Tools</summary>
+            <summary>Transport Lab</summary>
             <div class="stack">
-              <div class="button-row">
-                <button id="request-cap">Request Capability</button>
-                <button id="request-ip-network">Request IP Network</button>
-              </div>
+              <p class="muted">These controls are useful for low-level transport and capability debugging. They are not the main sharing flow.</p>
               <p class="muted">Capability-gated HTTP probe target.</p>
               <div class="button-row">
                 <input id="network-probe-host" type="text" value="neverssl.com" placeholder="Host">
@@ -341,8 +423,32 @@ Host: neverssl.com
       const rawUdpInterfaceEl = document.getElementById("raw-udp-interface");
       const transportAssessmentEl = document.getElementById("transport-assessment");
       const customTransportPillEl = document.getElementById("custom-transport-pill");
+      const peerRpcPillEl = document.getElementById("peer-rpc-pill");
       const localTicketEl = document.getElementById("local-ticket");
       const remoteTicketEl = document.getElementById("remote-ticket");
+      const exportedIpNetworkEl = document.getElementById("exported-ip-network");
+      const exportedApiSessionEl = document.getElementById("exported-api-session");
+      const peerRpcStatusEl = document.getElementById("peer-rpc-status");
+      const peerRpcErrorEl = document.getElementById("peer-rpc-error");
+      const importedIpNetworkEl = document.getElementById("imported-ip-network");
+      const importedApiSessionEl = document.getElementById("imported-api-session");
+      const persistedReceivedCapsEl = document.getElementById("persisted-received-caps");
+      const restoreImportedIpNetworkButton = document.getElementById("restore-imported-ip-network");
+      const restoreImportedApiSessionButton = document.getElementById("restore-imported-api-session");
+      const dropImportedIpNetworkButton = document.getElementById("drop-imported-ip-network");
+      const dropImportedApiSessionButton = document.getElementById("drop-imported-api-session");
+      const connectPeerRpcButton = document.getElementById("connect-peer-rpc");
+      const disconnectPeerRpcButton = document.getElementById("disconnect-peer-rpc");
+      const remoteIpNetworkExportSelectEl = document.getElementById("remote-ip-network-export-select");
+      const remoteApiSessionExportSelectEl = document.getElementById("remote-api-session-export-select");
+      const importRemoteIpNetworkButton = document.getElementById("import-remote-ip-network");
+      const importRemoteApiSessionButton = document.getElementById("import-remote-api-session");
+      const remoteInvokeHostEl = document.getElementById("remote-invoke-host");
+      const remoteInvokePortEl = document.getElementById("remote-invoke-port");
+      const invokeRemoteIpNetworkButton = document.getElementById("invoke-remote-ip-network");
+      const remoteApiFilenameEl = document.getElementById("remote-api-filename");
+      const remoteApiFileEl = document.getElementById("remote-api-file");
+      const invokeRemoteApiSessionButton = document.getElementById("invoke-remote-api-session");
       const requestButton = document.getElementById("request-cap");
       const requestIpNetworkButton = document.getElementById("request-ip-network");
       const requestIpInterfaceButton = document.getElementById("request-ip-interface");
@@ -373,9 +479,16 @@ Host: neverssl.com
         ipNetwork: "",
         ipInterface: "",
       };
+      let importedRemoteIpNetworkObjectId = "";
+      let importedRemoteApiSessionObjectId = "";
 
       function setStatus(text) {
         statusEl.textContent = text;
+      }
+
+      function responseTextToStatus(prefix, response, body) {
+        const text = (body || "").replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+        return `${prefix} with HTTP ${response.status}${text ? `: ${text}` : ""}`;
       }
 
       function previewBase64Payload(base64Value) {
@@ -536,6 +649,50 @@ Host: neverssl.com
             await refreshState();
           });
           item.appendChild(bindButton);
+
+          const exportButton = document.createElement("button");
+          exportButton.textContent = "Export as IpNetwork";
+          exportButton.title = "Requires this saved capability to actually implement IpNetwork.";
+          exportButton.addEventListener("click", async () => {
+            setStatus(`Configuring exported IpNetwork from ${entry.label}...`);
+            const response = await fetch("api/tunnel/exported-ip-network", {
+              method: "POST",
+              headers: { "Content-Type": "text/plain" },
+              body: entry.objectId || entry.id,
+            });
+
+            if (!response.ok) {
+              const body = await response.text();
+              setStatus(responseTextToStatus("Export configuration failed", response, body));
+              return;
+            }
+
+            setStatus(`Exported IpNetwork set to ${entry.label}.`);
+            await refreshState();
+          });
+          item.appendChild(exportButton);
+
+          const exportApiSessionButton = document.createElement("button");
+          exportApiSessionButton.textContent = "Export as HTTP API";
+          exportApiSessionButton.title = "Use this when the saved capability is a Sandstorm ApiSession HTTP bridge.";
+          exportApiSessionButton.addEventListener("click", async () => {
+            setStatus(`Configuring exported ApiSession from ${entry.label}...`);
+            const response = await fetch("api/tunnel/exported-api-session", {
+              method: "POST",
+              headers: { "Content-Type": "text/plain" },
+              body: entry.objectId || entry.id,
+            });
+
+            if (!response.ok) {
+              const body = await response.text();
+              setStatus(responseTextToStatus("HTTP API export configuration failed", response, body));
+              return;
+            }
+
+            setStatus(`Exported ApiSession set to ${entry.label}.`);
+            await refreshState();
+          });
+          item.appendChild(exportApiSessionButton);
 
           const advanced = document.createElement("details");
           advanced.className = "advanced";
@@ -756,6 +913,35 @@ Host: neverssl.com
         }
       }
 
+      function renderRemoteExports(selectEl, exports, emptyText) {
+        selectEl.innerHTML = "";
+        if (!exports.length) {
+          const option = document.createElement("option");
+          option.value = "";
+          option.textContent = emptyText;
+          selectEl.appendChild(option);
+          return;
+        }
+
+        for (const entry of exports) {
+          const option = document.createElement("option");
+          option.value = entry.id;
+          option.textContent = `${entry.label} (${entry.id})`;
+          selectEl.appendChild(option);
+        }
+      }
+
+      function renderPersistedReceivedCaps(items) {
+        if (!items || !items.length) {
+          persistedReceivedCapsEl.textContent = "none";
+          return;
+        }
+
+        persistedReceivedCapsEl.textContent = items
+          .map((entry) => `${entry.kind} ${entry.objectId} (${entry.label})`)
+          .join(" | ");
+      }
+
       async function refreshState() {
         const response = await fetch("api/state");
         const data = await response.json();
@@ -776,6 +962,41 @@ Host: neverssl.com
         transportAssessmentEl.textContent = data.transportAssessment || "unavailable";
         localTicketEl.value = endpoint.localTicket || "";
         remoteTicketEl.value = data.remoteTicket || "";
+        exportedIpNetworkEl.textContent = data.exportedIpNetwork
+          ? `${data.exportedIpNetwork.label} (${data.exportedIpNetwork.id})`
+          : "not configured";
+        exportedApiSessionEl.textContent = data.exportedApiSession
+          ? `${data.exportedApiSession.label} (${data.exportedApiSession.id})`
+          : "not configured";
+        const peerRpc = data.peerRpc || { connected: false, ipNetworkExports: [], apiSessionExports: [] };
+        peerRpcPillEl.textContent = peerRpc.connected ? "Peer RPC Connected" : "Peer RPC Disconnected";
+        peerRpcStatusEl.textContent = peerRpc.connected
+          ? `connected to ${peerRpc.remoteNodeId} [session ${peerRpc.sessionId}]`
+          : "not connected";
+        peerRpcErrorEl.textContent = data.peerRpcError || "none";
+        renderPersistedReceivedCaps(data.persistedReceivedCaps || []);
+        importedRemoteIpNetworkObjectId = data.importedRemoteIpNetwork
+          ? (data.importedRemoteIpNetwork.objectId || "")
+          : "";
+        importedIpNetworkEl.textContent = data.importedRemoteIpNetwork
+          ? `${data.importedRemoteIpNetwork.label} (${data.importedRemoteIpNetwork.exportId}) object ${data.importedRemoteIpNetwork.objectId}`
+          : "none";
+        importedRemoteApiSessionObjectId = data.importedRemoteApiSession
+          ? (data.importedRemoteApiSession.objectId || "")
+          : "";
+        importedApiSessionEl.textContent = data.importedRemoteApiSession
+          ? `${data.importedRemoteApiSession.label} (${data.importedRemoteApiSession.exportId}) object ${data.importedRemoteApiSession.objectId}`
+          : "none";
+        renderRemoteExports(
+          remoteIpNetworkExportSelectEl,
+          peerRpc.ipNetworkExports || [],
+          "No remote IpNetwork exports loaded"
+        );
+        renderRemoteExports(
+          remoteApiSessionExportSelectEl,
+          peerRpc.apiSessionExports || [],
+          "No remote ApiSession exports loaded"
+        );
         renderSavedCaps(data.savedCaps || [], endpoint.rawUdpInterface || null);
         renderActiveTcpSessions(data.activeTcpSessions || []);
       }
@@ -821,6 +1042,209 @@ Host: neverssl.com
         }
         const result = await response.json();
         setStatus(`Probe succeeded with ${result.remoteNodeId}: ${result.response}`);
+      });
+
+      connectPeerRpcButton.addEventListener("click", async () => {
+        setStatus("Connecting peer RPC session...");
+        const response = await fetch("api/tunnel/rpc/connect", {
+          method: "POST",
+        });
+        if (!response.ok) {
+          const body = await response.text();
+          setStatus(responseTextToStatus("Peer RPC connect failed", response, body));
+          return;
+        }
+        const result = await response.json();
+        const ipCount = (result.ipNetworkExports || []).length;
+        const apiCount = (result.apiSessionExports || []).length;
+        setStatus(`Peer RPC connected with ${ipCount} remote IpNetwork export(s) and ${apiCount} remote ApiSession export(s).`);
+        await refreshState();
+      });
+
+      disconnectPeerRpcButton.addEventListener("click", async () => {
+        setStatus("Disconnecting peer RPC session...");
+        const response = await fetch("api/tunnel/rpc/disconnect", {
+          method: "POST",
+        });
+        if (!response.ok) {
+          const body = await response.text();
+          setStatus(responseTextToStatus("Peer RPC disconnect failed", response, body));
+          return;
+        }
+        setStatus("Peer RPC disconnected.");
+        await refreshState();
+      });
+
+      importRemoteIpNetworkButton.addEventListener("click", async () => {
+        const exportId = remoteIpNetworkExportSelectEl.value;
+        if (!exportId) {
+          setStatus("Select a remote IpNetwork export first.");
+          return;
+        }
+        setStatus(`Importing remote IpNetwork ${exportId}...`);
+        const response = await fetch("api/tunnel/rpc/import-ip-network", {
+          method: "POST",
+          headers: { "Content-Type": "text/plain" },
+          body: exportId,
+        });
+        if (!response.ok) {
+          const body = await response.text();
+          setStatus(responseTextToStatus("Remote IpNetwork import failed", response, body));
+          return;
+        }
+        const result = await response.json();
+        setStatus(`Imported remote IpNetwork ${result.label} as object ${result.objectId}.`);
+        await refreshState();
+      });
+
+      importRemoteApiSessionButton.addEventListener("click", async () => {
+        const exportId = remoteApiSessionExportSelectEl.value;
+        if (!exportId) {
+          setStatus("Select a remote ApiSession export first.");
+          return;
+        }
+        setStatus(`Importing remote ApiSession ${exportId}...`);
+        const response = await fetch("api/tunnel/rpc/import-api-session", {
+          method: "POST",
+          headers: { "Content-Type": "text/plain" },
+          body: exportId,
+        });
+        if (!response.ok) {
+          const body = await response.text();
+          setStatus(responseTextToStatus("Remote ApiSession import failed", response, body));
+          return;
+        }
+        const result = await response.json();
+        setStatus(`Imported remote ApiSession ${result.label} as object ${result.objectId}.`);
+        await refreshState();
+      });
+
+      invokeRemoteIpNetworkButton.addEventListener("click", async () => {
+        const host = (remoteInvokeHostEl.value || "").trim() || "neverssl.com";
+        const port = (remoteInvokePortEl.value || "").trim() || "80";
+        setStatus(`Invoking imported remote IpNetwork for ${host}:${port}...`);
+        const response = await fetch("api/tunnel/rpc/invoke-ip-network", {
+          method: "POST",
+          headers: { "Content-Type": "text/plain" },
+          body: `${host}\n${port}`,
+        });
+        if (!response.ok) {
+          const body = await response.text();
+          setStatus(responseTextToStatus("Remote IpNetwork invoke failed", response, body));
+          return;
+        }
+        const result = await response.json();
+        setStatus(`Remote IpNetwork invocation succeeded for ${result.host}:${result.port}: ${result.responsePreview} [${result.trace}]`);
+        await refreshState();
+      });
+
+      invokeRemoteApiSessionButton.addEventListener("click", async () => {
+        const file = remoteApiFileEl.files && remoteApiFileEl.files[0];
+        if (!file) {
+          setStatus("Choose a file to send to the imported ApiSession first.");
+          return;
+        }
+        const filename = (remoteApiFilenameEl.value || "").trim() || file.name || "upload.bin";
+        setStatus(`Invoking imported ApiSession with ${filename}...`);
+        const response = await fetch("api/tunnel/rpc/invoke-api-session", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/octet-stream",
+            "x-sandstorm-app-filename": filename,
+          },
+          body: await file.arrayBuffer(),
+        });
+        if (!response.ok) {
+          const body = await response.text();
+          setStatus(responseTextToStatus("Remote ApiSession invoke failed", response, body));
+          return;
+        }
+        const result = await response.json();
+        const preview = result.responsePreview || previewBase64Payload(result.responsePreviewBase64 || "");
+        setStatus(`Remote ApiSession invocation succeeded with HTTP ${result.status} ${result.contentType || ""}: ${preview} [${result.trace}]`);
+        await refreshState();
+      });
+
+      restoreImportedIpNetworkButton.addEventListener("click", async () => {
+        if (!importedRemoteIpNetworkObjectId) {
+          setStatus("No imported remote IpNetwork object is loaded.");
+          return;
+        }
+        setStatus(`Resolving imported remote IpNetwork object ${importedRemoteIpNetworkObjectId}...`);
+        const response = await fetch("api/saved-cap/resolve-object", {
+          method: "PUT",
+          headers: { "Content-Type": "text/plain" },
+          body: importedRemoteIpNetworkObjectId,
+        });
+
+        if (response.ok) {
+          setStatus(`Imported remote IpNetwork object restore succeeded for ${importedRemoteIpNetworkObjectId}`);
+        } else {
+          const body = await response.text();
+          setStatus(responseTextToStatus("Imported remote IpNetwork object restore failed", response, body));
+        }
+      });
+
+      restoreImportedApiSessionButton.addEventListener("click", async () => {
+        if (!importedRemoteApiSessionObjectId) {
+          setStatus("No imported remote ApiSession object is loaded.");
+          return;
+        }
+        setStatus(`Resolving imported remote ApiSession object ${importedRemoteApiSessionObjectId}...`);
+        const response = await fetch("api/saved-cap/resolve-object", {
+          method: "PUT",
+          headers: { "Content-Type": "text/plain" },
+          body: importedRemoteApiSessionObjectId,
+        });
+
+        if (response.ok) {
+          setStatus(`Imported remote ApiSession object restore succeeded for ${importedRemoteApiSessionObjectId}`);
+        } else {
+          const body = await response.text();
+          setStatus(responseTextToStatus("Imported remote ApiSession object restore failed", response, body));
+        }
+      });
+
+      dropImportedIpNetworkButton.addEventListener("click", async () => {
+        if (!importedRemoteIpNetworkObjectId) {
+          setStatus("No imported remote IpNetwork object is loaded.");
+          return;
+        }
+        setStatus(`Dropping imported remote IpNetwork object ${importedRemoteIpNetworkObjectId}...`);
+        const response = await fetch("api/saved-cap/drop-object", {
+          method: "PUT",
+          headers: { "Content-Type": "text/plain" },
+          body: importedRemoteIpNetworkObjectId,
+        });
+
+        if (response.ok) {
+          setStatus(`Imported remote IpNetwork object dropped: ${importedRemoteIpNetworkObjectId}`);
+          await refreshState();
+        } else {
+          const body = await response.text();
+          setStatus(responseTextToStatus("Imported remote IpNetwork object drop failed", response, body));
+        }
+      });
+
+      dropImportedApiSessionButton.addEventListener("click", async () => {
+        if (!importedRemoteApiSessionObjectId) {
+          setStatus("No imported remote ApiSession object is loaded.");
+          return;
+        }
+        setStatus(`Dropping imported remote ApiSession object ${importedRemoteApiSessionObjectId}...`);
+        const response = await fetch("api/saved-cap/drop-object", {
+          method: "PUT",
+          headers: { "Content-Type": "text/plain" },
+          body: importedRemoteApiSessionObjectId,
+        });
+
+        if (response.ok) {
+          setStatus(`Imported remote ApiSession object dropped: ${importedRemoteApiSessionObjectId}`);
+          await refreshState();
+        } else {
+          const body = await response.text();
+          setStatus(responseTextToStatus("Imported remote ApiSession object drop failed", response, body));
+        }
       });
 
       function requestPowerboxCapability(query, saveLabel) {

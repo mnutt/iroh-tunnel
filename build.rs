@@ -4,6 +4,7 @@ use std::path::Path;
 fn main() {
     let schema_dir = Path::new("vendor/include/sandstorm");
     println!("cargo:rerun-if-changed=vendor/include");
+    println!("cargo:rerun-if-changed=src/tunnel.capnp");
 
     let mut command = capnpc::CompilerCommand::new();
     command.import_path("vendor/include");
@@ -24,5 +25,14 @@ fn main() {
 
     command.run().expect(
         "capnp schema compilation failed; ensure `capnp` is installed in the build environment",
+    );
+
+    let mut tunnel_command = capnpc::CompilerCommand::new();
+    tunnel_command.import_path("vendor/include");
+    tunnel_command.import_path("src");
+    tunnel_command.src_prefix("src");
+    tunnel_command.file("src/tunnel.capnp");
+    tunnel_command.run().expect(
+        "capnp schema compilation failed for src/tunnel.capnp; ensure `capnp` is installed in the build environment",
     );
 }
