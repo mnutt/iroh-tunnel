@@ -7,1324 +7,608 @@
     <style>
       :root {
         color-scheme: dark;
-        --bg: #171c29;
-        --panel: rgba(20, 25, 37, 0.82);
-        --line: rgba(224, 232, 255, 0.14);
-        --ink: #f3f6ff;
-        --muted: #9aa4c0;
-        --accent: #dfe7ff;
+        --bg: #0f1722;
+        --bg-accent: #172334;
+        --panel: rgba(18, 26, 39, 0.9);
+        --panel-soft: rgba(16, 23, 34, 0.76);
+        --line: rgba(215, 226, 255, 0.14);
+        --line-strong: rgba(215, 226, 255, 0.25);
+        --ink: #f2f5ff;
+        --muted: #9eabc4;
+        --accent: #dde7ff;
+        --accent-ink: #111827;
+        --danger: #ffb3b3;
+        --success: #b5efc1;
       }
+
       * { box-sizing: border-box; }
+
       body {
         margin: 0;
         min-height: 100vh;
-        overflow-x: hidden;
         font-family: "Iowan Old Style", "Palatino Linotype", serif;
-        background: var(--bg);
+        background:
+          radial-gradient(circle at top right, rgba(120, 146, 212, 0.14), transparent 30rem),
+          linear-gradient(180deg, var(--bg-accent), var(--bg));
         color: var(--ink);
       }
+
       main {
-        position: relative;
-        max-width: 64rem;
+        max-width: 78rem;
         margin: 0 auto;
-        padding: 2rem 1.25rem 3rem;
+        padding: 2rem 1.2rem 3rem;
       }
+
       h1 {
-        margin: 0 0 0.35rem;
-        font-size: clamp(2.3rem, 6vw, 4rem);
-        line-height: 0.94;
+        margin: 0;
+        font-size: clamp(2.4rem, 5vw, 4.4rem);
+        line-height: 0.95;
         letter-spacing: -0.04em;
       }
+
       h2 {
-        margin: 0 0 0.6rem;
-        font-size: 0.92rem;
-        letter-spacing: 0.06em;
+        margin: 0;
+        font-size: 1.05rem;
+        letter-spacing: 0.04em;
         text-transform: uppercase;
       }
-      p, li { line-height: 1.55; }
-      .eyebrow {
-        display: inline-block;
-        margin-bottom: 0.85rem;
-        color: var(--accent);
-        font-weight: 600;
-        text-transform: uppercase;
-        letter-spacing: 0.12em;
-        font-size: 0.75rem;
+
+      h3 {
+        margin: 0;
+        font-size: 1rem;
       }
-      .scene {
-        display: block;
-        min-height: 12rem;
+
+      p, li, label {
+        line-height: 1.55;
       }
-      .hero-copy {
-        position: relative;
-        z-index: 2;
-        max-width: 30rem;
+
+      code {
+        font-family: "Berkeley Mono", "SFMono-Regular", monospace;
+        font-size: 0.84em;
+        word-break: break-word;
       }
-      .lede {
-        max-width: 28rem;
-        font-size: 0.98rem;
-        color: var(--muted);
+
+      button,
+      input,
+      textarea,
+      select {
+        font: inherit;
       }
-      .vortex-wrap {
-        position: relative;
-        display: none;
-      }
-      .cards {
-        display: grid;
-        grid-template-columns: repeat(12, 1fr);
-        gap: 0.9rem;
-        margin-top: 1.4rem;
-      }
-      .panel {
-        background: var(--panel);
-        border: 1px solid var(--line);
-        border-radius: 0;
-        padding: 1rem;
-        backdrop-filter: blur(8px);
-      }
-      .panel-wide { grid-column: span 7; }
-      .panel-tall { grid-column: span 5; }
-      .panel-full { grid-column: 1 / -1; }
-      .panel-half { grid-column: span 6; }
+
       button {
         border: 0;
-        border-radius: 0;
-        padding: 0.72rem 1rem;
-        background: rgba(228, 235, 255, 0.92);
-        color: #101626;
-        font: inherit;
+        background: rgba(230, 237, 255, 0.95);
+        color: var(--accent-ink);
+        padding: 0.78rem 1rem;
         font-weight: 700;
         cursor: pointer;
       }
-      ul {
-        margin: 0;
-        padding-left: 1.1rem;
+
+      button.secondary {
+        background: rgba(255, 255, 255, 0.08);
+        color: var(--ink);
+        border: 1px solid var(--line);
       }
-      li + li {
-        margin-top: 0.8rem;
+
+      button.danger {
+        background: rgba(255, 119, 119, 0.14);
+        color: var(--danger);
+        border: 1px solid rgba(255, 119, 119, 0.28);
       }
-      .status-line {
-        min-height: 1.5rem;
-        margin-top: 0.9rem;
+
+      button:disabled {
+        opacity: 0.55;
+        cursor: default;
       }
-      .muted {
+
+      input,
+      textarea,
+      select {
+        width: 100%;
+        border: 1px solid var(--line);
+        background: rgba(12, 17, 27, 0.84);
+        color: var(--ink);
+        padding: 0.8rem 0.95rem;
+      }
+
+      textarea {
+        min-height: 7rem;
+        resize: vertical;
+      }
+
+      .hero {
+        display: grid;
+        gap: 0.8rem;
+        margin-bottom: 1.4rem;
+      }
+
+      .eyebrow {
+        color: var(--accent);
+        letter-spacing: 0.14em;
+        text-transform: uppercase;
+        font-size: 0.76rem;
+        font-weight: 700;
+      }
+
+      .lede {
+        max-width: 42rem;
         color: var(--muted);
+        margin: 0;
       }
-      .saved-row {
+
+      .status-banner {
+        margin-bottom: 1rem;
+        padding: 0.85rem 1rem;
+        border: 1px solid var(--line);
+        background: var(--panel-soft);
+        color: var(--muted);
+        min-height: 3.4rem;
+      }
+
+      .layout {
+        display: grid;
+        grid-template-columns: minmax(0, 1.5fr) minmax(18rem, 1fr);
+        gap: 1rem;
+        align-items: start;
+      }
+
+      .column {
+        display: grid;
+        gap: 1rem;
+      }
+
+      .panel {
+        background: var(--panel);
+        border: 1px solid var(--line);
+        padding: 1rem;
+      }
+
+      .panel-header {
         display: flex;
-        flex-wrap: wrap;
-        align-items: center;
-        gap: 0.5rem;
+        align-items: start;
+        justify-content: space-between;
+        gap: 1rem;
+        margin-bottom: 0.75rem;
       }
+
+      .panel-copy {
+        color: var(--muted);
+        margin: 0;
+      }
+
       .stack {
         display: grid;
         gap: 0.8rem;
       }
-      textarea {
-        width: 100%;
-        min-height: 7.5rem;
-        border: 1px solid var(--line);
-        border-radius: 0;
-        padding: 0.85rem 0.95rem;
-        background: rgba(20, 25, 37, 0.82);
-        color: var(--ink);
-        font: inherit;
-        resize: vertical;
+
+      .field {
+        display: grid;
+        gap: 0.35rem;
       }
-      input {
-        border: 1px solid var(--line);
-        border-radius: 0;
-        padding: 0.72rem 1rem;
-        background: rgba(20, 25, 37, 0.82);
-        color: var(--ink);
-        font: inherit;
+
+      .field-label {
+        font-size: 0.82rem;
+        letter-spacing: 0.05em;
+        text-transform: uppercase;
+        color: var(--muted);
       }
-      select {
-        border: 1px solid var(--line);
-        border-radius: 0;
-        padding: 0.72rem 1rem;
-        background: rgba(20, 25, 37, 0.82);
-        color: var(--ink);
-        font: inherit;
-      }
+
       .button-row {
         display: flex;
         flex-wrap: wrap;
-        gap: 0.5rem;
+        gap: 0.55rem;
       }
-      .button-row.tight {
-        align-items: center;
+
+      .ticket-row {
+        display: flex;
+        gap: 0.55rem;
+        align-items: start;
       }
-      code {
-        font-family: "Berkeley Mono", "SFMono-Regular", monospace;
-        font-size: 0.84em;
-        word-break: break-all;
+
+      .ticket-row textarea {
+        flex: 1;
       }
-      .checklist {
-        margin: 0;
-        padding-left: 1.1rem;
-      }
-      .checklist li {
-        margin-top: 0.5rem;
-      }
-      .pill {
+
+      .status-pill {
         display: inline-flex;
         align-items: center;
-        padding: 0.24rem 0.55rem;
+        padding: 0.28rem 0.58rem;
         border: 1px solid var(--line);
-        border-radius: 0;
-        font-size: 0.78rem;
-        letter-spacing: 0.03em;
-        text-transform: uppercase;
         color: var(--accent);
+        font-size: 0.78rem;
+        letter-spacing: 0.04em;
+        text-transform: uppercase;
       }
-      .state-grid {
+
+      .kv-grid {
         display: grid;
-        gap: 0.9rem;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 0.7rem;
       }
-      .state-row {
-        display: grid;
-        gap: 0.24rem;
+
+      .kv {
+        padding: 0.75rem 0.8rem;
+        border: 1px solid var(--line);
+        background: rgba(11, 16, 24, 0.45);
       }
-      .state-row strong {
-        font-size: 0.8rem;
+
+      .kv strong {
+        display: block;
+        margin-bottom: 0.32rem;
+        font-size: 0.78rem;
         letter-spacing: 0.06em;
         text-transform: uppercase;
         color: var(--muted);
       }
-      details.advanced {
-        border: 1px solid var(--line);
-        border-radius: 0;
-        padding: 0.85rem 0.95rem;
-        background: rgba(17, 22, 33, 0.55);
+
+      .cap-list,
+      .debug-list {
+        list-style: none;
+        margin: 0;
+        padding: 0;
+        display: grid;
+        gap: 0.8rem;
       }
-      details.advanced summary {
+
+      .cap-card {
+        border: 1px solid var(--line);
+        background: rgba(10, 15, 24, 0.5);
+        padding: 0.9rem;
+        display: grid;
+        gap: 0.7rem;
+      }
+
+      .cap-meta {
+        display: grid;
+        gap: 0.2rem;
+      }
+
+      .cap-subtext {
+        color: var(--muted);
+        font-size: 0.94rem;
+      }
+
+      .cap-actions {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.55rem;
+        align-items: center;
+      }
+
+      .toggle {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.45rem;
+        padding: 0.44rem 0.62rem;
+        border: 1px solid var(--line);
+        color: var(--ink);
+      }
+
+      .toggle input {
+        width: auto;
+        margin: 0;
+      }
+
+      .empty {
+        margin: 0;
+        color: var(--muted);
+        padding: 0.95rem 0;
+      }
+
+      .muted {
+        color: var(--muted);
+      }
+
+      .inline-note {
+        color: var(--muted);
+        font-size: 0.92rem;
+      }
+
+      details.debug {
+        border: 1px solid var(--line);
+        background: rgba(10, 14, 23, 0.65);
+        padding: 0.85rem 0.95rem;
+      }
+
+      details.debug summary {
         cursor: pointer;
         font-weight: 700;
       }
-      details.advanced[open] summary {
-        margin-bottom: 0.8rem;
+
+      details.debug[open] summary {
+        margin-bottom: 0.9rem;
       }
+
+      .debug-grid {
+        display: grid;
+        gap: 0.95rem;
+      }
+
+      .debug-panel {
+        border: 1px solid var(--line);
+        padding: 0.9rem;
+        background: rgba(12, 17, 27, 0.54);
+      }
+
+      .visually-hidden {
+        position: absolute;
+        width: 1px;
+        height: 1px;
+        padding: 0;
+        margin: -1px;
+        overflow: hidden;
+        clip: rect(0, 0, 0, 0);
+        white-space: nowrap;
+        border: 0;
+      }
+
       @media (max-width: 860px) {
-        .cards {
+        .layout {
           grid-template-columns: 1fr;
         }
-        .panel-wide,
-        .panel-half,
-        .panel-tall,
-        .panel-full {
-          grid-column: auto;
+
+        .kv-grid {
+          grid-template-columns: 1fr;
+        }
+
+        .ticket-row {
+          flex-direction: column;
         }
       }
     </style>
   </head>
   <body>
     <main>
-      <section class="scene">
-        <div class="hero-copy">
-          <h1>Iroh Tunnel</h1>
-          <p class="lede">
-            Pair two grains, choose which capabilities to share, and restore received remote
-            capabilities by stable object ID. The transport lab is still here, but it now lives in
-            <code>Advanced</code>.
-          </p>
-        </div>
+      <section id="hero-section" class="hero">
+        <span class="eyebrow">Iroh Tunnel</span>
+        <h1>Share capabilities through one tunnel.</h1>
+        <p class="lede">
+          Enable the tunnel, connect to another grain, choose what to share, and use what the other
+          side makes available. Transport details stay behind <code>Debug</code>.
+        </p>
       </section>
 
-      <section class="cards">
-        <section class="panel panel-full">
-          <h2>Status</h2>
-          <p class="muted">Main flow: bind RawUdp, pair grains, export one capability, import it on the other side, then restore or invoke it.</p>
-          <div class="button-row tight">
-            <span id="custom-transport-pill" class="pill">Custom Transport Missing</span>
-            <span id="peer-rpc-pill" class="pill">Peer RPC Disconnected</span>
-          </div>
-          <p id="status" class="status-line muted"></p>
-        </section>
-        <section class="panel panel-half">
-          <h2>Pairing</h2>
-          <div class="stack">
-            <p class="muted">Start here. Save one <code>IpInterface</code>, use it for RawUdp, wait for a <code>custom:</code> ticket address, then exchange tickets with the other grain.</p>
-            <div class="button-row">
-              <button id="request-ip-interface">Request IP Interface</button>
-              <button id="probe-ticket">Probe Connection</button>
+      <p id="status" class="status-banner">Loading current tunnel state...</p>
+
+      <section class="layout">
+        <div class="column">
+          <section id="share-panel" class="panel">
+            <div class="panel-header">
+              <div class="stack">
+                <h2>Share Capabilities</h2>
+                <p class="panel-copy">
+                  Choose capabilities this grain should offer through the tunnel.
+                </p>
+              </div>
+              <button id="request-cap">Find Capability to Share</button>
             </div>
-            <div class="state-grid">
-              <div class="state-row">
-                <strong>Node ID</strong>
-                <code id="node-id">loading…</code>
-              </div>
-              <div class="state-row">
-                <strong>Endpoint Status</strong>
-                <code id="endpoint-status">loading…</code>
-              </div>
-              <div class="state-row">
-                <strong>Configured RawUdp Interface</strong>
-                <code id="raw-udp-interface">loading…</code>
-              </div>
-              <div class="state-row">
-                <strong>Advertised Addresses</strong>
-                <code id="endpoint-addrs">loading…</code>
+            <p id="share-inline-note" class="inline-note"></p>
+            <ul id="shared-caps" class="cap-list"></ul>
+          </section>
+
+          <section id="received-panel" class="panel">
+            <div class="panel-header">
+              <div class="stack">
+                <h2 id="received-title">Received Capabilities</h2>
+                <p id="received-copy" class="panel-copy">
+                  Capabilities remembered from the remote grain stay listed here, even when the
+                  tunnel is disconnected.
+                </p>
               </div>
             </div>
-            <textarea id="local-ticket" spellcheck="false" readonly></textarea>
-            <textarea id="remote-ticket" spellcheck="false" placeholder="Remote node ticket"></textarea>
-            <div class="button-row">
-              <button id="save-ticket">Save Remote Ticket</button>
-              <button id="clear-ticket">Clear Remote Ticket</button>
-            </div>
-          </div>
-        </section>
-        <section class="panel panel-half">
-          <h2>Sharing</h2>
-          <div class="stack">
-            <p class="muted">Save local capabilities, then choose which ones this grain should export to its peer. Use <code>Export as HTTP API</code> for the file previewer capability.</p>
-            <div class="button-row">
-              <button id="request-cap">Request Capability</button>
-              <button id="request-ip-network">Request IP Network</button>
-            </div>
-            <div class="state-grid">
-              <div class="state-row">
-                <strong>Exported Local IpNetwork</strong>
-                <code id="exported-ip-network">loading…</code>
+            <ul id="received-caps" class="cap-list"></ul>
+          </section>
+        </div>
+
+        <div class="column">
+          <section id="tunnel-panel" class="panel">
+            <div class="panel-header">
+              <div class="stack">
+                <h2>Tunnel</h2>
+                <span id="tunnel-status-pill" class="status-pill">Loading</span>
               </div>
-              <div class="state-row">
-                <strong>Exported Local ApiSession</strong>
-                <code id="exported-api-session">loading…</code>
-              </div>
+              <button id="copy-ticket" class="secondary">Copy Ticket</button>
             </div>
-          </div>
-          <ul id="saved-caps"></ul>
-        </section>
-        <section class="panel panel-full">
-          <h2>Received</h2>
-          <div class="stack">
-            <p class="muted">Connect one peer RPC session, import remote capabilities, then restore or invoke them. Persisted received object IDs should remain stable across peer reconnects.</p>
-            <div class="button-row">
-              <button id="connect-peer-rpc">Connect Peer RPC</button>
-              <button id="disconnect-peer-rpc">Disconnect Peer RPC</button>
-            </div>
-            <div class="state-grid">
-              <div class="state-row">
-                <strong>Peer RPC Session</strong>
-                <code id="peer-rpc-status">loading…</code>
-              </div>
-              <div class="state-row">
-                <strong>Peer RPC Error</strong>
-                <code id="peer-rpc-error">none</code>
-              </div>
-              <div class="state-row">
-                <strong>Persisted Received Object IDs</strong>
-                <code id="persisted-received-caps">loading…</code>
-              </div>
-              <div class="state-row">
-                <strong>Imported Remote IpNetwork</strong>
-                <code id="imported-ip-network">loading…</code>
-              </div>
-              <div class="button-row">
-                <button id="restore-imported-ip-network">Restore Imported IpNetwork Object</button>
-                <button id="drop-imported-ip-network">Drop Imported IpNetwork Object</button>
-              </div>
-              <div class="state-row">
-                <strong>Imported Remote ApiSession</strong>
-                <code id="imported-api-session">loading…</code>
-              </div>
-              <div class="button-row">
-                <button id="restore-imported-api-session">Restore Imported ApiSession Object</button>
-                <button id="drop-imported-api-session">Drop Imported ApiSession Object</button>
-              </div>
-            </div>
-            <div class="state-row">
-              <strong>Remote IpNetwork Exports</strong>
-              <select id="remote-ip-network-export-select">
-                <option value="">No remote IpNetwork exports loaded</option>
-              </select>
-            </div>
-            <div class="button-row">
-              <button id="import-remote-ip-network">Import Selected Remote IpNetwork</button>
-            </div>
-            <div class="button-row">
-              <input id="remote-invoke-host" type="text" value="neverssl.com" placeholder="Host">
-              <input id="remote-invoke-port" type="number" value="80" min="1" max="65535" placeholder="Port">
-              <button id="invoke-remote-ip-network">Invoke Imported IpNetwork</button>
-            </div>
-            <div class="state-row">
-              <strong>Remote ApiSession Exports</strong>
-              <select id="remote-api-session-export-select">
-                <option value="">No remote ApiSession exports loaded</option>
-              </select>
-            </div>
-            <div class="button-row">
-              <button id="import-remote-api-session">Import Selected Remote ApiSession</button>
-            </div>
-            <div class="button-row">
-              <input id="remote-api-filename" type="text" value="sample.docx" placeholder="Filename">
-              <input id="remote-api-file" type="file">
-              <button id="invoke-remote-api-session">Invoke Imported ApiSession</button>
-            </div>
-          </div>
-        </section>
-        <section class="panel panel-full">
-          <h2>Advanced</h2>
-          <p id="transport-assessment" class="muted">loading…</p>
-          <details class="advanced">
-            <summary>Transport Lab</summary>
+
             <div class="stack">
-              <p class="muted">These controls are useful for low-level transport and capability debugging. They are not the main sharing flow.</p>
-              <p class="muted">Capability-gated HTTP probe target.</p>
-              <div class="button-row">
-                <input id="network-probe-host" type="text" value="neverssl.com" placeholder="Host">
-                <input id="network-probe-port" type="number" value="80" min="1" max="65535" placeholder="Port">
-                <input id="network-probe-path" type="text" value="/" placeholder="Path">
+              <p id="tunnel-helper" class="panel-copy"></p>
+
+              <div class="kv-grid">
+                <div class="kv">
+                  <strong>Node ID</strong>
+                  <code id="node-id">loading...</code>
+                </div>
+                <div class="kv">
+                  <strong>Endpoint</strong>
+                  <code id="endpoint-status">loading...</code>
+                </div>
+                <div class="kv">
+                  <strong>Configured Network Permission</strong>
+                  <code id="raw-udp-interface">loading...</code>
+                </div>
+                <div class="kv">
+                  <strong>Peer</strong>
+                  <code id="peer-rpc-status">loading...</code>
+                </div>
               </div>
-              <p class="muted">Raw TCP probe target and payload.</p>
-              <div class="button-row">
-                <input id="tcp-probe-host" type="text" value="neverssl.com" placeholder="Host">
-                <input id="tcp-probe-port" type="number" value="80" min="1" max="65535" placeholder="Port">
+
+              <div class="field">
+                <span class="field-label">Your Ticket</span>
+                <div class="ticket-row">
+                  <textarea id="local-ticket" spellcheck="false" readonly></textarea>
+                </div>
               </div>
-              <textarea id="tcp-probe-payload" spellcheck="false">GET / HTTP/1.0
+
+              <div class="field">
+                <label class="field-label" for="remote-ticket">Remote Grain Ticket</label>
+                <textarea id="remote-ticket" spellcheck="false" placeholder="Paste the other grain's ticket"></textarea>
+              </div>
+
+              <div class="button-row">
+                <button id="request-ip-interface">Request Tunneling Capability</button>
+                <button id="connect-tunnel">Connect</button>
+                <button id="toggle-tunnel" class="secondary">Disable Tunnel</button>
+                <button id="accept-tunnel" class="secondary">Accept Connection</button>
+                <button id="reject-tunnel" class="secondary">Reject</button>
+                <button id="disconnect-peer-rpc" class="secondary">Disconnect</button>
+                <button id="clear-ticket" class="danger">Forget Peer</button>
+              </div>
+
+              <p id="peer-rpc-error" class="inline-note"></p>
+
+              <details id="debug-panel" class="debug">
+                <summary>Debug</summary>
+                <div class="debug-grid">
+                  <div class="debug-panel stack">
+                    <h3>Current State</h3>
+                    <div class="kv-grid">
+                      <div class="kv">
+                        <strong>Advertised Addresses</strong>
+                        <code id="endpoint-addrs">loading...</code>
+                      </div>
+                      <div class="kv">
+                        <strong>Connection Error</strong>
+                        <code id="debug-peer-rpc-error">none</code>
+                      </div>
+                      <div class="kv">
+                        <strong>Transport</strong>
+                        <code id="custom-transport-pill">loading...</code>
+                      </div>
+                      <div class="kv">
+                        <strong>Peer RPC</strong>
+                        <code id="peer-rpc-pill">loading...</code>
+                      </div>
+                    </div>
+                    <p id="transport-assessment" class="muted">loading...</p>
+                  </div>
+
+                  <div class="debug-panel stack">
+                    <h3>Saved Capabilities</h3>
+                    <p class="muted">
+                      Low-level capability actions stay here while the product flow is being
+                      simplified.
+                    </p>
+                    <div class="button-row">
+                      <button id="request-ip-network" class="secondary">Request Network Capability</button>
+                    </div>
+                    <ul id="saved-caps" class="debug-list"></ul>
+                  </div>
+
+                  <div class="debug-panel stack">
+                    <h3>Powerbox Match Debug</h3>
+                    <div class="field">
+                      <span class="field-label">Advertised Match Descriptors</span>
+                      <ul id="powerbox-match-debug" class="debug-list"></ul>
+                    </div>
+                  </div>
+
+                  <div class="debug-panel stack">
+                    <h3>Remote Exports</h3>
+                    <div class="field">
+                      <label class="field-label" for="remote-capability-export-select">Remote Capability Exports</label>
+                      <select id="remote-capability-export-select">
+                        <option value="">No remote capability exports loaded</option>
+                      </select>
+                    </div>
+                    <div class="button-row">
+                      <button id="import-remote-capability" class="secondary">Import Selected Capability</button>
+                    </div>
+
+                    <div class="field">
+                      <label class="field-label" for="remote-invoke-host">Invoke Active Network Capability</label>
+                      <div class="button-row">
+                        <input id="remote-invoke-host" type="text" value="neverssl.com" placeholder="Host">
+                        <input id="remote-invoke-port" type="number" value="80" min="1" max="65535" placeholder="Port">
+                        <button id="invoke-remote-ip-network" class="secondary">Invoke Active Network Capability</button>
+                      </div>
+                    </div>
+
+                    <div class="button-row">
+                      <button id="restore-imported-ip-network" class="secondary">Restore Active Network Object</button>
+                      <button id="drop-imported-ip-network" class="secondary">Forget Active Network Object</button>
+                      <button id="restore-imported-api-session" class="secondary">Restore Active API Session Object</button>
+                      <button id="drop-imported-api-session" class="secondary">Forget Active API Session Object</button>
+                    </div>
+                    <div class="field">
+                      <label class="field-label" for="remote-api-filename">Invoke Active API Session</label>
+                      <div class="button-row">
+                        <input id="remote-api-filename" type="text" value="sample.docx" placeholder="Filename">
+                        <input id="remote-api-file" type="file">
+                        <button id="invoke-remote-api-session" class="secondary">Invoke Active API Session</button>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div class="debug-panel stack">
+                    <h3>Transport Lab</h3>
+                    <div class="button-row">
+                      <button id="probe-ticket" class="secondary">Probe Connection</button>
+                    </div>
+
+                    <div class="field">
+                      <span class="field-label">HTTP Probe Target</span>
+                      <div class="button-row">
+                        <input id="network-probe-host" type="text" value="neverssl.com" placeholder="Host">
+                        <input id="network-probe-port" type="number" value="80" min="1" max="65535" placeholder="Port">
+                        <input id="network-probe-path" type="text" value="/" placeholder="Path">
+                      </div>
+                    </div>
+
+                    <div class="field">
+                      <span class="field-label">TCP Probe Target</span>
+                      <div class="button-row">
+                        <input id="tcp-probe-host" type="text" value="neverssl.com" placeholder="Host">
+                        <input id="tcp-probe-port" type="number" value="80" min="1" max="65535" placeholder="Port">
+                      </div>
+                      <textarea id="tcp-probe-payload" spellcheck="false">GET / HTTP/1.0
 Host: neverssl.com
 
 </textarea>
-              <p class="muted">Generic binary exchange target. Request and response payloads are base64-encoded so this can drive non-text experiments.</p>
-              <div class="button-row">
-                <input id="exchange-host" type="text" value="neverssl.com" placeholder="Host">
-                <input id="exchange-port" type="number" value="80" min="1" max="65535" placeholder="Port">
-              </div>
-              <textarea id="exchange-payload" spellcheck="false">R0VUIC8gSFRUUC8xLjANCkhvc3Q6IG5ldmVyc3NsLmNvbQ0KDQo=</textarea>
-              <p class="muted">UDP probe target. Payload is base64-encoded and the app waits for one return packet delivered through Sandstorm's <code>UdpPort</code> callback path.</p>
-              <div class="button-row">
-                <input id="udp-probe-host" type="text" value="1.1.1.1" placeholder="Host">
-                <input id="udp-probe-port" type="number" value="53" min="1" max="65535" placeholder="Port">
-                <input id="udp-probe-wait" type="number" value="1000" min="0" placeholder="Wait ms">
-              </div>
-              <textarea id="udp-probe-payload" spellcheck="false">AAABAAABAAAAAAAAB2V4YW1wbGUDY29tAAABAAE=</textarea>
-              <p class="muted">Stateful TCP session target and payload. Payloads use base64 so you can send partial frames without the one-shot exchange closing the stream.</p>
-              <div class="button-row">
-                <input id="session-host" type="text" value="neverssl.com" placeholder="Host">
-                <input id="session-port" type="number" value="80" min="1" max="65535" placeholder="Port">
-                <input id="session-read-max" type="number" value="4096" min="1" placeholder="Read bytes">
-                <input id="session-read-wait" type="number" value="250" min="0" placeholder="Wait ms">
-              </div>
-              <textarea id="session-payload" spellcheck="false">R0VUIC8gSFRUUC8xLjANCkhvc3Q6IG5ldmVyc3NsLmNvbQ0KDQo=</textarea>
-              <h2>Active TCP Sessions</h2>
-              <ul id="active-tcp-sessions"></ul>
+                    </div>
+
+                    <div class="field">
+                      <span class="field-label">Binary Exchange</span>
+                      <div class="button-row">
+                        <input id="exchange-host" type="text" value="neverssl.com" placeholder="Host">
+                        <input id="exchange-port" type="number" value="80" min="1" max="65535" placeholder="Port">
+                      </div>
+                      <textarea id="exchange-payload" spellcheck="false">R0VUIC8gSFRUUC8xLjANCkhvc3Q6IG5ldmVyc3NsLmNvbQ0KDQo=</textarea>
+                    </div>
+
+                    <div class="field">
+                      <span class="field-label">UDP Probe</span>
+                      <div class="button-row">
+                        <input id="udp-probe-host" type="text" value="1.1.1.1" placeholder="Host">
+                        <input id="udp-probe-port" type="number" value="53" min="1" max="65535" placeholder="Port">
+                        <input id="udp-probe-wait" type="number" value="1000" min="0" placeholder="Wait ms">
+                      </div>
+                      <textarea id="udp-probe-payload" spellcheck="false">AAABAAABAAAAAAAAB2V4YW1wbGUDY29tAAABAAE=</textarea>
+                    </div>
+
+                    <div class="field">
+                      <span class="field-label">Stateful TCP Session</span>
+                      <div class="button-row">
+                        <input id="session-host" type="text" value="neverssl.com" placeholder="Host">
+                        <input id="session-port" type="number" value="80" min="1" max="65535" placeholder="Port">
+                        <input id="session-read-max" type="number" value="4096" min="1" placeholder="Read bytes">
+                        <input id="session-read-wait" type="number" value="250" min="0" placeholder="Wait ms">
+                      </div>
+                      <textarea id="session-payload" spellcheck="false">R0VUIC8gSFRUUC8xLjANCkhvc3Q6IG5ldmVyc3NsLmNvbQ0KDQo=</textarea>
+                    </div>
+
+                    <div class="field">
+                      <span class="field-label">Active TCP Sessions</span>
+                      <ul id="active-tcp-sessions" class="debug-list"></ul>
+                    </div>
+                  </div>
+                </div>
+              </details>
             </div>
-          </details>
-        </section>
+          </section>
+        </div>
       </section>
     </main>
-    <script>
-      const statusEl = document.getElementById("status");
-      const savedCapsEl = document.getElementById("saved-caps");
-      const nodeIdEl = document.getElementById("node-id");
-      const endpointAddrsEl = document.getElementById("endpoint-addrs");
-      const endpointStatusEl = document.getElementById("endpoint-status");
-      const rawUdpInterfaceEl = document.getElementById("raw-udp-interface");
-      const transportAssessmentEl = document.getElementById("transport-assessment");
-      const customTransportPillEl = document.getElementById("custom-transport-pill");
-      const peerRpcPillEl = document.getElementById("peer-rpc-pill");
-      const localTicketEl = document.getElementById("local-ticket");
-      const remoteTicketEl = document.getElementById("remote-ticket");
-      const exportedIpNetworkEl = document.getElementById("exported-ip-network");
-      const exportedApiSessionEl = document.getElementById("exported-api-session");
-      const peerRpcStatusEl = document.getElementById("peer-rpc-status");
-      const peerRpcErrorEl = document.getElementById("peer-rpc-error");
-      const importedIpNetworkEl = document.getElementById("imported-ip-network");
-      const importedApiSessionEl = document.getElementById("imported-api-session");
-      const persistedReceivedCapsEl = document.getElementById("persisted-received-caps");
-      const restoreImportedIpNetworkButton = document.getElementById("restore-imported-ip-network");
-      const restoreImportedApiSessionButton = document.getElementById("restore-imported-api-session");
-      const dropImportedIpNetworkButton = document.getElementById("drop-imported-ip-network");
-      const dropImportedApiSessionButton = document.getElementById("drop-imported-api-session");
-      const connectPeerRpcButton = document.getElementById("connect-peer-rpc");
-      const disconnectPeerRpcButton = document.getElementById("disconnect-peer-rpc");
-      const remoteIpNetworkExportSelectEl = document.getElementById("remote-ip-network-export-select");
-      const remoteApiSessionExportSelectEl = document.getElementById("remote-api-session-export-select");
-      const importRemoteIpNetworkButton = document.getElementById("import-remote-ip-network");
-      const importRemoteApiSessionButton = document.getElementById("import-remote-api-session");
-      const remoteInvokeHostEl = document.getElementById("remote-invoke-host");
-      const remoteInvokePortEl = document.getElementById("remote-invoke-port");
-      const invokeRemoteIpNetworkButton = document.getElementById("invoke-remote-ip-network");
-      const remoteApiFilenameEl = document.getElementById("remote-api-filename");
-      const remoteApiFileEl = document.getElementById("remote-api-file");
-      const invokeRemoteApiSessionButton = document.getElementById("invoke-remote-api-session");
-      const requestButton = document.getElementById("request-cap");
-      const requestIpNetworkButton = document.getElementById("request-ip-network");
-      const requestIpInterfaceButton = document.getElementById("request-ip-interface");
-      const saveTicketButton = document.getElementById("save-ticket");
-      const clearTicketButton = document.getElementById("clear-ticket");
-      const probeTicketButton = document.getElementById("probe-ticket");
-      const networkProbeHostEl = document.getElementById("network-probe-host");
-      const networkProbePortEl = document.getElementById("network-probe-port");
-      const networkProbePathEl = document.getElementById("network-probe-path");
-      const tcpProbeHostEl = document.getElementById("tcp-probe-host");
-      const tcpProbePortEl = document.getElementById("tcp-probe-port");
-      const tcpProbePayloadEl = document.getElementById("tcp-probe-payload");
-      const exchangeHostEl = document.getElementById("exchange-host");
-      const exchangePortEl = document.getElementById("exchange-port");
-      const exchangePayloadEl = document.getElementById("exchange-payload");
-      const udpProbeHostEl = document.getElementById("udp-probe-host");
-      const udpProbePortEl = document.getElementById("udp-probe-port");
-      const udpProbeWaitEl = document.getElementById("udp-probe-wait");
-      const udpProbePayloadEl = document.getElementById("udp-probe-payload");
-      const sessionHostEl = document.getElementById("session-host");
-      const sessionPortEl = document.getElementById("session-port");
-      const sessionReadMaxEl = document.getElementById("session-read-max");
-      const sessionReadWaitEl = document.getElementById("session-read-wait");
-      const sessionPayloadEl = document.getElementById("session-payload");
-      const activeTcpSessionsEl = document.getElementById("active-tcp-sessions");
-      let powerboxQueries = {
-        apiSession: "",
-        ipNetwork: "",
-        ipInterface: "",
-      };
-      let importedRemoteIpNetworkObjectId = "";
-      let importedRemoteApiSessionObjectId = "";
 
-      function setStatus(text) {
-        statusEl.textContent = text;
-      }
-
-      function responseTextToStatus(prefix, response, body) {
-        const text = (body || "").replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
-        return `${prefix} with HTTP ${response.status}${text ? `: ${text}` : ""}`;
-      }
-
-      function previewBase64Payload(base64Value) {
-        try {
-          const text = atob(base64Value);
-          return text.split("\n").slice(0, 12).join("\n");
-        } catch {
-          return "(non-text payload)";
-        }
-      }
-
-      async function fetchWithTimeout(url, options, timeoutMs) {
-        const controller = new AbortController();
-        const timeoutId = window.setTimeout(() => controller.abort(), timeoutMs);
-        try {
-          return await fetch(url, { ...options, signal: controller.signal });
-        } finally {
-          window.clearTimeout(timeoutId);
-        }
-      }
-
-      function renderActiveTcpSessions(items) {
-        activeTcpSessionsEl.innerHTML = "";
-        if (!items.length) {
-          const item = document.createElement("li");
-          item.textContent = "None yet.";
-          activeTcpSessionsEl.appendChild(item);
-          return;
-        }
-
-        for (const entry of items) {
-          const item = document.createElement("li");
-          item.className = "saved-row";
-          const label = document.createElement("span");
-          label.innerHTML = `<code>${entry.sessionId}</code> <span class="muted">${entry.host}:${entry.port}</span> <span class="muted">buffered</span> <code>${entry.bufferedBytes}</code> <span class="muted">received</span> <code>${entry.receivedBytes}</code> <span class="muted">done</span> <code>${entry.done}</code>`;
-          item.appendChild(label);
-
-          const sendButton = document.createElement("button");
-          sendButton.textContent = "Send Chunk";
-          sendButton.disabled = !!entry.done;
-          sendButton.addEventListener("click", async () => {
-            if (entry.done) {
-              setStatus(`TCP session ${entry.sessionId} is already closed by the remote side.`);
-              return;
-            }
-            const payload = (sessionPayloadEl.value || "").trim();
-            setStatus(`Sending ${entry.sessionId} payload...`);
-            const response = await fetch("api/network/session/send", {
-              method: "POST",
-              headers: { "Content-Type": "text/plain" },
-              body: `${entry.sessionId}\n${payload}`,
-            });
-
-            if (!response.ok) {
-              const body = await response.text();
-              const text = body.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
-              setStatus(`TCP session send failed with HTTP ${response.status}: ${text}`);
-              return;
-            }
-
-            const result = await response.json();
-            setStatus(`TCP session ${result.sessionId} sent ${result.bytesSent} bytes [${result.trace}]`);
-            await refreshState();
-          });
-          item.appendChild(sendButton);
-
-          const receiveButton = document.createElement("button");
-          receiveButton.textContent = "Read Chunk";
-          receiveButton.addEventListener("click", async () => {
-            const maxBytes = (sessionReadMaxEl.value || "").trim() || "4096";
-            const waitMs = (sessionReadWaitEl.value || "").trim() || "250";
-            setStatus(`Reading ${entry.sessionId}...`);
-            const response = await fetch("api/network/session/receive", {
-              method: "POST",
-              headers: { "Content-Type": "text/plain" },
-              body: `${entry.sessionId}\n${maxBytes}\n${waitMs}`,
-            });
-
-            if (!response.ok) {
-              const body = await response.text();
-              const text = body.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
-              setStatus(`TCP session receive failed with HTTP ${response.status}: ${text}`);
-              return;
-            }
-
-            const result = await response.json();
-            const preview = previewBase64Payload(result.responseBase64);
-            setStatus(`TCP session ${result.sessionId} read ${result.responseByteCount} bytes: ${preview} [${result.trace}]`);
-            await refreshState();
-          });
-          item.appendChild(receiveButton);
-
-          const closeButton = document.createElement("button");
-          closeButton.textContent = "Close Session";
-          closeButton.addEventListener("click", async () => {
-            setStatus(`Closing ${entry.sessionId}...`);
-            const response = await fetch("api/network/session/close", {
-              method: "POST",
-              headers: { "Content-Type": "text/plain" },
-              body: entry.sessionId,
-            });
-
-            if (!response.ok) {
-              const body = await response.text();
-              const text = body.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
-              setStatus(`TCP session close failed with HTTP ${response.status}: ${text}`);
-              return;
-            }
-
-            const result = await response.json();
-            setStatus(`TCP session ${result.sessionId} closed [${result.trace}]`);
-            await refreshState();
-          });
-          item.appendChild(closeButton);
-
-          activeTcpSessionsEl.appendChild(item);
-        }
-      }
-
-      function renderSavedCaps(items, rawUdpInterface) {
-        savedCapsEl.innerHTML = "";
-        if (!items.length) {
-          const item = document.createElement("li");
-          item.textContent = "None yet.";
-          savedCapsEl.appendChild(item);
-          return;
-        }
-
-        for (const entry of items) {
-          const item = document.createElement("li");
-          item.className = "saved-row";
-          const label = document.createElement("span");
-          label.innerHTML = `${entry.label}: <code>${entry.savedToken}</code> <span class="muted">object</span> <code>${entry.objectId || entry.id}</code>`;
-          item.appendChild(label);
-
-          const isConfiguredRawUdp =
-            rawUdpInterface && rawUdpInterface.savedToken === entry.savedToken;
-
-          const bindButton = document.createElement("button");
-          bindButton.textContent = isConfiguredRawUdp ? "RawUdp Active" : "Use for RawUdp";
-          bindButton.disabled = !!isConfiguredRawUdp;
-          bindButton.addEventListener("click", async () => {
-            setStatus(`Configuring RawUdp bind with ${entry.savedToken}...`);
-            const response = await fetch("api/endpoint/raw-udp-interface", {
-              method: "POST",
-              headers: { "Content-Type": "text/plain" },
-              body: entry.savedToken,
-            });
-
-            if (!response.ok) {
-              const body = await response.text();
-              const text = body.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
-              setStatus(`RawUdp bind update failed with HTTP ${response.status}: ${text}`);
-              return;
-            }
-
-            setStatus(`RawUdp bind configured from ${entry.label}.`);
-            await refreshState();
-          });
-          item.appendChild(bindButton);
-
-          const exportButton = document.createElement("button");
-          exportButton.textContent = "Export as IpNetwork";
-          exportButton.title = "Requires this saved capability to actually implement IpNetwork.";
-          exportButton.addEventListener("click", async () => {
-            setStatus(`Configuring exported IpNetwork from ${entry.label}...`);
-            const response = await fetch("api/tunnel/exported-ip-network", {
-              method: "POST",
-              headers: { "Content-Type": "text/plain" },
-              body: entry.objectId || entry.id,
-            });
-
-            if (!response.ok) {
-              const body = await response.text();
-              setStatus(responseTextToStatus("Export configuration failed", response, body));
-              return;
-            }
-
-            setStatus(`Exported IpNetwork set to ${entry.label}.`);
-            await refreshState();
-          });
-          item.appendChild(exportButton);
-
-          const exportApiSessionButton = document.createElement("button");
-          exportApiSessionButton.textContent = "Export as HTTP API";
-          exportApiSessionButton.title = "Use this when the saved capability is a Sandstorm ApiSession HTTP bridge.";
-          exportApiSessionButton.addEventListener("click", async () => {
-            setStatus(`Configuring exported ApiSession from ${entry.label}...`);
-            const response = await fetch("api/tunnel/exported-api-session", {
-              method: "POST",
-              headers: { "Content-Type": "text/plain" },
-              body: entry.objectId || entry.id,
-            });
-
-            if (!response.ok) {
-              const body = await response.text();
-              setStatus(responseTextToStatus("HTTP API export configuration failed", response, body));
-              return;
-            }
-
-            setStatus(`Exported ApiSession set to ${entry.label}.`);
-            await refreshState();
-          });
-          item.appendChild(exportApiSessionButton);
-
-          const advanced = document.createElement("details");
-          advanced.className = "advanced";
-          const summary = document.createElement("summary");
-          summary.textContent = "Advanced capability actions";
-          advanced.appendChild(summary);
-
-          const advancedRow = document.createElement("div");
-          advancedRow.className = "button-row";
-
-          const button = document.createElement("button");
-          button.textContent = "Restore Probe";
-          button.addEventListener("click", async () => {
-            setStatus(`Restoring ${entry.savedToken}...`);
-            const response = await fetch("api/saved-cap/restore", {
-              method: "PUT",
-              headers: { "Content-Type": "text/plain" },
-              body: entry.savedToken,
-            });
-
-            if (response.ok) {
-              setStatus(`Restore succeeded for ${entry.savedToken}`);
-            } else {
-              setStatus(`Restore failed with HTTP ${response.status}`);
-            }
-          });
-          advancedRow.appendChild(button);
-
-          const objectButton = document.createElement("button");
-          objectButton.textContent = "Object Probe";
-          objectButton.addEventListener("click", async () => {
-            const objectId = entry.objectId || entry.id;
-            setStatus(`Resolving object ${objectId}...`);
-            const response = await fetch("api/saved-cap/resolve-object", {
-              method: "PUT",
-              headers: { "Content-Type": "text/plain" },
-              body: objectId,
-            });
-
-            if (response.ok) {
-              setStatus(`Object restore succeeded for ${objectId}`);
-            } else {
-              setStatus(`Object restore failed with HTTP ${response.status}`);
-            }
-          });
-          advancedRow.appendChild(objectButton);
-
-          const networkButton = document.createElement("button");
-          networkButton.textContent = "IP Network Probe";
-          networkButton.addEventListener("click", async () => {
-            const host = (networkProbeHostEl.value || "").trim() || "neverssl.com";
-            const port = (networkProbePortEl.value || "").trim() || "80";
-            const path = (networkProbePathEl.value || "").trim() || "/";
-            setStatus(`Running IP network probe for ${entry.savedToken} to ${host}:${port}${path}...`);
-            const response = await fetch("api/network/http-probe", {
-              method: "POST",
-              headers: { "Content-Type": "text/plain" },
-              body: `${entry.savedToken}\n${host}\n${port}\n${path}`,
-            });
-
-            if (!response.ok) {
-              const body = await response.text();
-              const text = body.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
-              setStatus(`IP network probe failed with HTTP ${response.status}: ${text}`);
-              return;
-            }
-
-            const result = await response.json();
-            setStatus(`IP network probe to ${result.host}:${result.port}${result.path} succeeded: ${result.responsePreview} [${result.trace}]`);
-          });
-          advancedRow.appendChild(networkButton);
-
-          const tcpButton = document.createElement("button");
-          tcpButton.textContent = "TCP Byte Probe";
-          tcpButton.addEventListener("click", async () => {
-            const host = (tcpProbeHostEl.value || "").trim() || "neverssl.com";
-            const port = (tcpProbePortEl.value || "").trim() || "80";
-            const payload = tcpProbePayloadEl.value || "";
-            setStatus(`Running TCP byte probe for ${entry.savedToken} to ${host}:${port}...`);
-            const response = await fetch("api/network/tcp-probe", {
-              method: "POST",
-              headers: { "Content-Type": "text/plain" },
-              body: `${entry.savedToken}\n${host}\n${port}\n\n${payload}`,
-            });
-
-            if (!response.ok) {
-              const body = await response.text();
-              const text = body.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
-              setStatus(`TCP byte probe failed with HTTP ${response.status}: ${text}`);
-              return;
-            }
-
-            const result = await response.json();
-            setStatus(`TCP byte probe to ${result.host}:${result.port} returned ${result.responseByteCount} bytes: ${result.responsePreview} [${result.trace}]`);
-          });
-          advancedRow.appendChild(tcpButton);
-
-          const exchangeButton = document.createElement("button");
-          exchangeButton.textContent = "Binary Exchange";
-          exchangeButton.addEventListener("click", async () => {
-            const host = (exchangeHostEl.value || "").trim() || "neverssl.com";
-            const port = (exchangePortEl.value || "").trim() || "80";
-            const payload = (exchangePayloadEl.value || "").trim();
-            setStatus(`Running binary exchange for ${entry.savedToken} to ${host}:${port}...`);
-            const response = await fetch("api/network/exchange", {
-              method: "POST",
-              headers: { "Content-Type": "text/plain" },
-              body: `${entry.savedToken}\n${host}\n${port}\n${payload}`,
-            });
-
-            if (!response.ok) {
-              const body = await response.text();
-              const text = body.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
-              setStatus(`Binary exchange failed with HTTP ${response.status}: ${text}`);
-              return;
-            }
-
-            const result = await response.json();
-            const preview = previewBase64Payload(result.responseBase64);
-            setStatus(`Binary exchange to ${result.host}:${result.port} returned ${result.responseByteCount} bytes: ${preview} [${result.trace}]`);
-          });
-          advancedRow.appendChild(exchangeButton);
-
-          const udpButton = document.createElement("button");
-          udpButton.textContent = "UDP Probe";
-          udpButton.addEventListener("click", async () => {
-            const host = (udpProbeHostEl.value || "").trim() || "1.1.1.1";
-            const port = (udpProbePortEl.value || "").trim() || "53";
-            const waitMs = (udpProbeWaitEl.value || "").trim() || "1000";
-            const payload = (udpProbePayloadEl.value || "").trim();
-            setStatus(`Running UDP probe for ${entry.savedToken} to ${host}:${port}...`);
-            let response;
-            try {
-              response = await fetchWithTimeout("api/network/udp-probe", {
-                method: "POST",
-                headers: { "Content-Type": "text/plain" },
-                body: `${entry.savedToken}\n${host}\n${port}\n${payload}\n${waitMs}`,
-              }, Number(waitMs) + 4000);
-            } catch (error) {
-              if (error.name === "AbortError") {
-                setStatus(`UDP probe client timeout after ${Number(waitMs) + 4000}ms`);
-                return;
-              }
-              setStatus(`UDP probe request failed: ${error}`);
-              return;
-            }
-
-            if (!response.ok) {
-              const body = await response.text();
-              const text = body.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
-              setStatus(`UDP probe failed with HTTP ${response.status}: ${text}`);
-              return;
-            }
-
-            let result;
-            try {
-              result = await response.json();
-            } catch (error) {
-              const body = await response.text().catch(() => "");
-              setStatus(`UDP probe JSON parse failed: ${error} ${body}`.trim());
-              return;
-            }
-            const preview = previewBase64Payload(result.responseBase64);
-            setStatus(`UDP probe to ${result.host}:${result.port} returned ${result.responseByteCount} bytes in ${result.responsePacketCount} packet(s): ${preview} [${result.trace}]`);
-          });
-          advancedRow.appendChild(udpButton);
-
-          const sessionButton = document.createElement("button");
-          sessionButton.textContent = "Open TCP Session";
-          sessionButton.addEventListener("click", async () => {
-            const host = (sessionHostEl.value || "").trim() || "neverssl.com";
-            const port = (sessionPortEl.value || "").trim() || "80";
-            setStatus(`Opening TCP session for ${entry.savedToken} to ${host}:${port}...`);
-            const response = await fetch("api/network/session/open", {
-              method: "POST",
-              headers: { "Content-Type": "text/plain" },
-              body: `${entry.savedToken}\n${host}\n${port}`,
-            });
-
-            if (!response.ok) {
-              const body = await response.text();
-              const text = body.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
-              setStatus(`TCP session open failed with HTTP ${response.status}: ${text}`);
-              return;
-            }
-
-            const result = await response.json();
-            setStatus(`Opened TCP session ${result.sessionId} to ${result.host}:${result.port} [${result.trace}]`);
-            await refreshState();
-          });
-          advancedRow.appendChild(sessionButton);
-
-          advanced.appendChild(advancedRow);
-          item.appendChild(advanced);
-
-          if (isConfiguredRawUdp) {
-            const clearBindButton = document.createElement("button");
-            clearBindButton.textContent = "Clear RawUdp";
-            clearBindButton.addEventListener("click", async () => {
-              setStatus("Clearing RawUdp bind configuration...");
-              const response = await fetch("api/endpoint/raw-udp-interface", {
-                method: "PUT",
-              });
-
-              if (!response.ok) {
-                const body = await response.text();
-                const text = body.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
-                setStatus(`RawUdp bind clear failed with HTTP ${response.status}: ${text}`);
-                return;
-              }
-
-              setStatus("RawUdp bind configuration cleared.");
-              await refreshState();
-            });
-            item.appendChild(clearBindButton);
-          }
-          savedCapsEl.appendChild(item);
-        }
-      }
-
-      function renderRemoteExports(selectEl, exports, emptyText) {
-        selectEl.innerHTML = "";
-        if (!exports.length) {
-          const option = document.createElement("option");
-          option.value = "";
-          option.textContent = emptyText;
-          selectEl.appendChild(option);
-          return;
-        }
-
-        for (const entry of exports) {
-          const option = document.createElement("option");
-          option.value = entry.id;
-          option.textContent = `${entry.label} (${entry.id})`;
-          selectEl.appendChild(option);
-        }
-      }
-
-      function renderPersistedReceivedCaps(items) {
-        if (!items || !items.length) {
-          persistedReceivedCapsEl.textContent = "none";
-          return;
-        }
-
-        persistedReceivedCapsEl.textContent = items
-          .map((entry) => `${entry.kind} ${entry.objectId} (${entry.label})`)
-          .join(" | ");
-      }
-
-      async function refreshState() {
-        const response = await fetch("api/state");
-        const data = await response.json();
-        nodeIdEl.textContent = data.irohNodeId || "unavailable";
-        powerboxQueries = data.powerboxQueries || powerboxQueries;
-        const endpoint = data.irohEndpoint || {};
-        const directAddrs = endpoint.directAddrs || [];
-        const customAddrs = endpoint.customAddrs || [];
-        const hasCustomTicket = (endpoint.localTicket || "").split("\n").some((line) => line.startsWith("custom:"));
-        endpointAddrsEl.textContent = [...directAddrs, ...customAddrs].length
-          ? [...directAddrs, ...customAddrs].join(", ")
-          : "none";
-        endpointStatusEl.textContent = endpoint.error || (endpoint.bound ? "bound (relay disabled)" : "not bound");
-        rawUdpInterfaceEl.textContent = endpoint.rawUdpInterface
-          ? `${endpoint.rawUdpInterface.label} [${endpoint.rawUdpInterface.source}]`
-          : "not configured";
-        customTransportPillEl.textContent = hasCustomTicket ? "Custom Transport Ready" : "Custom Transport Missing";
-        transportAssessmentEl.textContent = data.transportAssessment || "unavailable";
-        localTicketEl.value = endpoint.localTicket || "";
-        remoteTicketEl.value = data.remoteTicket || "";
-        exportedIpNetworkEl.textContent = data.exportedIpNetwork
-          ? `${data.exportedIpNetwork.label} (${data.exportedIpNetwork.id})`
-          : "not configured";
-        exportedApiSessionEl.textContent = data.exportedApiSession
-          ? `${data.exportedApiSession.label} (${data.exportedApiSession.id})`
-          : "not configured";
-        const peerRpc = data.peerRpc || { connected: false, ipNetworkExports: [], apiSessionExports: [] };
-        peerRpcPillEl.textContent = peerRpc.connected ? "Peer RPC Connected" : "Peer RPC Disconnected";
-        peerRpcStatusEl.textContent = peerRpc.connected
-          ? `connected to ${peerRpc.remoteNodeId} [session ${peerRpc.sessionId}]`
-          : "not connected";
-        peerRpcErrorEl.textContent = data.peerRpcError || "none";
-        renderPersistedReceivedCaps(data.persistedReceivedCaps || []);
-        importedRemoteIpNetworkObjectId = data.importedRemoteIpNetwork
-          ? (data.importedRemoteIpNetwork.objectId || "")
-          : "";
-        importedIpNetworkEl.textContent = data.importedRemoteIpNetwork
-          ? `${data.importedRemoteIpNetwork.label} (${data.importedRemoteIpNetwork.exportId}) object ${data.importedRemoteIpNetwork.objectId}`
-          : "none";
-        importedRemoteApiSessionObjectId = data.importedRemoteApiSession
-          ? (data.importedRemoteApiSession.objectId || "")
-          : "";
-        importedApiSessionEl.textContent = data.importedRemoteApiSession
-          ? `${data.importedRemoteApiSession.label} (${data.importedRemoteApiSession.exportId}) object ${data.importedRemoteApiSession.objectId}`
-          : "none";
-        renderRemoteExports(
-          remoteIpNetworkExportSelectEl,
-          peerRpc.ipNetworkExports || [],
-          "No remote IpNetwork exports loaded"
-        );
-        renderRemoteExports(
-          remoteApiSessionExportSelectEl,
-          peerRpc.apiSessionExports || [],
-          "No remote ApiSession exports loaded"
-        );
-        renderSavedCaps(data.savedCaps || [], endpoint.rawUdpInterface || null);
-        renderActiveTcpSessions(data.activeTcpSessions || []);
-      }
-
-      saveTicketButton.addEventListener("click", async () => {
-        setStatus("Saving remote ticket...");
-        const response = await fetch("api/pairing/remote-ticket", {
-          method: "POST",
-          headers: { "Content-Type": "text/plain" },
-          body: remoteTicketEl.value,
-        });
-        if (!response.ok) {
-          setStatus(`Remote ticket save failed with HTTP ${response.status}`);
-          return;
-        }
-        setStatus("Remote ticket saved.");
-        await refreshState();
-      });
-
-      clearTicketButton.addEventListener("click", async () => {
-        setStatus("Clearing remote ticket...");
-        const response = await fetch("api/pairing/remote-ticket", {
-          method: "PUT",
-        });
-        if (!response.ok) {
-          setStatus(`Remote ticket clear failed with HTTP ${response.status}`);
-          return;
-        }
-        setStatus("Remote ticket cleared.");
-        await refreshState();
-      });
-
-      probeTicketButton.addEventListener("click", async () => {
-        setStatus("Probing remote connection...");
-        const response = await fetch("api/pairing/probe-connect", {
-          method: "POST",
-        });
-        if (!response.ok) {
-          const body = await response.text();
-          const text = body.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
-          setStatus(`Probe failed with HTTP ${response.status}: ${text}`);
-          return;
-        }
-        const result = await response.json();
-        setStatus(`Probe succeeded with ${result.remoteNodeId}: ${result.response}`);
-      });
-
-      connectPeerRpcButton.addEventListener("click", async () => {
-        setStatus("Connecting peer RPC session...");
-        const response = await fetch("api/tunnel/rpc/connect", {
-          method: "POST",
-        });
-        if (!response.ok) {
-          const body = await response.text();
-          setStatus(responseTextToStatus("Peer RPC connect failed", response, body));
-          return;
-        }
-        const result = await response.json();
-        const ipCount = (result.ipNetworkExports || []).length;
-        const apiCount = (result.apiSessionExports || []).length;
-        setStatus(`Peer RPC connected with ${ipCount} remote IpNetwork export(s) and ${apiCount} remote ApiSession export(s).`);
-        await refreshState();
-      });
-
-      disconnectPeerRpcButton.addEventListener("click", async () => {
-        setStatus("Disconnecting peer RPC session...");
-        const response = await fetch("api/tunnel/rpc/disconnect", {
-          method: "POST",
-        });
-        if (!response.ok) {
-          const body = await response.text();
-          setStatus(responseTextToStatus("Peer RPC disconnect failed", response, body));
-          return;
-        }
-        setStatus("Peer RPC disconnected.");
-        await refreshState();
-      });
-
-      importRemoteIpNetworkButton.addEventListener("click", async () => {
-        const exportId = remoteIpNetworkExportSelectEl.value;
-        if (!exportId) {
-          setStatus("Select a remote IpNetwork export first.");
-          return;
-        }
-        setStatus(`Importing remote IpNetwork ${exportId}...`);
-        const response = await fetch("api/tunnel/rpc/import-ip-network", {
-          method: "POST",
-          headers: { "Content-Type": "text/plain" },
-          body: exportId,
-        });
-        if (!response.ok) {
-          const body = await response.text();
-          setStatus(responseTextToStatus("Remote IpNetwork import failed", response, body));
-          return;
-        }
-        const result = await response.json();
-        setStatus(`Imported remote IpNetwork ${result.label} as object ${result.objectId}.`);
-        await refreshState();
-      });
-
-      importRemoteApiSessionButton.addEventListener("click", async () => {
-        const exportId = remoteApiSessionExportSelectEl.value;
-        if (!exportId) {
-          setStatus("Select a remote ApiSession export first.");
-          return;
-        }
-        setStatus(`Importing remote ApiSession ${exportId}...`);
-        const response = await fetch("api/tunnel/rpc/import-api-session", {
-          method: "POST",
-          headers: { "Content-Type": "text/plain" },
-          body: exportId,
-        });
-        if (!response.ok) {
-          const body = await response.text();
-          setStatus(responseTextToStatus("Remote ApiSession import failed", response, body));
-          return;
-        }
-        const result = await response.json();
-        setStatus(`Imported remote ApiSession ${result.label} as object ${result.objectId}.`);
-        await refreshState();
-      });
-
-      invokeRemoteIpNetworkButton.addEventListener("click", async () => {
-        const host = (remoteInvokeHostEl.value || "").trim() || "neverssl.com";
-        const port = (remoteInvokePortEl.value || "").trim() || "80";
-        setStatus(`Invoking imported remote IpNetwork for ${host}:${port}...`);
-        const response = await fetch("api/tunnel/rpc/invoke-ip-network", {
-          method: "POST",
-          headers: { "Content-Type": "text/plain" },
-          body: `${host}\n${port}`,
-        });
-        if (!response.ok) {
-          const body = await response.text();
-          setStatus(responseTextToStatus("Remote IpNetwork invoke failed", response, body));
-          return;
-        }
-        const result = await response.json();
-        setStatus(`Remote IpNetwork invocation succeeded for ${result.host}:${result.port}: ${result.responsePreview} [${result.trace}]`);
-        await refreshState();
-      });
-
-      invokeRemoteApiSessionButton.addEventListener("click", async () => {
-        const file = remoteApiFileEl.files && remoteApiFileEl.files[0];
-        if (!file) {
-          setStatus("Choose a file to send to the imported ApiSession first.");
-          return;
-        }
-        const filename = (remoteApiFilenameEl.value || "").trim() || file.name || "upload.bin";
-        setStatus(`Invoking imported ApiSession with ${filename}...`);
-        const response = await fetch("api/tunnel/rpc/invoke-api-session", {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/octet-stream",
-            "x-sandstorm-app-filename": filename,
-          },
-          body: await file.arrayBuffer(),
-        });
-        if (!response.ok) {
-          const body = await response.text();
-          setStatus(responseTextToStatus("Remote ApiSession invoke failed", response, body));
-          return;
-        }
-        const result = await response.json();
-        const preview = result.responsePreview || previewBase64Payload(result.responsePreviewBase64 || "");
-        setStatus(`Remote ApiSession invocation succeeded with HTTP ${result.status} ${result.contentType || ""}: ${preview} [${result.trace}]`);
-        await refreshState();
-      });
-
-      restoreImportedIpNetworkButton.addEventListener("click", async () => {
-        if (!importedRemoteIpNetworkObjectId) {
-          setStatus("No imported remote IpNetwork object is loaded.");
-          return;
-        }
-        setStatus(`Resolving imported remote IpNetwork object ${importedRemoteIpNetworkObjectId}...`);
-        const response = await fetch("api/saved-cap/resolve-object", {
-          method: "PUT",
-          headers: { "Content-Type": "text/plain" },
-          body: importedRemoteIpNetworkObjectId,
-        });
-
-        if (response.ok) {
-          setStatus(`Imported remote IpNetwork object restore succeeded for ${importedRemoteIpNetworkObjectId}`);
-        } else {
-          const body = await response.text();
-          setStatus(responseTextToStatus("Imported remote IpNetwork object restore failed", response, body));
-        }
-      });
-
-      restoreImportedApiSessionButton.addEventListener("click", async () => {
-        if (!importedRemoteApiSessionObjectId) {
-          setStatus("No imported remote ApiSession object is loaded.");
-          return;
-        }
-        setStatus(`Resolving imported remote ApiSession object ${importedRemoteApiSessionObjectId}...`);
-        const response = await fetch("api/saved-cap/resolve-object", {
-          method: "PUT",
-          headers: { "Content-Type": "text/plain" },
-          body: importedRemoteApiSessionObjectId,
-        });
-
-        if (response.ok) {
-          setStatus(`Imported remote ApiSession object restore succeeded for ${importedRemoteApiSessionObjectId}`);
-        } else {
-          const body = await response.text();
-          setStatus(responseTextToStatus("Imported remote ApiSession object restore failed", response, body));
-        }
-      });
-
-      dropImportedIpNetworkButton.addEventListener("click", async () => {
-        if (!importedRemoteIpNetworkObjectId) {
-          setStatus("No imported remote IpNetwork object is loaded.");
-          return;
-        }
-        setStatus(`Dropping imported remote IpNetwork object ${importedRemoteIpNetworkObjectId}...`);
-        const response = await fetch("api/saved-cap/drop-object", {
-          method: "PUT",
-          headers: { "Content-Type": "text/plain" },
-          body: importedRemoteIpNetworkObjectId,
-        });
-
-        if (response.ok) {
-          setStatus(`Imported remote IpNetwork object dropped: ${importedRemoteIpNetworkObjectId}`);
-          await refreshState();
-        } else {
-          const body = await response.text();
-          setStatus(responseTextToStatus("Imported remote IpNetwork object drop failed", response, body));
-        }
-      });
-
-      dropImportedApiSessionButton.addEventListener("click", async () => {
-        if (!importedRemoteApiSessionObjectId) {
-          setStatus("No imported remote ApiSession object is loaded.");
-          return;
-        }
-        setStatus(`Dropping imported remote ApiSession object ${importedRemoteApiSessionObjectId}...`);
-        const response = await fetch("api/saved-cap/drop-object", {
-          method: "PUT",
-          headers: { "Content-Type": "text/plain" },
-          body: importedRemoteApiSessionObjectId,
-        });
-
-        if (response.ok) {
-          setStatus(`Imported remote ApiSession object dropped: ${importedRemoteApiSessionObjectId}`);
-          await refreshState();
-        } else {
-          const body = await response.text();
-          setStatus(responseTextToStatus("Imported remote ApiSession object drop failed", response, body));
-        }
-      });
-
-      function requestPowerboxCapability(query, saveLabel) {
-        const rpcId = `iroh-tunnel-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-        setStatus("Waiting for Powerbox selection...");
-
-        const onMessage = async (event) => {
-          const message = event.data || {};
-          if (message.rpcId !== rpcId) return;
-          window.removeEventListener("message", onMessage, false);
-
-          if (message.error) {
-            setStatus(`Powerbox error: ${message.error}`);
-            return;
-          }
-
-          if (!message.token) {
-            setStatus("Powerbox returned no token.");
-            return;
-          }
-
-          setStatus("Claiming and saving capability...");
-          const claimResponse = await fetch("api/powerbox/claim", {
-            method: "POST",
-            headers: { "Content-Type": "text/plain" },
-            body: `${message.token}\n${saveLabel}`,
-          });
-
-          if (!claimResponse.ok) {
-            setStatus(`Claim failed with HTTP ${claimResponse.status}.`);
-            return;
-          }
-
-          const result = await claimResponse.json();
-          if (!result.ok) {
-            setStatus("Claim failed.");
-            return;
-          }
-
-          setStatus(`Saved capability token: ${result.savedToken}`);
-          await refreshState();
-        };
-
-        window.addEventListener("message", onMessage, false);
-        window.parent.postMessage({
-          powerboxRequest: {
-            rpcId,
-            query: [query],
-            saveLabel: { defaultText: saveLabel }
-          }
-        }, "*");
-      }
-
-      requestButton.addEventListener("click", () => {
-        if (!powerboxQueries.apiSession) {
-          setStatus("ApiSession query is not loaded yet.");
-          return;
-        }
-        requestPowerboxCapability(powerboxQueries.apiSession, "Powerbox capability");
-      });
-
-      requestIpNetworkButton.addEventListener("click", () => {
-        if (!powerboxQueries.ipNetwork) {
-          setStatus("IpNetwork query is not loaded yet.");
-          return;
-        }
-        requestPowerboxCapability(powerboxQueries.ipNetwork, "IpNetwork capability");
-      });
-
-      requestIpInterfaceButton.addEventListener("click", () => {
-        if (!powerboxQueries.ipInterface) {
-          setStatus("IpInterface query is not loaded yet.");
-          return;
-        }
-        requestPowerboxCapability(powerboxQueries.ipInterface, "IpInterface capability");
-      });
-
-      refreshState().catch((error) => {
-        setStatus(`Failed to load saved capabilities: ${error}`);
-      });
-    </script>
+    <script type="module" src="./app.js"></script>
   </body>
 </html>

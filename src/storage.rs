@@ -8,12 +8,14 @@ pub struct SavedCapabilityRecord {
     pub label: String,
     pub saved_token: String,
     pub created_at_ms: u64,
+    pub descriptor_json: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReceivedCapabilityKind {
     IpNetwork,
     ApiSession,
+    Other,
 }
 
 impl ReceivedCapabilityKind {
@@ -21,6 +23,7 @@ impl ReceivedCapabilityKind {
         match self {
             Self::IpNetwork => "IpNetwork",
             Self::ApiSession => "ApiSession",
+            Self::Other => "Other",
         }
     }
 
@@ -28,9 +31,48 @@ impl ReceivedCapabilityKind {
         match value {
             "IpNetwork" => Some(Self::IpNetwork),
             "ApiSession" => Some(Self::ApiSession),
+            "Other" => Some(Self::Other),
             _ => None,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SharedCapabilityKind {
+    IpNetwork,
+    ApiSession,
+    Other,
+}
+
+impl SharedCapabilityKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::IpNetwork => "IpNetwork",
+            Self::ApiSession => "ApiSession",
+            Self::Other => "Other",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "IpNetwork" => Some(Self::IpNetwork),
+            "ApiSession" => Some(Self::ApiSession),
+            "Other" => Some(Self::Other),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct SharedCapabilityRecord {
+    pub id: String,
+    pub saved_cap_id: String,
+    pub label: String,
+    pub kind: SharedCapabilityKind,
+    pub type_tag: Option<String>,
+    pub enabled: bool,
+    pub created_at_ms: u64,
+    pub descriptor_json: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -39,6 +81,9 @@ pub struct PersistedReceivedCapabilityRecord {
     pub export_id: String,
     pub label: String,
     pub kind: ReceivedCapabilityKind,
+    pub type_tag: Option<String>,
+    pub descriptor_json: Option<String>,
+    pub enabled: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -53,6 +98,10 @@ impl Storage {
 
     pub fn saved_caps_path(&self) -> PathBuf {
         self.root.join("saved-caps.tsv")
+    }
+
+    pub fn shared_caps_path(&self) -> PathBuf {
+        self.root.join("shared-caps.tsv")
     }
 
     pub fn received_caps_path(&self) -> PathBuf {
@@ -83,6 +132,14 @@ impl Storage {
         self.root.join("remote-ticket.txt")
     }
 
+    pub fn approved_peer_node_id_path(&self) -> PathBuf {
+        self.root.join("approved-peer-node-id")
+    }
+
+    pub fn tunnel_enabled_path(&self) -> PathBuf {
+        self.root.join("tunnel-enabled")
+    }
+
     pub fn ensure_root(&self) -> Result<(), String> {
         std::fs::create_dir_all(&self.root)
             .map_err(|err| format!("failed to create state directory {}: {err}", self.root.display()))
@@ -107,10 +164,87 @@ impl Storage {
                     label: parts[1].to_string(),
                     saved_token: parts[2].to_string(),
                     created_at_ms: parts[3].parse().unwrap_or(0),
+                    descriptor_json: parts.get(4).map(|value| value.to_string()).filter(|value| !value.is_empty()),
                 });
             }
         }
         Ok(rows)
+    }
+
+    pub fn load_shared_capabilities(&self) -> Result<Vec<SharedCapabilityRecord>, String> {
+        let contents = match std::fs::read_to_string(self.shared_caps_path()) {
+            Ok(contents) => contents,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(err) => return Err(format!("failed to read shared capability registry: {err}")),
+        };
+
+        let mut rows = Vec::new();
+        for line in contents.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let parts: Vec<_> = line.split('\t').collect();
+            if parts.len() < 6 {
+                continue;
+            }
+            let Some(kind) = SharedCapabilityKind::parse(parts[3]) else {
+                continue;
+            };
+            rows.push(SharedCapabilityRecord {
+                id: parts[0].to_string(),
+                saved_cap_id: parts[1].to_string(),
+                label: parts[2].to_string(),
+                kind,
+                type_tag: parts
+                    .get(6)
+                    .map(|value| value.to_string())
+                    .filter(|value| !value.is_empty()),
+                enabled: parts[4] == "true",
+                created_at_ms: parts[5].parse().unwrap_or(0),
+                descriptor_json: parts
+                    .get(7)
+                    .map(|value| value.to_string())
+                    .filter(|value| !value.is_empty())
+                    .or_else(|| {
+                        parts.get(6).and_then(|value| {
+                            if value.starts_with('{') || value.starts_with('[') || value.starts_with('"') {
+                                Some((*value).to_string())
+                            } else {
+                                None
+                            }
+                        })
+                    }),
+            });
+        }
+        Ok(rows)
+    }
+
+    pub fn persist_shared_capabilities(
+        &self,
+        records: &[SharedCapabilityRecord],
+    ) -> Result<(), String> {
+        self.ensure_root()?;
+        let mut rows = Vec::new();
+        for record in records {
+            rows.push(format!(
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                record.id,
+                record.saved_cap_id,
+                record.label,
+                record.kind.as_str(),
+                if record.enabled { "true" } else { "false" },
+                record.created_at_ms,
+                record.type_tag.as_deref().unwrap_or(""),
+                record.descriptor_json.as_deref().unwrap_or("")
+            ));
+        }
+        let body = if rows.is_empty() {
+            String::new()
+        } else {
+            format!("{}\n", rows.join("\n"))
+        };
+        std::fs::write(self.shared_caps_path(), body)
+            .map_err(|err| format!("failed to persist shared capability registry: {err}"))
     }
 
     pub fn persist_saved_capability(&self, record: &SavedCapabilityRecord) -> Result<(), String> {
@@ -122,29 +256,26 @@ impl Storage {
             .map_err(|err| format!("failed to open saved capability registry: {err}"))?;
         writeln!(
             file,
-            "{}\t{}\t{}\t{}",
-            record.id, record.label, record.saved_token, record.created_at_ms
+            "{}\t{}\t{}\t{}\t{}",
+            record.id,
+            record.label,
+            record.saved_token,
+            record.created_at_ms,
+            record.descriptor_json.as_deref().unwrap_or("")
         )
         .map_err(|err| format!("failed to persist saved capability: {err}"))
     }
 
     pub fn load_persisted_received_capabilities(
         &self,
-    ) -> Result<
-        (
-            Option<PersistedReceivedCapabilityRecord>,
-            Option<PersistedReceivedCapabilityRecord>,
-        ),
-        String,
-    > {
+    ) -> Result<Vec<PersistedReceivedCapabilityRecord>, String> {
         let contents = match std::fs::read_to_string(self.received_caps_path()) {
             Ok(contents) => contents,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok((None, None)),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(err) => return Err(format!("failed to read received capability registry: {err}")),
         };
 
-        let mut ip_network = None;
-        let mut api_session = None;
+        let mut rows = Vec::new();
         for line in contents.lines() {
             if line.trim().is_empty() {
                 continue;
@@ -161,29 +292,37 @@ impl Storage {
                 export_id: parts[2].to_string(),
                 label: parts[3].to_string(),
                 kind,
+                type_tag: parts
+                    .get(5)
+                    .map(|value| value.to_string())
+                    .filter(|value| !value.is_empty()),
+                descriptor_json: parts
+                    .get(6)
+                    .map(|value| value.to_string())
+                    .filter(|value| !value.is_empty()),
+                enabled: parts.get(4).map(|value| *value != "false").unwrap_or(true),
             };
-            match kind {
-                ReceivedCapabilityKind::IpNetwork => ip_network = Some(record),
-                ReceivedCapabilityKind::ApiSession => api_session = Some(record),
-            }
+            rows.push(record);
         }
-        Ok((ip_network, api_session))
+        Ok(rows)
     }
 
     pub fn persist_received_capability_registry(
         &self,
-        ip_network: Option<&PersistedReceivedCapabilityRecord>,
-        api_session: Option<&PersistedReceivedCapabilityRecord>,
+        records: &[PersistedReceivedCapabilityRecord],
     ) -> Result<(), String> {
         self.ensure_root()?;
         let mut rows = Vec::new();
-        for record in [ip_network, api_session].into_iter().flatten() {
+        for record in records {
             rows.push(format!(
-                "{}\t{}\t{}\t{}",
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}",
                 record.kind.as_str(),
                 record.object_id,
                 record.export_id,
-                record.label
+                record.label,
+                if record.enabled { "true" } else { "false" },
+                record.type_tag.as_deref().unwrap_or(""),
+                record.descriptor_json.as_deref().unwrap_or("")
             ));
         }
         let body = if rows.is_empty() {

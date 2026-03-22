@@ -15,7 +15,7 @@ mod storage;
 mod test_support;
 
 use base64::Engine as _;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::os::fd::FromRawFd;
 use std::path::Path;
 use std::str::FromStr;
@@ -44,7 +44,8 @@ use crate::sandstorm_custom_transport::{
     socket_addr_to_custom_addr, SANDSTORM_RAW_UDP_TRANSPORT_ID,
 };
 use crate::storage::{
-    PersistedReceivedCapabilityRecord, ReceivedCapabilityKind, SavedCapabilityRecord, Storage,
+    PersistedReceivedCapabilityRecord, ReceivedCapabilityKind, SavedCapabilityRecord,
+    SharedCapabilityKind, SharedCapabilityRecord, Storage,
 };
 
 const CLIENT_ROOT: &str = "/opt/app/client";
@@ -52,6 +53,8 @@ const STATE_DIR: &str = "/var/iroh-tunnel";
 const WEB_SESSION_TYPE_ID: u64 = web_session_capnp::web_session::Client::TYPE_ID;
 const IROH_ALPN: &[u8] = b"dev.iroh-tunnel.capnp/1";
 const IROH_RPC_ALPN: &[u8] = b"dev.iroh-tunnel.capnp/rpc/1";
+const IROH_PAIR_ALPN: &[u8] = b"dev.iroh-tunnel.capnp/pair/1";
+const PAIRING_PROTOCOL_VERSION: u16 = 1;
 const IROH_TRANSPORT_ASSESSMENT: &str = "Saved IpNetwork is proven for outbound TCP and UDP. Native iroh 0.97.0 now exposes custom transports behind unstable-custom-transports, and this prototype has both a proxy-based Quinn RawUdp adapter and a native iroh CustomTransport scaffold for Sandstorm RawUdp. The remaining work is application plumbing: restore an IpInterface capability early enough to bind RawUdp, publish custom transport addresses in tickets, and decide how Sandstorm mode is configured and discovered.";
 const IROH_SANDSTORM_RAW_UDP_INTERFACE_TOKEN_ENV: &str = "IROH_SANDSTORM_RAW_UDP_INTERFACE_TOKEN";
 const IROH_SANDSTORM_RAW_UDP_PORT_ENV: &str = "IROH_SANDSTORM_RAW_UDP_PORT";
@@ -61,7 +64,11 @@ fn app_storage() -> Storage {
 }
 
 fn app_core(app_state: &Arc<Mutex<AppState>>) -> App {
-    App::new(app_state.clone(), app_storage())
+    let storage = app_state
+        .lock()
+        .map(|guard| guard.storage.clone())
+        .unwrap_or_else(|_| app_storage());
+    App::new(app_state.clone(), storage)
 }
 
 fn exported_ip_network_id_path() -> std::path::PathBuf {
@@ -86,6 +93,14 @@ fn iroh_secret_key_path() -> std::path::PathBuf {
 
 fn remote_ticket_path() -> std::path::PathBuf {
     app_storage().remote_ticket_path()
+}
+
+fn approved_peer_node_id_path() -> std::path::PathBuf {
+    app_storage().approved_peer_node_id_path()
+}
+
+fn tunnel_enabled_path() -> std::path::PathBuf {
+    app_storage().tunnel_enabled_path()
 }
 
 fn main() {
@@ -181,8 +196,33 @@ impl grain_capnp::ui_view::Server for UiViewImpl {
         _: grain_capnp::ui_view::GetViewInfoParams,
         mut results: grain_capnp::ui_view::GetViewInfoResults,
     ) -> Promise<(), capnp::Error> {
+        let match_request_descriptors =
+            collect_match_request_descriptors(&self.app_state).unwrap_or_else(|err| {
+                eprintln!("failed to collect powerbox match requests: {err}");
+                Vec::new()
+            });
         let mut view_info = results.get();
         init_localized_text(view_info.reborrow().init_app_title(), "Iroh Tunnel");
+
+        let mut match_requests =
+            view_info
+                .reborrow()
+                .init_match_requests(match_request_descriptors.len() as u32);
+        for (index, encoded) in match_request_descriptors.iter().enumerate() {
+            let Ok(message) = decode_powerbox_descriptor(encoded) else {
+                continue;
+            };
+            let Ok(descriptor) = message.get_root::<powerbox_capnp::powerbox_descriptor::Reader<'_>>()
+            else {
+                continue;
+            };
+            if let Err(err) = copy_powerbox_descriptor(
+                descriptor,
+                match_requests.reborrow().get(index as u32),
+            ) {
+                eprintln!("failed to copy powerbox match request descriptor: {err}");
+            }
+        }
 
         let mut permissions = view_info.reborrow().init_permissions(2);
         {
@@ -258,6 +298,52 @@ impl grain_capnp::ui_view::Server for UiViewImpl {
             sandstorm_api: self.sandstorm_api.clone(),
             session_context: pry!(params.get_context()),
             app_state: self.app_state.clone(),
+            request_descriptor_b64: None,
+        });
+        results.get().set_session(grain_capnp::ui_session::Client {
+            client: session_client.client,
+        });
+        Promise::ok(())
+    }
+
+    fn new_request_session(
+        self: Rc<Self>,
+        params: grain_capnp::ui_view::NewRequestSessionParams,
+        mut results: grain_capnp::ui_view::NewRequestSessionResults,
+    ) -> Promise<(), capnp::Error> {
+        let params = pry!(params.get());
+        let session_type = params.get_session_type();
+
+        if session_type != WEB_SESSION_TYPE_ID {
+            return Promise::err(capnp::Error::failed(format!(
+                "unsupported request session type 0x{session_type:016x}"
+            )));
+        }
+
+        let _session_params = pry!(
+            params
+                .get_session_params()
+                .get_as::<web_session_capnp::web_session::params::Reader<'_>>()
+        );
+        let user_info = pry!(params.get_user_info());
+        let permissions = pry!(user_info.get_permissions());
+        let can_manage = permissions.len() > 0 && permissions.get(0);
+        let request_descriptor_b64 = match pry!(params.get_request_info())
+            .iter()
+            .next()
+            .map(encode_powerbox_descriptor)
+            .transpose()
+        {
+            Ok(value) => value,
+            Err(err) => return Promise::err(err),
+        };
+
+        let session_client: web_session_capnp::web_session::Client = new_client(WebSessionImpl {
+            can_manage,
+            sandstorm_api: self.sandstorm_api.clone(),
+            session_context: pry!(params.get_context()),
+            app_state: self.app_state.clone(),
+            request_descriptor_b64,
         });
         results.get().set_session(grain_capnp::ui_session::Client {
             client: session_client.client,
@@ -318,6 +404,7 @@ struct WebSessionImpl {
     sandstorm_api: grain_capnp::sandstorm_api::Client<capnp::any_pointer::Owned>,
     session_context: grain_capnp::session_context::Client,
     app_state: Arc<Mutex<AppState>>,
+    request_descriptor_b64: Option<String>,
 }
 
 impl grain_capnp::ui_session::Server for WebSessionImpl {}
@@ -345,15 +432,56 @@ impl web_session_capnp::web_session::Server for WebSessionImpl {
         }
 
         if path == "api/state" {
-            let body = match render_state_json(&self.app_state) {
-                Ok(body) => body,
-                Err(err) => return Promise::err(capnp::Error::failed(err)),
-            };
-            let mut response = results.get().init_content();
-            response.set_status_code(web_session_capnp::web_session::response::SuccessCode::Ok);
-            response.set_mime_type("application/json");
-            response.init_body().set_bytes(body.as_bytes());
-            return Promise::ok(());
+            let app_state = self.app_state.clone();
+            let request_descriptor_active = self.request_descriptor_b64.is_some();
+            return Promise::from_future(async move {
+                if let Err(err) = refresh_peer_rpc_exports(&app_state).await {
+                    if err != "peer rpc session is not connected" {
+                        eprintln!("state refresh of peer exports failed: {err}");
+                    }
+                }
+
+                let mut body: serde_json::Value = match render_state_json(&app_state)
+                    .and_then(|body| {
+                        serde_json::from_str(&body)
+                            .map_err(|err| format!("failed to parse rendered state json: {err}"))
+                    }) {
+                    Ok(body) => body,
+                    Err(err) => {
+                        let mut error = results.get().init_server_error();
+                        error.set_description_html(
+                            format!(
+                                "<!doctype html><title>State Render Failed</title><pre>{}</pre>",
+                                escape_html(&err)
+                            )
+                            .as_str(),
+                        );
+                        return Ok(());
+                    }
+                };
+                body["powerboxRequestSession"] = serde_json::json!({
+                    "active": request_descriptor_active,
+                });
+                let body = match serde_json::to_string(&body) {
+                    Ok(body) => body,
+                    Err(err) => {
+                        let mut error = results.get().init_server_error();
+                        error.set_description_html(
+                            format!(
+                                "<!doctype html><title>State Serialize Failed</title><pre>{}</pre>",
+                                escape_html(&err.to_string())
+                            )
+                            .as_str(),
+                        );
+                        return Ok(());
+                    }
+                };
+                let mut response = results.get().init_content();
+                response.set_status_code(web_session_capnp::web_session::response::SuccessCode::Ok);
+                response.set_mime_type("application/json");
+                response.init_body().set_bytes(body.as_bytes());
+                Ok(())
+            });
         }
 
         if path.is_empty() || path.ends_with('/') {
@@ -469,6 +597,161 @@ impl web_session_capnp::web_session::Server for WebSessionImpl {
                         let mut error = results.get().init_server_error();
                         let description = format!(
                             "<!doctype html><title>Probe Failed</title><pre>{}</pre>",
+                            escape_html(&err)
+                        );
+                        error.set_description_html(description.as_str());
+                    }
+                }
+                Ok(())
+            });
+        }
+
+        if path == "api/tunnel/connect" {
+            if !self.can_manage {
+                let mut error = results.get().init_client_error();
+                error.set_status_code(
+                    web_session_capnp::web_session::response::ClientErrorCode::Forbidden,
+                );
+                return Promise::ok(());
+            }
+
+            let app_state = self.app_state.clone();
+            let sandstorm_api = self.sandstorm_api.clone();
+            return Promise::from_future(async move {
+                tokio::task::spawn_local(async move {
+                    if let Err(err) = begin_pair_connection(app_state.clone(), sandstorm_api).await {
+                        if let Ok(mut guard) = app_state.lock() {
+                            guard.pending_outgoing_peer_node_id = None;
+                            guard.peer_rpc_error = Some(err.clone());
+                            guard.pairing_status = PairingStatus::Error;
+                        }
+                    }
+                });
+                let mut content = results.get().init_content();
+                content.set_status_code(
+                    web_session_capnp::web_session::response::SuccessCode::Accepted,
+                );
+                content.set_mime_type("application/json");
+                content.init_body().set_bytes(br#"{"ok":true}"#);
+                Ok(())
+            });
+        }
+
+        if path == "api/tunnel/accept" {
+            if !self.can_manage {
+                let mut error = results.get().init_client_error();
+                error.set_status_code(
+                    web_session_capnp::web_session::response::ClientErrorCode::Forbidden,
+                );
+                return Promise::ok(());
+            }
+
+            let app_state = self.app_state.clone();
+            let sandstorm_api = self.sandstorm_api.clone();
+            return Promise::from_future(async move {
+                tokio::task::spawn_local(async move {
+                    if let Err(err) =
+                        accept_pending_pair_connection(app_state.clone(), sandstorm_api).await
+                    {
+                        if let Ok(mut guard) = app_state.lock() {
+                            guard.peer_rpc_error = Some(err.clone());
+                            guard.pairing_status = PairingStatus::Error;
+                        }
+                    }
+                });
+                let mut content = results.get().init_content();
+                content.set_status_code(
+                    web_session_capnp::web_session::response::SuccessCode::Accepted,
+                );
+                content.set_mime_type("application/json");
+                content.init_body().set_bytes(br#"{"ok":true}"#);
+                Ok(())
+            });
+        }
+
+        if path == "api/tunnel/enable" {
+            if !self.can_manage {
+                let mut error = results.get().init_client_error();
+                error.set_status_code(
+                    web_session_capnp::web_session::response::ClientErrorCode::Forbidden,
+                );
+                return Promise::ok(());
+            }
+
+            let app_state = self.app_state.clone();
+            let sandstorm_api = self.sandstorm_api.clone();
+            return Promise::from_future(async move {
+                tokio::task::spawn_local(async move {
+                    if let Err(err) = enable_tunnel(app_state.clone(), sandstorm_api).await {
+                        if let Ok(mut guard) = app_state.lock() {
+                            guard.peer_rpc_error = Some(err.clone());
+                            guard.pairing_status = PairingStatus::Error;
+                        }
+                    }
+                });
+                let mut content = results.get().init_content();
+                content.set_status_code(
+                    web_session_capnp::web_session::response::SuccessCode::Accepted,
+                );
+                content.set_mime_type("application/json");
+                content.init_body().set_bytes(br#"{"ok":true}"#);
+                Ok(())
+            });
+        }
+
+        if path == "api/tunnel/disable" {
+            if !self.can_manage {
+                let mut error = results.get().init_client_error();
+                error.set_status_code(
+                    web_session_capnp::web_session::response::ClientErrorCode::Forbidden,
+                );
+                return Promise::ok(());
+            }
+
+            match disable_tunnel(&self.app_state) {
+                Ok(()) => {
+                    let mut content = results.get().init_content();
+                    content
+                        .set_status_code(web_session_capnp::web_session::response::SuccessCode::Ok);
+                    content.set_mime_type("application/json");
+                    content.init_body().set_bytes(br#"{"ok":true}"#);
+                }
+                Err(err) => {
+                    let mut error = results.get().init_server_error();
+                    let description = format!(
+                        "<!doctype html><title>Disable Tunnel Failed</title><pre>{}</pre>",
+                        escape_html(&err)
+                    );
+                    error.set_description_html(description.as_str());
+                }
+            }
+            return Promise::ok(());
+        }
+
+        if path == "api/tunnel/reject" {
+            if !self.can_manage {
+                let mut error = results.get().init_client_error();
+                error.set_status_code(
+                    web_session_capnp::web_session::response::ClientErrorCode::Forbidden,
+                );
+                return Promise::ok(());
+            }
+
+            let app_state = self.app_state.clone();
+            return Promise::from_future(async move {
+                match reject_pending_pair_connection(app_state).await {
+                    Ok(()) => {
+                        let mut content = results.get().init_content();
+                        content.set_status_code(
+                            web_session_capnp::web_session::response::SuccessCode::Ok,
+                        );
+                        content.set_mime_type("application/json");
+                        content.init_body().set_bytes(br#"{"ok":true}"#);
+                    }
+                    Err(err) => {
+                        let mut error = results.get().init_server_error();
+                        let description = format!(
+                            "<!doctype html><title>Reject Failed</title><pre>{}</pre>",
                             escape_html(&err)
                         );
                         error.set_description_html(description.as_str());
@@ -763,6 +1046,44 @@ impl web_session_capnp::web_session::Server for WebSessionImpl {
             return Promise::ok(());
         }
 
+        if path == "api/tunnel/rpc/refresh-exports" {
+            if !self.can_manage {
+                let mut error = results.get().init_client_error();
+                error.set_status_code(
+                    web_session_capnp::web_session::response::ClientErrorCode::Forbidden,
+                );
+                return Promise::ok(());
+            }
+
+            let app_state = self.app_state.clone();
+            return Promise::from_future(async move {
+                match refresh_peer_rpc_exports(&app_state).await {
+                    Ok(refreshed) => {
+                        let body = if refreshed {
+                            br#"{"ok":true,"refreshed":true}"#.as_slice()
+                        } else {
+                            br#"{"ok":true,"refreshed":false}"#.as_slice()
+                        };
+                        let mut content = results.get().init_content();
+                        content.set_status_code(
+                            web_session_capnp::web_session::response::SuccessCode::Ok,
+                        );
+                        content.set_mime_type("application/json");
+                        content.init_body().set_bytes(body);
+                    }
+                    Err(err) => {
+                        let mut error = results.get().init_server_error();
+                        let description = format!(
+                            "<!doctype html><title>Peer RPC Refresh Failed</title><pre>{}</pre>",
+                            escape_html(&err)
+                        );
+                        error.set_description_html(description.as_str());
+                    }
+                }
+                Ok(())
+            });
+        }
+
         if path == "api/tunnel/rpc/import-ip-network" {
             if !self.can_manage {
                 let mut error = results.get().init_client_error();
@@ -883,6 +1204,73 @@ impl web_session_capnp::web_session::Server for WebSessionImpl {
                     }
                     Err(err) => {
                         eprintln!("peer rpc api session import failed: {err}");
+                        let mut error = results.get().init_server_error();
+                        let description = format!(
+                            "<!doctype html><title>Peer RPC Import Failed</title><pre>{}</pre>",
+                            escape_html(&err)
+                        );
+                        error.set_description_html(description.as_str());
+                    }
+                }
+                Ok(())
+            });
+        }
+
+        if path == "api/tunnel/rpc/import-capability" {
+            if !self.can_manage {
+                let mut error = results.get().init_client_error();
+                error.set_status_code(
+                    web_session_capnp::web_session::response::ClientErrorCode::Forbidden,
+                );
+                return Promise::ok(());
+            }
+
+            let body = pry!(params.get_content())
+                .get_content()
+                .unwrap_or(&[])
+                .to_vec();
+            let export_id = match std::str::from_utf8(&body) {
+                Ok(value) => value.trim().to_string(),
+                Err(err) => {
+                    let mut error = results.get().init_client_error();
+                    let description =
+                        format!("<!doctype html><title>Bad Request</title><p>{err}</p>");
+                    error.set_status_code(
+                        web_session_capnp::web_session::response::ClientErrorCode::BadRequest,
+                    );
+                    error.set_description_html(description.as_str());
+                    return Promise::ok(());
+                }
+            };
+            if export_id.is_empty() {
+                let mut error = results.get().init_client_error();
+                error.set_status_code(
+                    web_session_capnp::web_session::response::ClientErrorCode::BadRequest,
+                );
+                error.set_description_html("missing remote export id");
+                return Promise::ok(());
+            }
+
+            let app_state = self.app_state.clone();
+            return Promise::from_future(async move {
+                match import_remote_capability_export(&app_state, &export_id).await {
+                    Ok((label, object_id, kind)) => {
+                        let body = format!(
+                            "{{\"ok\":true,\"objectId\":\"{}\",\"exportId\":\"{}\",\"label\":\"{}\",\"kind\":\"{}\"}}",
+                            json_escape(&object_id),
+                            json_escape(&export_id),
+                            json_escape(&label),
+                            json_escape(imported_kind_label(kind))
+                        );
+                        let mut content = results.get().init_content();
+                        content.set_status_code(
+                            web_session_capnp::web_session::response::SuccessCode::Ok,
+                        );
+                        content.set_mime_type("application/json");
+                        content.init_body().set_bytes(body.as_bytes());
+                    }
+                    Err(err) => {
+                        eprintln!("peer rpc generic import failed: {err}");
                         let mut error = results.get().init_server_error();
                         let description = format!(
                             "<!doctype html><title>Peer RPC Import Failed</title><pre>{}</pre>",
@@ -1854,8 +2242,22 @@ impl web_session_capnp::web_session::Server for WebSessionImpl {
             .get_content()
             .unwrap_or(&[])
             .to_vec();
-        let (request_token, save_label) = match std::str::from_utf8(&body) {
-            Ok(value) => parse_claim_payload(value),
+        let (request_token, save_label, descriptor_json) = match std::str::from_utf8(&body) {
+            Ok(value) => match parse_claim_payload(value) {
+                Ok(payload) => payload,
+                Err(err) => {
+                    let mut error = results.get().init_client_error();
+                    let description = format!(
+                        "<!doctype html><title>Bad Request</title><p>{}</p>",
+                        escape_html(&err)
+                    );
+                    error.set_status_code(
+                        web_session_capnp::web_session::response::ClientErrorCode::BadRequest,
+                    );
+                    error.set_description_html(description.as_str());
+                    return Promise::ok(());
+                }
+            },
             Err(err) => {
                 let mut error = results.get().init_client_error();
                 let description = format!("<!doctype html><title>Bad Request</title><p>{err}</p>");
@@ -1878,7 +2280,11 @@ impl web_session_capnp::web_session::Server for WebSessionImpl {
             )
             .await
             .and_then(|saved_token| {
-                let saved_cap = persist_saved_capability(&save_label, &saved_token)?;
+                let saved_cap = persist_saved_capability(
+                    &save_label,
+                    &saved_token,
+                    descriptor_json.as_deref(),
+                )?;
                 Ok(saved_cap)
             });
 
@@ -1937,6 +2343,35 @@ impl web_session_capnp::web_session::Server for WebSessionImpl {
                     let mut error = results.get().init_server_error();
                     let description = format!(
                         "<!doctype html><title>Pairing Delete Failed</title><pre>{}</pre>",
+                        escape_html(&err)
+                    );
+                    error.set_description_html(description.as_str());
+                }
+            }
+            return Promise::ok(());
+        }
+
+        if path == "api/pairing/forget" {
+            if !self.can_manage {
+                let mut error = results.get().init_client_error();
+                error.set_status_code(
+                    web_session_capnp::web_session::response::ClientErrorCode::Forbidden,
+                );
+                return Promise::ok(());
+            }
+
+            match forget_peer(&self.app_state) {
+                Ok(()) => {
+                    let mut content = results.get().init_content();
+                    content
+                        .set_status_code(web_session_capnp::web_session::response::SuccessCode::Ok);
+                    content.set_mime_type("application/json");
+                    content.init_body().set_bytes(br#"{"ok":true}"#);
+                }
+                Err(err) => {
+                    let mut error = results.get().init_server_error();
+                    let description = format!(
+                        "<!doctype html><title>Forget Peer Failed</title><pre>{}</pre>",
                         escape_html(&err)
                     );
                     error.set_description_html(description.as_str());
@@ -2022,6 +2457,328 @@ impl web_session_capnp::web_session::Server for WebSessionImpl {
                                 escape_html(&err)
                             );
                             error.set_description_html(description.as_str());
+                        }
+                    }
+                    Ok(())
+                });
+            } else if path == "api/received-cap/disable" {
+                let body = pry!(params.get_content())
+                    .get_content()
+                    .unwrap_or(&[])
+                    .to_vec();
+                let object_id = match std::str::from_utf8(&body) {
+                    Ok(value) => value.trim().to_string(),
+                    Err(err) => {
+                        let mut error = results.get().init_client_error();
+                        let description =
+                            format!("<!doctype html><title>Bad Request</title><p>{err}</p>");
+                        error.set_status_code(
+                            web_session_capnp::web_session::response::ClientErrorCode::BadRequest,
+                        );
+                        error.set_description_html(description.as_str());
+                        return Promise::ok(());
+                    }
+                };
+
+                let app_state = self.app_state.clone();
+                return Promise::from_future(async move {
+                    match disable_received_remote_capability(&app_state, &object_id) {
+                        Ok(true) => {
+                            results.get().init_no_content();
+                        }
+                        Ok(false) => {
+                            let mut error = results.get().init_client_error();
+                            error.set_status_code(
+                                web_session_capnp::web_session::response::ClientErrorCode::NotFound,
+                            );
+                        }
+                        Err(err) => {
+                            let mut error = results.get().init_server_error();
+                            let description = format!(
+                                "<!doctype html><title>Disable Received Capability Failed</title><pre>{}</pre>",
+                                escape_html(&err)
+                            );
+                            error.set_description_html(description.as_str());
+                        }
+                    }
+                    Ok(())
+                });
+            } else if path == "api/received-cap/enable" {
+                let body = pry!(params.get_content())
+                    .get_content()
+                    .unwrap_or(&[])
+                    .to_vec();
+                let object_id = match std::str::from_utf8(&body) {
+                    Ok(value) => value.trim().to_string(),
+                    Err(err) => {
+                        let mut error = results.get().init_client_error();
+                        let description =
+                            format!("<!doctype html><title>Bad Request</title><p>{err}</p>");
+                        error.set_status_code(
+                            web_session_capnp::web_session::response::ClientErrorCode::BadRequest,
+                        );
+                        error.set_description_html(description.as_str());
+                        return Promise::ok(());
+                    }
+                };
+
+                let app_state = self.app_state.clone();
+                return Promise::from_future(async move {
+                    match enable_received_remote_capability(&app_state, &object_id).await {
+                        Ok(true) => {
+                            results.get().init_no_content();
+                        }
+                        Ok(false) => {
+                            let mut error = results.get().init_client_error();
+                            error.set_status_code(
+                                web_session_capnp::web_session::response::ClientErrorCode::NotFound,
+                            );
+                        }
+                        Err(err) => {
+                            let mut error = results.get().init_server_error();
+                            let description = format!(
+                                "<!doctype html><title>Enable Received Capability Failed</title><pre>{}</pre>",
+                                escape_html(&err)
+                            );
+                            error.set_description_html(description.as_str());
+                        }
+                    }
+                    Ok(())
+                });
+            } else if path == "api/received-cap/save-local" {
+                let body = pry!(params.get_content())
+                    .get_content()
+                    .unwrap_or(&[])
+                    .to_vec();
+                let object_id = match std::str::from_utf8(&body) {
+                    Ok(value) => value.trim().to_string(),
+                    Err(err) => {
+                        let mut error = results.get().init_client_error();
+                        let description =
+                            format!("<!doctype html><title>Bad Request</title><p>{err}</p>");
+                        error.set_status_code(
+                            web_session_capnp::web_session::response::ClientErrorCode::BadRequest,
+                        );
+                        error.set_description_html(description.as_str());
+                        return Promise::ok(());
+                    }
+                };
+
+                let app_state = self.app_state.clone();
+                let sandstorm_api = self.sandstorm_api.clone();
+                return Promise::from_future(async move {
+                    match save_received_remote_capability_locally(
+                        &app_state,
+                        sandstorm_api,
+                        &object_id,
+                    )
+                    .await
+                    {
+                        Ok(saved_cap) => {
+                            let body = format!(
+                                "{{\"ok\":true,\"id\":\"{}\",\"label\":\"{}\",\"savedToken\":\"{}\"}}",
+                                json_escape(&saved_cap.id),
+                                json_escape(&saved_cap.label),
+                                json_escape(&saved_cap.saved_token)
+                            );
+                            let mut content = results.get().init_content();
+                            content.set_status_code(
+                                web_session_capnp::web_session::response::SuccessCode::Ok,
+                            );
+                            content.set_mime_type("application/json");
+                            content.init_body().set_bytes(body.as_bytes());
+                        }
+                        Err(err) => {
+                            let mut error = results.get().init_server_error();
+                            let description = format!(
+                                "<!doctype html><title>Save Local Capability Failed</title><pre>{}</pre>",
+                                escape_html(&err)
+                            );
+                            error.set_description_html(description.as_str());
+                        }
+                    }
+                    Ok(())
+                });
+            } else if path == "api/powerbox/fulfill-object" {
+                let body = pry!(params.get_content())
+                    .get_content()
+                    .unwrap_or(&[])
+                    .to_vec();
+                let object_id = match std::str::from_utf8(&body) {
+                    Ok(value) => value.trim().to_string(),
+                    Err(err) => {
+                        let mut error = results.get().init_client_error();
+                        let description =
+                            format!("<!doctype html><title>Bad Request</title><p>{err}</p>");
+                        error.set_status_code(
+                            web_session_capnp::web_session::response::ClientErrorCode::BadRequest,
+                        );
+                        error.set_description_html(description.as_str());
+                        return Promise::ok(());
+                    }
+                };
+                let Some(request_descriptor_b64) = self.request_descriptor_b64.clone() else {
+                    let mut error = results.get().init_client_error();
+                    error.set_status_code(
+                        web_session_capnp::web_session::response::ClientErrorCode::BadRequest,
+                    );
+                    error.set_description_html("not in a powerbox request session");
+                    return Promise::ok(());
+                };
+
+                let app_state = self.app_state.clone();
+                let sandstorm_api = self.sandstorm_api.clone();
+                let session_context = self.session_context.clone();
+                return Promise::from_future(async move {
+                    let label = match capability_label_for_object_id(&app_state, &object_id) {
+                        Ok(label) => label,
+                        Err(err) => {
+                            let mut error = results.get().init_server_error();
+                            error.set_description_html(
+                                format!(
+                                    "<!doctype html><title>Fulfill Request Failed</title><pre>{}</pre>",
+                                    escape_html(&err)
+                                )
+                                .as_str(),
+                            );
+                            return Ok(());
+                        }
+                    };
+                    let cap = match restore_app_object_capability(sandstorm_api, &app_state, &object_id)
+                        .await
+                    {
+                        Ok(cap) => cap,
+                        Err(err) => {
+                            let mut error = results.get().init_server_error();
+                            error.set_description_html(
+                                format!(
+                                    "<!doctype html><title>Fulfill Request Failed</title><pre>{}</pre>",
+                                    escape_html(&err)
+                                )
+                                .as_str(),
+                            );
+                            return Ok(());
+                        }
+                    };
+                    let descriptor_source = match capability_descriptor_for_object_id(&app_state, &object_id)
+                    {
+                        Ok(Some(value)) => value,
+                        Ok(None) => request_descriptor_b64,
+                        Err(err) => {
+                            let mut error = results.get().init_server_error();
+                            error.set_description_html(
+                                format!(
+                                    "<!doctype html><title>Fulfill Request Failed</title><pre>{}</pre>",
+                                    escape_html(&err)
+                                )
+                                .as_str(),
+                            );
+                            return Ok(());
+                        }
+                    };
+                    match fulfill_powerbox_request_with_capability(
+                        session_context,
+                        cap,
+                        &label,
+                        &descriptor_source,
+                    )
+                    .await
+                    {
+                        Ok(_) => {
+                            let mut content = results.get().init_content();
+                            content.set_status_code(
+                                web_session_capnp::web_session::response::SuccessCode::Ok,
+                            );
+                            content.set_mime_type("application/json");
+                            content.init_body().set_bytes(br#"{"ok":true}"#);
+                        }
+                        Err(err) => {
+                            let mut error = results.get().init_server_error();
+                            error.set_description_html(
+                                format!(
+                                    "<!doctype html><title>Fulfill Request Failed</title><pre>{}</pre>",
+                                    escape_html(&err)
+                                )
+                                .as_str(),
+                            );
+                        }
+                    }
+                    Ok(())
+                });
+            } else if path == "api/powerbox/fulfill-export" {
+                let body = pry!(params.get_content())
+                    .get_content()
+                    .unwrap_or(&[])
+                    .to_vec();
+                let export_id = match std::str::from_utf8(&body) {
+                    Ok(value) => value.trim().to_string(),
+                    Err(err) => {
+                        let mut error = results.get().init_client_error();
+                        let description =
+                            format!("<!doctype html><title>Bad Request</title><p>{err}</p>");
+                        error.set_status_code(
+                            web_session_capnp::web_session::response::ClientErrorCode::BadRequest,
+                        );
+                        error.set_description_html(description.as_str());
+                        return Promise::ok(());
+                    }
+                };
+                let Some(request_descriptor_b64) = self.request_descriptor_b64.clone() else {
+                    let mut error = results.get().init_client_error();
+                    error.set_status_code(
+                        web_session_capnp::web_session::response::ClientErrorCode::BadRequest,
+                    );
+                    error.set_description_html("not in a powerbox request session");
+                    return Promise::ok(());
+                };
+
+                let app_state = self.app_state.clone();
+                let session_context = self.session_context.clone();
+                return Promise::from_future(async move {
+                    let (label, descriptor_json, cap) =
+                        match fetch_remote_capability_by_export_id(&app_state, &export_id).await {
+                            Ok(value) => value,
+                            Err(err) => {
+                                let mut error = results.get().init_server_error();
+                                error.set_description_html(
+                                    format!(
+                                        "<!doctype html><title>Fulfill Request Failed</title><pre>{}</pre>",
+                                        escape_html(&err)
+                                    )
+                                    .as_str(),
+                                );
+                                return Ok(());
+                            }
+                        };
+                    let descriptor_source = descriptor_json
+                        .and_then(|value| descriptor_json_to_b64(&value))
+                        .unwrap_or(request_descriptor_b64);
+
+                    match fulfill_powerbox_request_with_capability(
+                        session_context,
+                        cap,
+                        &label,
+                        &descriptor_source,
+                    )
+                    .await
+                    {
+                        Ok(_) => {
+                            let mut content = results.get().init_content();
+                            content.set_status_code(
+                                web_session_capnp::web_session::response::SuccessCode::Ok,
+                            );
+                            content.set_mime_type("application/json");
+                            content.init_body().set_bytes(br#"{"ok":true}"#);
+                        }
+                        Err(err) => {
+                            let mut error = results.get().init_server_error();
+                            error.set_description_html(
+                                format!(
+                                    "<!doctype html><title>Fulfill Request Failed</title><pre>{}</pre>",
+                                    escape_html(&err)
+                                )
+                                .as_str(),
+                            );
                         }
                     }
                     Ok(())
@@ -2237,6 +2994,29 @@ async fn claim_and_save_capability(
     Ok(hex_encode(token))
 }
 
+async fn save_capability(
+    sandstorm_api: grain_capnp::sandstorm_api::Client<capnp::any_pointer::Owned>,
+    cap: capnp::capability::Client,
+    save_label: &str,
+) -> Result<String, String> {
+    let mut save_req = sandstorm_api.save_request();
+    save_req.get().get_cap().set_as_capability(cap.hook);
+    init_localized_text(save_req.get().init_label(), save_label);
+
+    let save_resp = save_req
+        .send()
+        .promise
+        .await
+        .map_err(|err| format!("SandstormApi.save() failed: {err}"))?;
+    let token = save_resp
+        .get()
+        .map_err(|err| format!("failed to decode save() response: {err}"))?
+        .get_token()
+        .map_err(|err| format!("save() returned no token: {err}"))?;
+
+    Ok(hex_encode(token))
+}
+
 async fn restore_saved_capability(
     sandstorm_api: grain_capnp::sandstorm_api::Client<capnp::any_pointer::Owned>,
     saved_token_hex: &str,
@@ -2296,6 +3076,16 @@ async fn restore_saved_api_session(
         .await
 }
 
+async fn restore_saved_generic_capability(
+    sandstorm_api: grain_capnp::sandstorm_api::Client<capnp::any_pointer::Owned>,
+    saved_token_hex: &str,
+) -> Result<capnp::capability::Client, String> {
+    let token = hex_decode(saved_token_hex)?;
+    SandstormBackend::new(sandstorm_api)
+        .restore_capability(&token)
+        .await
+}
+
 fn load_saved_capabilities() -> Result<Vec<SavedCapability>, String> {
     Ok(app_storage()
         .load_saved_capabilities()?
@@ -2305,6 +3095,7 @@ fn load_saved_capabilities() -> Result<Vec<SavedCapability>, String> {
             label: row.label,
             saved_token: row.saved_token,
             created_at_ms: row.created_at_ms,
+            descriptor_json: row.descriptor_json,
         })
         .collect())
 }
@@ -2318,20 +3109,82 @@ fn load_saved_capability_by_id(id: &str) -> Result<Option<SavedCapability>, Stri
     Ok(None)
 }
 
-fn persist_saved_capability(label: &str, saved_token: &str) -> Result<SavedCapability, String> {
+fn persist_saved_capability(
+    label: &str,
+    saved_token: &str,
+    descriptor_json: Option<&str>,
+) -> Result<SavedCapability, String> {
     let saved_cap = SavedCapability {
         id: make_saved_cap_id(),
         label: label.to_string(),
         saved_token: saved_token.to_string(),
         created_at_ms: now_ms(),
+        descriptor_json: descriptor_json.map(|value| value.to_string()),
     };
     app_storage().persist_saved_capability(&SavedCapabilityRecord {
         id: saved_cap.id.clone(),
         label: saved_cap.label.clone(),
         saved_token: saved_cap.saved_token.clone(),
         created_at_ms: saved_cap.created_at_ms,
+        descriptor_json: saved_cap.descriptor_json.clone(),
     })?;
     Ok(saved_cap)
+}
+
+pub(crate) fn make_shared_cap_id() -> String {
+    format!("shared-cap-{}", now_ms())
+}
+
+fn load_shared_capabilities() -> Result<Vec<SharedCapability>, String> {
+    Ok(app_storage()
+        .load_shared_capabilities()?
+        .into_iter()
+        .map(|row: SharedCapabilityRecord| -> Result<SharedCapability, String> {
+            let saved_cap =
+                load_saved_capability_by_id(&row.saved_cap_id)?.unwrap_or(SavedCapability {
+                    id: row.saved_cap_id,
+                    label: row.label.clone(),
+                    saved_token: String::new(),
+                    created_at_ms: 0,
+                    descriptor_json: row.descriptor_json.clone(),
+                });
+            Ok(SharedCapability {
+                id: row.id,
+                label: row.label,
+                kind: row.kind,
+                enabled: row.enabled,
+                created_at_ms: row.created_at_ms,
+                saved_cap,
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?)
+}
+
+fn persist_shared_capabilities(records: &[SharedCapability]) -> Result<(), String> {
+    let rows = records
+        .iter()
+        .map(|record| SharedCapabilityRecord {
+            id: record.id.clone(),
+            saved_cap_id: record.saved_cap.id.clone(),
+            label: record.label.clone(),
+            kind: record.kind,
+            type_tag: Some(shared_capability_type_tag(record)),
+            enabled: record.enabled,
+            created_at_ms: record.created_at_ms,
+            descriptor_json: record.saved_cap.descriptor_json.clone(),
+        })
+        .collect::<Vec<_>>();
+    app_storage().persist_shared_capabilities(&rows)
+}
+
+fn first_enabled_shared_capability(
+    shared_caps: &[SharedCapability],
+    kind: SharedCapabilityKind,
+) -> Option<SavedCapability> {
+    shared_caps
+        .iter()
+        .find(|cap| cap.kind == kind && cap.enabled)
+        .map(|cap| cap.saved_cap.clone())
 }
 
 fn load_configured_exported_capability(
@@ -2344,6 +3197,7 @@ fn load_configured_exported_capability(
             label: fallback_label.to_string(),
             saved_token: String::new(),
             created_at_ms: 0,
+            descriptor_json: None,
         }))),
         None => Ok(None),
     }
@@ -2357,24 +3211,28 @@ fn clear_configured_exported_capability(path: &Path) -> Result<(), String> {
     app_storage().clear_file(path)
 }
 
-fn load_persisted_received_capabilities() -> Result<
-    (
-        Option<PersistedReceivedCapability>,
-        Option<PersistedReceivedCapability>,
-    ),
-    String,
-> {
-    let (ip_network, api_session) = app_storage().load_persisted_received_capabilities()?;
-    let convert = |record: PersistedReceivedCapabilityRecord| PersistedReceivedCapability {
-        object_id: record.object_id,
-        export_id: record.export_id,
-        label: record.label,
-        kind: match record.kind {
-            ReceivedCapabilityKind::IpNetwork => ImportedRemoteCapabilityKind::IpNetwork,
-            ReceivedCapabilityKind::ApiSession => ImportedRemoteCapabilityKind::ApiSession,
-        },
-    };
-    Ok((ip_network.map(convert), api_session.map(convert)))
+fn load_persisted_received_capabilities() -> Result<Vec<PersistedReceivedCapability>, String> {
+    Ok(app_storage()
+        .load_persisted_received_capabilities()?
+        .into_iter()
+        .map(|record: PersistedReceivedCapabilityRecord| PersistedReceivedCapability {
+            object_id: record.object_id,
+            export_id: record.export_id,
+            label: record.label,
+            kind: match record.kind {
+                ReceivedCapabilityKind::IpNetwork => ImportedRemoteCapabilityKind::IpNetwork,
+                ReceivedCapabilityKind::ApiSession => ImportedRemoteCapabilityKind::ApiSession,
+                ReceivedCapabilityKind::Other => ImportedRemoteCapabilityKind::Other,
+            },
+            type_tag: record.type_tag.unwrap_or_else(|| imported_type_tag_for_kind(match record.kind {
+                ReceivedCapabilityKind::IpNetwork => ImportedRemoteCapabilityKind::IpNetwork,
+                ReceivedCapabilityKind::ApiSession => ImportedRemoteCapabilityKind::ApiSession,
+                ReceivedCapabilityKind::Other => ImportedRemoteCapabilityKind::Other,
+            })),
+            descriptor_json: record.descriptor_json,
+            enabled: record.enabled,
+        })
+        .collect())
 }
 
 fn parse_remote_cap_numeric_suffix(object_id: &str) -> Option<u64> {
@@ -2383,13 +3241,9 @@ fn parse_remote_cap_numeric_suffix(object_id: &str) -> Option<u64> {
         .and_then(|value| value.parse::<u64>().ok())
 }
 
-fn max_persisted_received_cap_id(
-    ip_network: Option<&PersistedReceivedCapability>,
-    api_session: Option<&PersistedReceivedCapability>,
-) -> Option<u64> {
-    [ip_network, api_session]
-        .into_iter()
-        .flatten()
+fn max_persisted_received_cap_id(records: &[PersistedReceivedCapability]) -> Option<u64> {
+    records
+        .iter()
         .filter_map(|record| parse_remote_cap_numeric_suffix(&record.object_id))
         .max()
 }
@@ -2465,6 +3319,17 @@ struct SavedCapability {
     label: String,
     saved_token: String,
     created_at_ms: u64,
+    descriptor_json: Option<String>,
+}
+
+#[derive(Clone)]
+pub(crate) struct SharedCapability {
+    pub(crate) id: String,
+    pub(crate) label: String,
+    pub(crate) kind: SharedCapabilityKind,
+    pub(crate) enabled: bool,
+    pub(crate) created_at_ms: u64,
+    pub(crate) saved_cap: SavedCapability,
 }
 
 #[derive(Clone)]
@@ -2473,11 +3338,21 @@ struct PeerRpcExport {
     label: String,
 }
 
+#[derive(Clone)]
+struct PeerRpcCapabilityExport {
+    id: String,
+    label: String,
+    kind: SharedCapabilityKind,
+    type_tag: String,
+    descriptor_json: Option<String>,
+}
+
 struct PeerRpcSession {
     session_id: u64,
     remote_node_id: String,
     connection: iroh::endpoint::Connection,
     remote_bootstrap: tunnel_capnp::peer_bootstrap::Client,
+    capability_exports: Vec<PeerRpcCapabilityExport>,
     ip_network_exports: Vec<PeerRpcExport>,
     api_session_exports: Vec<PeerRpcExport>,
 }
@@ -2500,6 +3375,7 @@ struct ImportedRemoteApiSession {
 enum ImportedRemoteCapabilityKind {
     IpNetwork,
     ApiSession,
+    Other,
 }
 
 #[derive(Clone)]
@@ -2508,6 +3384,9 @@ struct PersistedReceivedCapability {
     export_id: String,
     label: String,
     kind: ImportedRemoteCapabilityKind,
+    type_tag: String,
+    descriptor_json: Option<String>,
+    enabled: bool,
 }
 
 #[derive(Clone)]
@@ -2516,20 +3395,67 @@ struct ImportedRemoteCapability {
     export_id: String,
     label: String,
     kind: ImportedRemoteCapabilityKind,
+    type_tag: String,
+    descriptor_json: Option<String>,
     client: capnp::capability::Client,
 }
 
 struct ExportedIpNetworkState {
-    saved_cap: SavedCapability,
     client: ip_capnp::ip_network::Client,
 }
 
 struct ExportedApiSessionState {
-    saved_cap: SavedCapability,
     client: api_session_capnp::api_session::Client,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PairControlDecision {
+    Accepted,
+    Rejected,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PairControlMessage {
+    Request { version: u16 },
+    Response {
+        version: u16,
+        decision: PairControlDecision,
+    },
+}
+
+struct PendingIncomingConnection {
+    remote_node_id: String,
+    connection: iroh::endpoint::Connection,
+    handshake_send: iroh::endpoint::SendStream,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PairingStatus {
+    Disconnected,
+    Connecting,
+    AwaitingRemoteAccept,
+    IncomingRequest,
+    Connected,
+    Disabled,
+    Error,
+}
+
+impl PairingStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Disconnected => "disconnected",
+            Self::Connecting => "connecting",
+            Self::AwaitingRemoteAccept => "awaitingRemoteAccept",
+            Self::IncomingRequest => "incomingRequest",
+            Self::Connected => "connected",
+            Self::Disabled => "disabled",
+            Self::Error => "error",
+        }
+    }
+}
+
 struct AppState {
+    storage: Storage,
     iroh_identity: IrohIdentity,
     iroh_endpoint: Option<Endpoint>,
     iroh_endpoint_addr: IrohEndpointAddrSummary,
@@ -2537,16 +3463,23 @@ struct AppState {
     raw_udp_interface: Option<SavedCapability>,
     raw_udp_interface_source: Option<String>,
     remote_ticket: Option<String>,
+    approved_peer_node_id: Option<String>,
+    pending_incoming_peer_node_id: Option<String>,
+    pending_outgoing_peer_node_id: Option<String>,
+    pending_incoming_connection: Option<PendingIncomingConnection>,
+    tunnel_enabled: bool,
+    pairing_status: PairingStatus,
+    shared_caps: Vec<SharedCapability>,
     exported_ip_network: Option<SavedCapability>,
     exported_api_session: Option<SavedCapability>,
-    exported_ip_network_live: Option<ExportedIpNetworkState>,
-    exported_api_session_live: Option<ExportedApiSessionState>,
+    exported_caps_live: HashMap<String, capnp::capability::Client>,
+    exported_ip_network_live: HashMap<String, ExportedIpNetworkState>,
+    exported_api_session_live: HashMap<String, ExportedApiSessionState>,
     peer_rpc_session: Option<PeerRpcSession>,
     imported_remote_ip_network: Option<ImportedRemoteIpNetwork>,
     imported_remote_api_session: Option<ImportedRemoteApiSession>,
     imported_remote_caps: HashMap<String, ImportedRemoteCapability>,
-    persisted_received_ip_network: Option<PersistedReceivedCapability>,
-    persisted_received_api_session: Option<PersistedReceivedCapability>,
+    persisted_received_caps: Vec<PersistedReceivedCapability>,
     next_peer_rpc_session_id: u64,
     next_imported_remote_cap_id: u64,
     peer_rpc_error: Option<String>,
@@ -2558,23 +3491,51 @@ impl AppState {
     fn initialize() -> Result<Self, String> {
         let iroh_identity = load_or_create_iroh_identity()?;
         let remote_ticket = load_remote_ticket()?;
-        let exported_ip_network = load_configured_exported_capability(
+        let approved_peer_node_id = load_approved_peer_node_id()?;
+        let tunnel_enabled = load_tunnel_enabled()?;
+        let legacy_exported_ip_network = load_configured_exported_capability(
             exported_ip_network_id_path().as_path(),
             "Configured IpNetwork export",
         )?;
-        let exported_api_session = load_configured_exported_capability(
+        let legacy_exported_api_session = load_configured_exported_capability(
             exported_api_session_id_path().as_path(),
             "Configured ApiSession export",
         )?;
-        let (persisted_received_ip_network, persisted_received_api_session) =
-            load_persisted_received_capabilities()?;
+        let mut shared_caps = load_shared_capabilities()?;
+        if shared_caps.is_empty() {
+            if let Some(saved_cap) = legacy_exported_ip_network.clone() {
+                shared_caps.push(SharedCapability {
+                    id: make_shared_cap_id(),
+                    label: saved_cap.label.clone(),
+                    kind: SharedCapabilityKind::IpNetwork,
+                    enabled: true,
+                    created_at_ms: saved_cap.created_at_ms,
+                    saved_cap,
+                });
+            }
+            if let Some(saved_cap) = legacy_exported_api_session.clone() {
+                shared_caps.push(SharedCapability {
+                    id: make_shared_cap_id(),
+                    label: saved_cap.label.clone(),
+                    kind: SharedCapabilityKind::ApiSession,
+                    enabled: true,
+                    created_at_ms: saved_cap.created_at_ms,
+                    saved_cap,
+                });
+            }
+            if !shared_caps.is_empty() {
+                persist_shared_capabilities(&shared_caps)?;
+            }
+        }
+        let exported_ip_network =
+            first_enabled_shared_capability(&shared_caps, SharedCapabilityKind::IpNetwork);
+        let exported_api_session =
+            first_enabled_shared_capability(&shared_caps, SharedCapabilityKind::ApiSession);
+        let persisted_received_caps = load_persisted_received_capabilities()?;
         let next_imported_remote_cap_id =
-            max_persisted_received_cap_id(
-                persisted_received_ip_network.as_ref(),
-                persisted_received_api_session.as_ref(),
-            )
-            .unwrap_or(0);
+            max_persisted_received_cap_id(&persisted_received_caps).unwrap_or(0);
         Ok(Self {
+            storage: app_storage(),
             iroh_identity,
             iroh_endpoint: None,
             iroh_endpoint_addr: IrohEndpointAddrSummary::empty(),
@@ -2582,16 +3543,27 @@ impl AppState {
             raw_udp_interface: None,
             raw_udp_interface_source: None,
             remote_ticket,
+            approved_peer_node_id,
+            pending_incoming_peer_node_id: None,
+            pending_outgoing_peer_node_id: None,
+            pending_incoming_connection: None,
+            tunnel_enabled,
+            pairing_status: if tunnel_enabled {
+                PairingStatus::Disconnected
+            } else {
+                PairingStatus::Disabled
+            },
+            shared_caps,
             exported_ip_network,
             exported_api_session,
-            exported_ip_network_live: None,
-            exported_api_session_live: None,
+            exported_caps_live: HashMap::new(),
+            exported_ip_network_live: HashMap::new(),
+            exported_api_session_live: HashMap::new(),
             peer_rpc_session: None,
             imported_remote_ip_network: None,
             imported_remote_api_session: None,
             imported_remote_caps: HashMap::new(),
-            persisted_received_ip_network,
-            persisted_received_api_session,
+            persisted_received_caps,
             next_peer_rpc_session_id: 0,
             next_imported_remote_cap_id,
             peer_rpc_error: None,
@@ -2605,7 +3577,7 @@ async fn initialize_iroh_endpoint(
     app_state: Arc<Mutex<AppState>>,
     sandstorm_api: grain_capnp::sandstorm_api::Client<capnp::any_pointer::Owned>,
 ) -> Result<(), String> {
-    let (secret_key, old_endpoint) = {
+    let (secret_key, old_endpoint, pending_incoming) = {
         let mut guard = app_state
             .lock()
             .map_err(|_| "app state lock poisoned".to_string())?;
@@ -2614,39 +3586,99 @@ async fn initialize_iroh_endpoint(
                 .connection
                 .close(0u32.into(), b"local endpoint reinitialized");
         }
+        let pending_incoming = guard.pending_incoming_connection.take();
+        guard.pending_incoming_peer_node_id = None;
+        guard.pending_outgoing_peer_node_id = None;
         guard.imported_remote_ip_network = None;
         guard.imported_remote_api_session = None;
         guard.peer_rpc_error = None;
+        guard.pairing_status = if guard.tunnel_enabled {
+            PairingStatus::Disconnected
+        } else {
+            PairingStatus::Disabled
+        };
         (
             guard.iroh_identity.secret_key.clone(),
             guard.iroh_endpoint.take(),
+            pending_incoming,
         )
     };
+    if let Some(pending_incoming) = pending_incoming {
+        pending_incoming
+            .connection
+            .close(0u32.into(), b"local endpoint reinitialized");
+    }
     if let Some(old_endpoint) = old_endpoint {
         old_endpoint.close().await;
     }
 
-    let bind_result = bind_local_iroh_endpoint(app_state.clone(), sandstorm_api, &secret_key).await;
+    let bind_result =
+        bind_local_iroh_endpoint(app_state.clone(), sandstorm_api.clone(), &secret_key).await;
     let (raw_udp_interface, raw_udp_interface_source) =
         load_configured_raw_udp_interface_state()?;
-    let mut guard = app_state
-        .lock()
-        .map_err(|_| "app state lock poisoned".to_string())?;
-    guard.raw_udp_interface = raw_udp_interface;
-    guard.raw_udp_interface_source = raw_udp_interface_source;
-    match bind_result {
-        Ok((endpoint, endpoint_addr)) => {
-            guard.iroh_endpoint = Some(endpoint);
-            guard.iroh_endpoint_addr = endpoint_addr;
-            guard.iroh_endpoint_error = None;
-        }
-        Err(err) => {
-            guard.iroh_endpoint = None;
-            guard.iroh_endpoint_addr = IrohEndpointAddrSummary::empty();
-            guard.iroh_endpoint_error = Some(err);
+    {
+        let mut guard = app_state
+            .lock()
+            .map_err(|_| "app state lock poisoned".to_string())?;
+        guard.raw_udp_interface = raw_udp_interface;
+        guard.raw_udp_interface_source = raw_udp_interface_source;
+        match bind_result {
+            Ok((endpoint, endpoint_addr)) => {
+                guard.iroh_endpoint = Some(endpoint);
+                guard.iroh_endpoint_addr = endpoint_addr;
+                guard.iroh_endpoint_error = None;
+            }
+            Err(err) => {
+                guard.iroh_endpoint = None;
+                guard.iroh_endpoint_addr = IrohEndpointAddrSummary::empty();
+                guard.iroh_endpoint_error = Some(err);
+            }
         }
     }
+
+    if should_auto_reconnect_tunnel(&app_state)? {
+        let app_state = app_state.clone();
+        let sandstorm_api = sandstorm_api.clone();
+        tokio::task::spawn_local(async move {
+            eprintln!("iroh startup: beginning automatic tunnel reconnect");
+            if let Err(err) = begin_pair_connection(app_state, sandstorm_api).await {
+                eprintln!("iroh startup: automatic tunnel reconnect failed: {err}");
+            } else {
+                eprintln!("iroh startup: automatic tunnel reconnect initiated");
+            }
+        });
+    }
+
     Ok(())
+}
+
+fn should_auto_reconnect_tunnel(app_state: &Arc<Mutex<AppState>>) -> Result<bool, String> {
+    let guard = app_state
+        .lock()
+        .map_err(|_| "app state lock poisoned".to_string())?;
+    if !guard.tunnel_enabled {
+        return Ok(false);
+    }
+    if guard.peer_rpc_session.is_some()
+        || guard.pending_outgoing_peer_node_id.is_some()
+        || guard.pending_incoming_peer_node_id.is_some()
+    {
+        return Ok(false);
+    }
+    let Some(remote_ticket) = guard.remote_ticket.as_ref() else {
+        return Ok(false);
+    };
+    let Some(approved_peer_node_id) = guard.approved_peer_node_id.as_ref() else {
+        return Ok(false);
+    };
+
+    let remote_addr = parse_remote_ticket(remote_ticket)?;
+    let remote_node_id = remote_addr.id.to_string();
+    if &remote_node_id != approved_peer_node_id {
+        return Ok(false);
+    }
+
+    Ok(guard.iroh_identity.node_id >= remote_node_id)
 }
 
 fn load_configured_raw_udp_interface_state() -> Result<(Option<SavedCapability>, Option<String>), String>
@@ -2658,6 +3690,7 @@ fn load_configured_raw_udp_interface_state() -> Result<(Option<SavedCapability>,
                 label: "Configured IpInterface".to_string(),
                 saved_token,
                 created_at_ms: 0,
+                descriptor_json: None,
             })),
             Some("saved".to_string()),
         ));
@@ -2670,6 +3703,7 @@ fn load_configured_raw_udp_interface_state() -> Result<(Option<SavedCapability>,
                 label: "Env-configured IpInterface".to_string(),
                 saved_token: token.trim().to_string(),
                 created_at_ms: 0,
+                descriptor_json: None,
             }),
             Some("env".to_string()),
         )),
@@ -2994,7 +4028,11 @@ async fn bind_local_iroh_endpoint(
 
     eprintln!("iroh bind: using native ambient UDP transports");
     let endpoint = Endpoint::builder(presets::N0)
-        .alpns(vec![IROH_ALPN.to_vec(), IROH_RPC_ALPN.to_vec()])
+        .alpns(vec![
+            IROH_ALPN.to_vec(),
+            IROH_RPC_ALPN.to_vec(),
+            IROH_PAIR_ALPN.to_vec(),
+        ])
         .secret_key(secret_key.clone())
         .relay_mode(RelayMode::Disabled)
         .bind()
@@ -3048,7 +4086,11 @@ async fn bind_sandstorm_raw_udp_iroh_endpoint(
     eprintln!("iroh bind: Sandstorm RawUdp custom transport initialized");
 
     let endpoint = Endpoint::builder(presets::N0)
-        .alpns(vec![IROH_ALPN.to_vec(), IROH_RPC_ALPN.to_vec()])
+        .alpns(vec![
+            IROH_ALPN.to_vec(),
+            IROH_RPC_ALPN.to_vec(),
+            IROH_PAIR_ALPN.to_vec(),
+        ])
         .secret_key(secret_key.clone())
         .relay_mode(RelayMode::Disabled)
         .clear_ip_transports()
@@ -3131,6 +4173,21 @@ fn load_remote_ticket() -> Result<Option<String>, String> {
     }
 }
 
+fn load_approved_peer_node_id() -> Result<Option<String>, String> {
+    app_storage().load_text_file(approved_peer_node_id_path().as_path())
+}
+
+fn load_tunnel_enabled() -> Result<bool, String> {
+    let Some(value) = app_storage().load_text_file(tunnel_enabled_path().as_path())? else {
+        return Ok(true);
+    };
+    match value.as_str() {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        _ => Err(format!("failed to parse persisted tunnel enabled flag: {value:?}")),
+    }
+}
+
 fn update_remote_ticket(
     app_state: &Arc<Mutex<AppState>>,
     remote_ticket: String,
@@ -3181,7 +4238,222 @@ fn imported_kind_label(kind: ImportedRemoteCapabilityKind) -> &'static str {
     match kind {
         ImportedRemoteCapabilityKind::IpNetwork => "IpNetwork",
         ImportedRemoteCapabilityKind::ApiSession => "ApiSession",
+        ImportedRemoteCapabilityKind::Other => "Other",
     }
+}
+
+fn imported_type_tag_for_kind(kind: ImportedRemoteCapabilityKind) -> String {
+    match kind {
+        ImportedRemoteCapabilityKind::IpNetwork => "sandstorm/ip-network".to_string(),
+        ImportedRemoteCapabilityKind::ApiSession => "sandstorm/api-session".to_string(),
+        ImportedRemoteCapabilityKind::Other => "capnp/unknown".to_string(),
+    }
+}
+
+fn descriptor_type_tag(descriptor_json: Option<&str>) -> Option<String> {
+    let descriptor_json = descriptor_json?;
+    let value: serde_json::Value = serde_json::from_str(descriptor_json).ok()?;
+    let raw = match value {
+        serde_json::Value::String(text) => text,
+        _ => return None,
+    };
+    let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, raw).ok()?;
+    let ascii = bytes
+        .iter()
+        .map(|byte| {
+            let ch = *byte as char;
+            if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '/' | '-' | '_') {
+                ch
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>();
+    ascii
+        .split_whitespace()
+        .find(|part| part.contains('.') && part.contains('/'))
+        .map(|value| value.to_string())
+}
+
+fn normalize_descriptor_string(value: &str) -> Option<String> {
+    let mut current = value.trim().to_string();
+    if current.is_empty() {
+        return None;
+    }
+
+    loop {
+        let parsed = serde_json::from_str::<serde_json::Value>(&current);
+        match parsed {
+            Ok(serde_json::Value::String(inner)) => {
+                let trimmed = inner.trim().to_string();
+                if trimmed.is_empty() {
+                    return None;
+                }
+                if trimmed == current {
+                    return Some(trimmed);
+                }
+                current = trimmed;
+            }
+            _ => break,
+        }
+    }
+
+    Some(current)
+}
+
+fn descriptor_json_to_b64(descriptor_json: &str) -> Option<String> {
+    normalize_descriptor_string(descriptor_json)
+}
+
+fn make_powerbox_query_from_descriptor_b64(encoded: &str) -> Option<String> {
+    let message = decode_powerbox_descriptor(encoded).ok()?;
+    let descriptor = message
+        .get_root::<powerbox_capnp::powerbox_descriptor::Reader<'_>>()
+        .ok()?;
+    let tags = descriptor.get_tags().ok()?;
+
+    let mut query_message = capnp::message::Builder::new_default();
+    let mut query = query_message.init_root::<powerbox_capnp::powerbox_descriptor::Builder<'_>>();
+    let mut query_tags = query.reborrow().init_tags(tags.len() as u32);
+    for index in 0..tags.len() {
+        let tag = tags.get(index);
+        query_tags.reborrow().get(index as u32).set_id(tag.get_id());
+    }
+    query.set_quality(powerbox_capnp::powerbox_descriptor::MatchQuality::Acceptable);
+
+    let mut bytes = Vec::new();
+    capnp::serialize_packed::write_message(&mut bytes, &query_message).ok()?;
+    Some(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
+}
+
+pub(crate) fn descriptor_json_to_match_request_b64(descriptor_json: &str) -> Option<String> {
+    let encoded = descriptor_json_to_b64(descriptor_json)?;
+    make_powerbox_query_from_descriptor_b64(&encoded)
+}
+
+fn collect_match_request_descriptors(
+    app_state: &Arc<Mutex<AppState>>,
+) -> Result<Vec<String>, String> {
+    let mut seen = HashSet::new();
+    let mut encoded_descriptors = Vec::new();
+
+    for saved_cap in load_saved_capabilities()? {
+        let Some(encoded) = saved_cap
+            .descriptor_json
+            .as_deref()
+            .and_then(descriptor_json_to_match_request_b64)
+        else {
+            continue;
+        };
+        if decode_powerbox_descriptor(&encoded).is_ok() && seen.insert(encoded.clone()) {
+            encoded_descriptors.push(encoded);
+        }
+    }
+
+    let imported_descriptors = {
+        let guard = app_state
+            .lock()
+            .map_err(|_| "app state lock poisoned".to_string())?;
+        let mut values = guard
+            .imported_remote_caps
+            .values()
+            .filter_map(|cap| cap.descriptor_json.clone())
+            .collect::<Vec<_>>();
+        if let Some(session) = guard.peer_rpc_session.as_ref() {
+            values.extend(
+                session
+                    .capability_exports
+                    .iter()
+                    .filter_map(|cap| cap.descriptor_json.clone()),
+            );
+        }
+        values
+    };
+
+    for descriptor_json in imported_descriptors {
+        let Some(encoded) = descriptor_json_to_match_request_b64(&descriptor_json) else {
+            continue;
+        };
+        if decode_powerbox_descriptor(&encoded).is_ok() && seen.insert(encoded.clone()) {
+            encoded_descriptors.push(encoded);
+        }
+    }
+
+    Ok(encoded_descriptors)
+}
+
+pub(crate) fn advertised_powerbox_matches_json(
+    app_state: &Arc<Mutex<AppState>>,
+) -> Result<String, String> {
+    let descriptors = collect_match_request_descriptors(app_state)?;
+    advertised_powerbox_matches_json_from_b64(&descriptors)
+}
+
+pub(crate) fn advertised_powerbox_matches_json_from_b64(
+    descriptors: &[String],
+) -> Result<String, String> {
+    let mut rows = Vec::new();
+    for encoded in descriptors {
+        let message = match decode_powerbox_descriptor(&encoded) {
+            Ok(message) => message,
+            Err(_) => continue,
+        };
+        let descriptor = match message.get_root::<powerbox_capnp::powerbox_descriptor::Reader<'_>>()
+        {
+            Ok(descriptor) => descriptor,
+            Err(_) => continue,
+        };
+        let tag_ids = match descriptor.get_tags() {
+            Ok(tags) => (0..tags.len())
+                .map(|index| tags.get(index).get_id().to_string())
+                .collect::<Vec<_>>(),
+            Err(_) => Vec::new(),
+        };
+        rows.push(format!(
+            "{{\"descriptor\":\"{}\",\"tagIds\":[{}]}}",
+            json_escape(&encoded),
+            tag_ids
+                .iter()
+                .map(|value| format!("\"{}\"", json_escape(value)))
+                .collect::<Vec<_>>()
+                .join(",")
+        ));
+    }
+    Ok(format!("[{}]", rows.join(",")))
+}
+
+fn copy_powerbox_descriptor(
+    source: powerbox_capnp::powerbox_descriptor::Reader<'_>,
+    mut target: powerbox_capnp::powerbox_descriptor::Builder<'_>,
+) -> Result<(), capnp::Error> {
+    if let Ok(tags) = source.get_tags() {
+        let mut target_tags = target.reborrow().init_tags(tags.len() as u32);
+        for index in 0..tags.len() {
+            let tag = tags.get(index);
+            let mut target_tag = target_tags.reborrow().get(index as u32);
+            target_tag.set_id(tag.get_id());
+            if tag.has_value() {
+                target_tag
+                    .reborrow()
+                    .init_value()
+                    .set_as::<capnp::any_pointer::Owned>(tag.get_value())?;
+            }
+        }
+    }
+    if let Ok(quality) = source.get_quality() {
+        target.set_quality(quality);
+    }
+    Ok(())
+}
+
+fn shared_capability_type_tag(shared: &SharedCapability) -> String {
+    descriptor_type_tag(shared.saved_cap.descriptor_json.as_deref()).unwrap_or_else(|| {
+        match shared.kind {
+            SharedCapabilityKind::IpNetwork => "sandstorm/ip-network".to_string(),
+            SharedCapabilityKind::ApiSession => "sandstorm/api-session".to_string(),
+            SharedCapabilityKind::Other => "capnp/unknown".to_string(),
+        }
+    })
 }
 
 fn drop_received_remote_capability(
@@ -3189,6 +4461,163 @@ fn drop_received_remote_capability(
     object_id: &str,
 ) -> Result<bool, String> {
     app_core(app_state).drop_received_remote_capability(object_id)
+}
+
+fn disable_received_remote_capability(
+    app_state: &Arc<Mutex<AppState>>,
+    object_id: &str,
+) -> Result<bool, String> {
+    app_core(app_state).disable_received_remote_capability(object_id)
+}
+
+async fn enable_received_remote_capability(
+    app_state: &Arc<Mutex<AppState>>,
+    object_id: &str,
+) -> Result<bool, String> {
+    app_core(app_state)
+        .enable_received_remote_capability(object_id)
+        .await
+}
+
+async fn save_received_remote_capability_locally(
+    app_state: &Arc<Mutex<AppState>>,
+    sandstorm_api: grain_capnp::sandstorm_api::Client<capnp::any_pointer::Owned>,
+    object_id: &str,
+) -> Result<SavedCapability, String> {
+    app_core(app_state)
+        .save_received_remote_capability_locally(sandstorm_api, object_id)
+        .await
+}
+
+fn capability_label_for_object_id(
+    app_state: &Arc<Mutex<AppState>>,
+    object_id: &str,
+) -> Result<String, String> {
+    {
+        let guard = app_state
+            .lock()
+            .map_err(|_| "app state lock poisoned".to_string())?;
+        if let Some(cap) = guard.imported_remote_caps.get(object_id) {
+            return Ok(cap.label.clone());
+        }
+        if let Some(record) = guard
+            .persisted_received_caps
+            .iter()
+            .find(|record| record.object_id == object_id)
+        {
+            return Ok(record.label.clone());
+        }
+    }
+    let saved_cap = load_saved_capability_by_id(object_id)?
+        .ok_or_else(|| format!("unknown capability object id: {object_id}"))?;
+    Ok(saved_cap.label)
+}
+
+fn capability_descriptor_for_object_id(
+    app_state: &Arc<Mutex<AppState>>,
+    object_id: &str,
+) -> Result<Option<String>, String> {
+    {
+        let guard = app_state
+            .lock()
+            .map_err(|_| "app state lock poisoned".to_string())?;
+        if let Some(cap) = guard.imported_remote_caps.get(object_id) {
+            return Ok(cap.descriptor_json.clone());
+        }
+        if let Some(record) = guard
+            .persisted_received_caps
+            .iter()
+            .find(|record| record.object_id == object_id)
+        {
+            return Ok(record.descriptor_json.clone());
+        }
+    }
+    let saved_cap = load_saved_capability_by_id(object_id)?
+        .ok_or_else(|| format!("unknown capability object id: {object_id}"))?;
+    Ok(saved_cap.descriptor_json)
+}
+
+fn capability_descriptor_for_remote_export_id(
+    app_state: &Arc<Mutex<AppState>>,
+    export_id: &str,
+) -> Result<Option<String>, String> {
+    let guard = app_state
+        .lock()
+        .map_err(|_| "app state lock poisoned".to_string())?;
+    let Some(session) = guard.peer_rpc_session.as_ref() else {
+        return Ok(None);
+    };
+    Ok(session
+        .capability_exports
+        .iter()
+        .find(|export| export.id == export_id)
+        .and_then(|export| export.descriptor_json.clone()))
+}
+
+async fn fetch_remote_capability_by_export_id(
+    app_state: &Arc<Mutex<AppState>>,
+    export_id: &str,
+) -> Result<(String, Option<String>, capnp::capability::Client), String> {
+    let remote_bootstrap = {
+        let guard = app_state
+            .lock()
+            .map_err(|_| "app state lock poisoned".to_string())?;
+        guard
+            .peer_rpc_session
+            .as_ref()
+            .ok_or_else(|| "peer rpc session is not connected".to_string())?
+            .remote_bootstrap
+            .clone()
+    };
+    let (label, _kind, _type_tag, descriptor_json, client) =
+        fetch_remote_capability_export(remote_bootstrap, export_id).await?;
+    let descriptor_json =
+        descriptor_json.or(capability_descriptor_for_remote_export_id(app_state, export_id)?);
+    Ok((label, descriptor_json, client))
+}
+
+async fn fulfill_powerbox_request_with_capability(
+    session_context: grain_capnp::session_context::Client,
+    cap: capnp::capability::Client,
+    label: &str,
+    descriptor_source: &str,
+) -> Result<(), String> {
+    let normalized_descriptor = descriptor_json_to_b64(descriptor_source)
+        .unwrap_or_else(|| descriptor_source.trim().to_string());
+    let descriptor_message = decode_powerbox_descriptor(&normalized_descriptor)?;
+    let descriptor = descriptor_message
+        .get_root::<powerbox_capnp::powerbox_descriptor::Reader<'_>>()
+        .map_err(|err| format!("failed to read request descriptor: {err}"))?;
+
+    let mut request = session_context.fulfill_request_request();
+    request.get().get_cap().set_as_capability(cap.hook);
+    request.get().init_required_permissions(0);
+    request
+        .get()
+        .set_descriptor(descriptor)
+        .map_err(|err| format!("failed to encode fulfillRequest() descriptor: {err}"))?;
+    init_localized_text(request.get().init_display_info().init_title(), label);
+    init_localized_text(
+        request.get().init_display_info().init_verb_phrase(),
+        "use tunneled capability",
+    );
+    init_localized_text(
+        request.get().init_display_info().init_description(),
+        "Capability provided through Iroh Tunnel.",
+    );
+
+    match request.send().promise.await {
+        Ok(_) => {}
+        Err(err) => {
+            let err_text = err.to_string();
+            // In Powerbox request sessions, fulfilling the request can immediately tear down the
+            // embedded provider session. Treat the common disconnect-on-success path as success.
+            if !err_text.contains("connection lost") && !err_text.contains("Disconnected") {
+                return Err(format!("SessionContext.fulfillRequest() failed: {err}"));
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn configure_exported_ip_network(
@@ -3346,6 +4775,61 @@ async fn list_remote_ip_network_exports(
     Ok(values)
 }
 
+async fn list_remote_capability_exports(
+    remote_bootstrap: tunnel_capnp::peer_bootstrap::Client,
+) -> Result<Vec<PeerRpcCapabilityExport>, String> {
+    let response = remote_bootstrap
+        .list_capability_exports_request()
+        .send()
+        .promise
+        .await
+        .map_err(|err| format!("PeerBootstrap.listCapabilityExports() failed: {err}"))?;
+    let response = response
+        .get()
+        .map_err(|err| format!("failed to decode listCapabilityExports() response: {err}"))?;
+    let exports = response
+        .get_exports()
+        .map_err(|err| format!("listCapabilityExports() returned invalid exports: {err}"))?;
+    let mut values = Vec::new();
+    for export in exports.iter() {
+        values.push(PeerRpcCapabilityExport {
+            id: export
+                .get_id()
+                .map_err(|err| format!("failed to read export id: {err}"))?
+                .to_str()
+                .unwrap_or("")
+                .to_string(),
+            label: export
+                .get_label()
+                .map_err(|err| format!("failed to read export label: {err}"))?
+                .to_str()
+                .unwrap_or("")
+                .to_string(),
+            kind: match export
+                .get_kind()
+                .map_err(|err| format!("failed to read export kind: {err}"))?
+            {
+                tunnel_capnp::CapabilityKind::IpNetwork => SharedCapabilityKind::IpNetwork,
+                tunnel_capnp::CapabilityKind::ApiSession => SharedCapabilityKind::ApiSession,
+                tunnel_capnp::CapabilityKind::Other => SharedCapabilityKind::Other,
+            },
+            type_tag: export
+                .get_type_tag()
+                .map_err(|err| format!("failed to read export type tag: {err}"))?
+                .to_str()
+                .unwrap_or("")
+                .to_string(),
+            descriptor_json: export
+                .get_descriptor_json()
+                .ok()
+                .and_then(|value| value.to_str().ok())
+                .map(|value| value.to_string())
+                .filter(|value| !value.is_empty()),
+        });
+    }
+    Ok(values)
+}
+
 async fn list_remote_api_session_exports(
     remote_bootstrap: tunnel_capnp::peer_bootstrap::Client,
 ) -> Result<Vec<PeerRpcExport>, String> {
@@ -3433,6 +4917,62 @@ async fn fetch_remote_api_session_export(
     Ok((label, client))
 }
 
+async fn fetch_remote_capability_export(
+    remote_bootstrap: tunnel_capnp::peer_bootstrap::Client,
+    export_id: &str,
+) -> Result<
+    (
+        String,
+        ImportedRemoteCapabilityKind,
+        String,
+        Option<String>,
+        capnp::capability::Client,
+    ),
+    String,
+> {
+    let mut request = remote_bootstrap.get_capability_export_request();
+    request.get().set_id(export_id);
+    let response = request
+        .send()
+        .promise
+        .await
+        .map_err(|err| format!("PeerBootstrap.getCapabilityExport() failed: {err}"))?;
+    let response = response
+        .get()
+        .map_err(|err| format!("failed to decode getCapabilityExport() response: {err}"))?;
+    let label = response
+        .get_label()
+        .map_err(|err| format!("failed to read imported label: {err}"))?
+        .to_str()
+        .unwrap_or("")
+        .to_string();
+    let kind = match response
+        .get_kind()
+        .map_err(|err| format!("failed to read imported capability kind: {err}"))?
+    {
+        tunnel_capnp::CapabilityKind::IpNetwork => ImportedRemoteCapabilityKind::IpNetwork,
+        tunnel_capnp::CapabilityKind::ApiSession => ImportedRemoteCapabilityKind::ApiSession,
+        tunnel_capnp::CapabilityKind::Other => ImportedRemoteCapabilityKind::Other,
+    };
+    let type_tag = response
+        .get_type_tag()
+        .map_err(|err| format!("failed to read imported capability type tag: {err}"))?
+        .to_str()
+        .unwrap_or("")
+        .to_string();
+    let descriptor_json = response
+        .get_descriptor_json()
+        .ok()
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.to_string())
+        .filter(|value| !value.is_empty());
+    let client = response
+        .get_cap()
+        .get_as_capability::<capnp::capability::Client>()
+        .map_err(|err| format!("failed to read imported capability: {err}"))?;
+    Ok((label, kind, type_tag, descriptor_json, client))
+}
+
 async fn connect_peer_rpc_session(
     app_state: Arc<Mutex<AppState>>,
     sandstorm_api: grain_capnp::sandstorm_api::Client<capnp::any_pointer::Owned>,
@@ -3440,6 +4980,45 @@ async fn connect_peer_rpc_session(
     app_core(&app_state)
         .connect_peer_rpc_session(sandstorm_api)
         .await
+}
+
+async fn begin_pair_connection(
+    app_state: Arc<Mutex<AppState>>,
+    sandstorm_api: grain_capnp::sandstorm_api::Client<capnp::any_pointer::Owned>,
+) -> Result<(), String> {
+    app_core(&app_state).begin_pair_connection(sandstorm_api).await
+}
+
+async fn refresh_peer_rpc_exports(app_state: &Arc<Mutex<AppState>>) -> Result<bool, String> {
+    app_core(app_state).refresh_peer_rpc_exports().await
+}
+
+async fn accept_pending_pair_connection(
+    app_state: Arc<Mutex<AppState>>,
+    sandstorm_api: grain_capnp::sandstorm_api::Client<capnp::any_pointer::Owned>,
+) -> Result<(), String> {
+    app_core(&app_state)
+        .accept_pending_pair_connection(sandstorm_api)
+        .await
+}
+
+async fn reject_pending_pair_connection(app_state: Arc<Mutex<AppState>>) -> Result<(), String> {
+    app_core(&app_state).reject_pending_pair_connection().await
+}
+
+async fn enable_tunnel(
+    app_state: Arc<Mutex<AppState>>,
+    sandstorm_api: grain_capnp::sandstorm_api::Client<capnp::any_pointer::Owned>,
+) -> Result<(), String> {
+    app_core(&app_state).enable_tunnel(sandstorm_api).await
+}
+
+fn disable_tunnel(app_state: &Arc<Mutex<AppState>>) -> Result<(), String> {
+    app_core(app_state).disable_tunnel()
+}
+
+fn forget_peer(app_state: &Arc<Mutex<AppState>>) -> Result<(), String> {
+    app_core(app_state).forget_peer()
 }
 
 fn disconnect_peer_rpc_session(app_state: &Arc<Mutex<AppState>>) -> Result<(), String> {
@@ -3461,6 +5040,15 @@ async fn import_remote_api_session_export(
 ) -> Result<(String, String), String> {
     app_core(app_state)
         .import_remote_api_session_export(export_id)
+        .await
+}
+
+async fn import_remote_capability_export(
+    app_state: &Arc<Mutex<AppState>>,
+    export_id: &str,
+) -> Result<(String, String, ImportedRemoteCapabilityKind), String> {
+    app_core(app_state)
+        .import_remote_capability_export(export_id)
         .await
 }
 
@@ -3547,16 +5135,40 @@ async fn invoke_imported_remote_api_session(
         .await
 }
 
-fn parse_claim_payload(value: &str) -> (String, String) {
+fn parse_claim_payload(value: &str) -> Result<(String, String, Option<String>), String> {
     let trimmed = value.trim();
+    if trimmed.starts_with('{') {
+        let payload: serde_json::Value = serde_json::from_str(trimmed)
+            .map_err(|err| format!("invalid claim payload json: {err}"))?;
+        let token = payload
+            .get("token")
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if token.is_empty() {
+            return Err("missing powerbox request token".to_string());
+        }
+        let label = payload
+            .get("label")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("Powerbox capability")
+            .to_string();
+        let descriptor_json = payload
+            .get("descriptor")
+            .map(|value| value.to_string());
+        return Ok((token, label, descriptor_json));
+    }
     if let Some((token, label)) = trimmed.split_once('\n') {
         let token = token.trim().to_string();
         let label = label.trim();
         if !token.is_empty() && !label.is_empty() {
-            return (token, label.to_string());
+            return Ok((token, label.to_string(), None));
         }
     }
-    (trimmed.to_string(), "Powerbox capability".to_string())
+    Ok((trimmed.to_string(), "Powerbox capability".to_string(), None))
 }
 
 fn parse_http_probe_request(value: &str) -> Result<HttpProbeRequest, String> {
@@ -3854,6 +5466,99 @@ fn powerbox_query_for_interface(type_id: u64) -> Result<String, String> {
     Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
 }
 
+fn encode_powerbox_descriptor(
+    descriptor: powerbox_capnp::powerbox_descriptor::Reader<'_>,
+) -> Result<String, capnp::Error> {
+    let mut message = capnp::message::Builder::new_default();
+    message
+        .set_root(descriptor)
+        .map_err(|err| capnp::Error::failed(format!("failed to copy powerbox descriptor: {err}")))?;
+    let mut bytes = Vec::new();
+    capnp::serialize_packed::write_message(&mut bytes, &message)
+        .map_err(|err| capnp::Error::failed(format!("failed to encode powerbox descriptor: {err}")))?;
+    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
+}
+
+fn decode_powerbox_descriptor(
+    encoded: &str,
+) -> Result<capnp::message::Reader<capnp::serialize::OwnedSegments>, String> {
+    let normalized =
+        normalize_descriptor_string(encoded).unwrap_or_else(|| encoded.trim().to_string());
+    let trimmed = normalized.trim();
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(trimmed)
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(trimmed))
+        .or_else(|_| base64::engine::general_purpose::STANDARD.decode(trimmed))
+        .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(trimmed))
+        .map_err(|err| format!("failed to decode powerbox descriptor base64: {err}"))?;
+    let reader = capnp::serialize_packed::read_message(
+        &mut bytes.as_slice(),
+        capnp::message::ReaderOptions::new(),
+    )
+    .map_err(|err| format!("failed to decode powerbox descriptor message: {err}"))?;
+    Ok(reader)
+}
+
+fn encode_pair_control_message(message: PairControlMessage) -> Result<Vec<u8>, String> {
+    let mut builder = capnp::message::Builder::new_default();
+    let mut control = builder.init_root::<tunnel_capnp::pair_control::Builder<'_>>();
+    match message {
+        PairControlMessage::Request { version } => {
+            control.reborrow().init_request().set_version(version);
+        }
+        PairControlMessage::Response { version, decision } => {
+            let mut response = control.reborrow().init_response();
+            response.set_version(version);
+            response.set_decision(match decision {
+                PairControlDecision::Accepted => tunnel_capnp::PairDecision::Accepted,
+                PairControlDecision::Rejected => tunnel_capnp::PairDecision::Rejected,
+            });
+        }
+    }
+
+    let mut bytes = Vec::new();
+    capnp::serialize_packed::write_message(&mut bytes, &builder)
+        .map_err(|err| format!("failed to encode pair control message: {err}"))?;
+    Ok(bytes)
+}
+
+fn decode_pair_control_message(bytes: &[u8]) -> Result<PairControlMessage, String> {
+    let mut slice = bytes;
+    let reader = capnp::serialize_packed::read_message(
+        &mut slice,
+        capnp::message::ReaderOptions::new(),
+    )
+    .map_err(|err| format!("failed to decode pair control message: {err}"))?;
+    let control = reader
+        .get_root::<tunnel_capnp::pair_control::Reader<'_>>()
+        .map_err(|err| format!("failed to read pair control root: {err}"))?;
+    match control
+        .which()
+        .map_err(|err| format!("failed to decode pair control union: {err}"))?
+    {
+        tunnel_capnp::pair_control::Request(request) => Ok(PairControlMessage::Request {
+            version: request
+                .map_err(|err| format!("failed to read pair request: {err}"))?
+                .get_version(),
+        }),
+        tunnel_capnp::pair_control::Response(response) => {
+            let response = response
+                .map_err(|err| format!("failed to read pair response: {err}"))?;
+            let decision = match response
+                .get_decision()
+                .map_err(|err| format!("failed to read pair response decision: {err}"))?
+            {
+                tunnel_capnp::PairDecision::Accepted => PairControlDecision::Accepted,
+                tunnel_capnp::PairDecision::Rejected => PairControlDecision::Rejected,
+            };
+            Ok(PairControlMessage::Response {
+                version: response.get_version(),
+                decision,
+            })
+        }
+    }
+}
+
 fn format_local_ticket(endpoint_addr: &IrohEndpointAddrSummary) -> String {
     let mut lines = vec![endpoint_addr.node_id.clone()];
     lines.extend(
@@ -3955,12 +5660,29 @@ mod tests {
             .map(|value| value.object_id.clone())
     }
 
+    async fn wait_for_test_condition<F>(label: &str, mut predicate: F)
+    where
+        F: FnMut() -> bool,
+    {
+        let started = std::time::Instant::now();
+        loop {
+            if predicate() {
+                return;
+            }
+            if started.elapsed() > Duration::from_secs(3) {
+                panic!("timed out waiting for condition: {label}");
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
     fn persisted_api_session_object_id(app: &App) -> Option<String> {
         let state = app.shared_state_for_test();
         let guard = state.lock().unwrap();
         guard
-            .persisted_received_api_session
-            .as_ref()
+            .persisted_received_caps
+            .iter()
+            .find(|record| record.kind == ImportedRemoteCapabilityKind::ApiSession)
             .map(|value| value.object_id.clone())
     }
 
@@ -4150,6 +5872,38 @@ mod tests {
     }
 
     #[test]
+    fn pair_control_request_round_trips_through_capnp() {
+        let bytes = encode_pair_control_message(PairControlMessage::Request {
+            version: PAIRING_PROTOCOL_VERSION,
+        })
+        .unwrap();
+        let decoded = decode_pair_control_message(&bytes).unwrap();
+        assert_eq!(
+            decoded,
+            PairControlMessage::Request {
+                version: PAIRING_PROTOCOL_VERSION,
+            }
+        );
+    }
+
+    #[test]
+    fn pair_control_response_round_trips_through_capnp() {
+        let bytes = encode_pair_control_message(PairControlMessage::Response {
+            version: PAIRING_PROTOCOL_VERSION,
+            decision: PairControlDecision::Accepted,
+        })
+        .unwrap();
+        let decoded = decode_pair_control_message(&bytes).unwrap();
+        assert_eq!(
+            decoded,
+            PairControlMessage::Response {
+                version: PAIRING_PROTOCOL_VERSION,
+                decision: PairControlDecision::Accepted,
+            }
+        );
+    }
+
+    #[test]
     fn require_saved_capability_by_token_reports_missing_token() {
         let err = require_saved_capability_by_token("definitely-missing").unwrap_err();
         assert_eq!(err, "saved capability token not found");
@@ -4164,6 +5918,7 @@ mod tests {
                 label: "IpInterface capability".to_string(),
                 saved_token: "saved-token".to_string(),
                 created_at_ms: 1,
+                descriptor_json: None,
             };
 
             configure_raw_udp_interface_binding(
@@ -4247,6 +6002,7 @@ mod tests {
     #[test]
     fn render_state_json_includes_raw_udp_interface_and_ip_interface_query() {
         let app_state = Arc::new(Mutex::new(AppState {
+            storage: Storage::new(make_test_storage_root("render-state-json")),
             iroh_identity: IrohIdentity {
                 node_id: test_endpoint_id(6).to_string(),
                 secret_key: SecretKey::from_bytes(&[6; 32]),
@@ -4264,19 +6020,27 @@ mod tests {
                 label: "IpInterface capability".to_string(),
                 saved_token: "saved-raw-token".to_string(),
                 created_at_ms: 42,
+                descriptor_json: None,
             }),
             raw_udp_interface_source: Some("saved".to_string()),
             remote_ticket: None,
+            approved_peer_node_id: None,
+            pending_incoming_peer_node_id: None,
+            pending_outgoing_peer_node_id: None,
+            pending_incoming_connection: None,
+            tunnel_enabled: true,
+            pairing_status: PairingStatus::Disconnected,
+            shared_caps: Vec::new(),
             exported_ip_network: None,
             exported_api_session: None,
-            exported_ip_network_live: None,
-            exported_api_session_live: None,
+            exported_caps_live: HashMap::new(),
+            exported_ip_network_live: HashMap::new(),
+            exported_api_session_live: HashMap::new(),
             peer_rpc_session: None,
             imported_remote_ip_network: None,
             imported_remote_api_session: None,
             imported_remote_caps: HashMap::new(),
-            persisted_received_ip_network: None,
-            persisted_received_api_session: None,
+            persisted_received_caps: Vec::new(),
             next_peer_rpc_session_id: 0,
             next_imported_remote_cap_id: 0,
             peer_rpc_error: None,
@@ -4290,6 +6054,8 @@ mod tests {
         assert!(state_json.contains("saved-raw-token"));
         assert!(state_json.contains("\"source\":\"saved\""));
         assert!(state_json.contains("1234_deadbeef"));
+        assert!(state_json.contains("\"pairing\":{"));
+        assert!(state_json.contains("\"status\":\"disconnected\""));
     }
 
     #[test]
@@ -4371,6 +6137,253 @@ mod tests {
     }
 
     #[test]
+    fn begin_pair_connection_creates_pending_outgoing_and_incoming_states() {
+        run_local_async_test(async {
+            let (app_a, _, app_a_sandstorm_api) = build_test_app("pair-state-a", 201).await;
+            let (app_b, _, _) = build_test_app("pair-state-b", 202).await;
+
+            let app_a_node_id = app_a.local_ticket_for_test().unwrap().lines().next().unwrap().to_string();
+            let app_b_node_id = app_b.local_ticket_for_test().unwrap().lines().next().unwrap().to_string();
+
+            app_a
+                .set_remote_ticket_for_test(app_b.local_ticket_for_test().unwrap())
+                .unwrap();
+
+            let app_a_clone = app_a.clone();
+            let app_a_api = app_a_sandstorm_api.clone();
+            tokio::task::spawn_local(async move {
+                let _ = app_a_clone.begin_pair_connection(app_a_api).await;
+            });
+
+            wait_for_test_condition("outgoing awaiting accept", || {
+                let state_json = app_a.render_state_json().unwrap();
+                state_json.contains("\"status\":\"awaitingRemoteAccept\"")
+                    && state_json.contains(&format!(
+                        "\"pendingOutgoingPeerNodeId\":\"{app_b_node_id}\""
+                    ))
+            })
+            .await;
+
+            wait_for_test_condition("incoming request visible", || {
+                let state_json = app_b.render_state_json().unwrap();
+                state_json.contains("\"status\":\"incomingRequest\"")
+                    && state_json.contains(&format!(
+                        "\"pendingIncomingPeerNodeId\":\"{app_a_node_id}\""
+                    ))
+            })
+            .await;
+
+            app_a.close_test_endpoint().await;
+            app_b.close_test_endpoint().await;
+        });
+    }
+
+    #[test]
+    fn accepting_pending_pair_connection_transitions_both_sides_to_connected() {
+        run_local_async_test(async {
+            let (app_a, _, app_a_sandstorm_api) = build_test_app("pair-accept-a", 211).await;
+            let (app_b, _, app_b_sandstorm_api) = build_test_app("pair-accept-b", 212).await;
+
+            app_a
+                .set_remote_ticket_for_test(app_b.local_ticket_for_test().unwrap())
+                .unwrap();
+
+            let app_a_clone = app_a.clone();
+            let app_a_api = app_a_sandstorm_api.clone();
+            tokio::task::spawn_local(async move {
+                let _ = app_a_clone.begin_pair_connection(app_a_api).await;
+            });
+
+            wait_for_test_condition("incoming request before accept", || {
+                app_b
+                    .render_state_json()
+                    .unwrap()
+                    .contains("\"status\":\"incomingRequest\"")
+            })
+            .await;
+
+            let app_b_clone = app_b.clone();
+            let app_b_api = app_b_sandstorm_api.clone();
+            tokio::task::spawn_local(async move {
+                let _ = app_b_clone.accept_pending_pair_connection(app_b_api).await;
+            });
+
+            wait_for_test_condition("side a connected", || {
+                let state_json = app_a.render_state_json().unwrap();
+                state_json.contains("\"status\":\"connected\"")
+                    && state_json.contains("\"connected\":true")
+            })
+            .await;
+
+            wait_for_test_condition("side b connected", || {
+                let state_json = app_b.render_state_json().unwrap();
+                state_json.contains("\"status\":\"connected\"")
+                    && state_json.contains("\"connected\":true")
+            })
+            .await;
+
+            app_a.close_test_endpoint().await;
+            app_b.close_test_endpoint().await;
+        });
+    }
+
+    #[test]
+    fn rejecting_pending_pair_connection_returns_initiator_to_error_and_clears_pending_state() {
+        run_local_async_test(async {
+            let (app_a, _, app_a_sandstorm_api) = build_test_app("pair-reject-a", 221).await;
+            let (app_b, _, _) = build_test_app("pair-reject-b", 222).await;
+
+            app_a
+                .set_remote_ticket_for_test(app_b.local_ticket_for_test().unwrap())
+                .unwrap();
+
+            let app_a_clone = app_a.clone();
+            let app_a_api = app_a_sandstorm_api.clone();
+            tokio::task::spawn_local(async move {
+                let _ = app_a_clone.begin_pair_connection(app_a_api).await;
+            });
+
+            wait_for_test_condition("incoming request before reject", || {
+                app_b
+                    .render_state_json()
+                    .unwrap()
+                    .contains("\"status\":\"incomingRequest\"")
+            })
+            .await;
+
+            app_b.reject_pending_pair_connection().await.unwrap();
+
+            wait_for_test_condition("initiator enters error state", || {
+                let state_json = app_a.render_state_json().unwrap();
+                state_json.contains("\"status\":\"error\"")
+                    && state_json.contains("remote grain rejected the connection")
+            })
+            .await;
+
+            let responder_state = app_b.render_state_json().unwrap();
+            assert!(responder_state.contains("\"pendingIncomingPeerNodeId\":null"));
+            assert!(responder_state.contains("\"status\":\"disconnected\""));
+
+            app_a.close_test_endpoint().await;
+            app_b.close_test_endpoint().await;
+        });
+    }
+
+    #[test]
+    fn approved_peer_reconnects_without_manual_accept() {
+        run_local_async_test(async {
+            let (app_a, _, app_a_sandstorm_api) = build_test_app("pair-auto-a", 231).await;
+            let (app_b, app_b_state, _) = build_test_app("pair-auto-b", 232).await;
+
+            let app_a_node_id = app_a
+                .local_ticket_for_test()
+                .unwrap()
+                .lines()
+                .next()
+                .unwrap()
+                .to_string();
+
+            {
+                let mut guard = app_b_state.lock().unwrap();
+                guard.approved_peer_node_id = Some(app_a_node_id);
+                guard.tunnel_enabled = true;
+                guard.pairing_status = PairingStatus::Disconnected;
+            }
+
+            app_a
+                .set_remote_ticket_for_test(app_b.local_ticket_for_test().unwrap())
+                .unwrap();
+
+            let app_a_clone = app_a.clone();
+            tokio::task::spawn_local(async move {
+                let _ = app_a_clone.begin_pair_connection(app_a_sandstorm_api).await;
+            });
+
+            wait_for_test_condition("auto accepted initiator connected", || {
+                app_a
+                    .render_state_json()
+                    .unwrap()
+                    .contains("\"status\":\"connected\"")
+            })
+            .await;
+
+            wait_for_test_condition("auto accepted responder connected", || {
+                app_b
+                    .render_state_json()
+                    .unwrap()
+                    .contains("\"status\":\"connected\"")
+            })
+            .await;
+
+            app_a.close_test_endpoint().await;
+            app_b.close_test_endpoint().await;
+        });
+    }
+
+    #[test]
+    fn approved_disabled_peer_waits_for_enable_then_connects() {
+        run_local_async_test(async {
+            let (app_a, _, app_a_sandstorm_api) = build_test_app("pair-enable-a", 241).await;
+            let (app_b, app_b_state, app_b_sandstorm_api) =
+                build_test_app("pair-enable-b", 242).await;
+
+            let app_a_node_id = app_a
+                .local_ticket_for_test()
+                .unwrap()
+                .lines()
+                .next()
+                .unwrap()
+                .to_string();
+
+            {
+                let mut guard = app_b_state.lock().unwrap();
+                guard.approved_peer_node_id = Some(app_a_node_id.clone());
+                guard.tunnel_enabled = false;
+                guard.pairing_status = PairingStatus::Disabled;
+            }
+
+            app_a
+                .set_remote_ticket_for_test(app_b.local_ticket_for_test().unwrap())
+                .unwrap();
+
+            let app_a_clone = app_a.clone();
+            tokio::task::spawn_local(async move {
+                let _ = app_a_clone.begin_pair_connection(app_a_sandstorm_api).await;
+            });
+
+            wait_for_test_condition("disabled peer shows pending reconnect", || {
+                let state_json = app_b.render_state_json().unwrap();
+                state_json.contains("\"status\":\"disabled\"")
+                    && state_json.contains(&format!(
+                        "\"pendingIncomingPeerNodeId\":\"{app_a_node_id}\""
+                    ))
+            })
+            .await;
+
+            app_b.enable_tunnel(app_b_sandstorm_api).await.unwrap();
+
+            wait_for_test_condition("initiator connected after enable", || {
+                app_a
+                    .render_state_json()
+                    .unwrap()
+                    .contains("\"status\":\"connected\"")
+            })
+            .await;
+
+            wait_for_test_condition("responder connected after enable", || {
+                app_b
+                    .render_state_json()
+                    .unwrap()
+                    .contains("\"status\":\"connected\"")
+            })
+            .await;
+
+            app_a.close_test_endpoint().await;
+            app_b.close_test_endpoint().await;
+        });
+    }
+
+    #[test]
     fn load_persisted_received_capabilities_ignores_malformed_rows() {
         let root = make_test_storage_root("malformed-received-caps");
         let storage = Storage::new(&root);
@@ -4386,9 +6399,16 @@ mod tests {
         )
         .unwrap();
 
-        let (ip_network, api_session) = storage.load_persisted_received_capabilities().unwrap();
-        let ip_network = ip_network.expect("expected ip network record");
-        let api_session = api_session.expect("expected api session record");
+        let records = storage.load_persisted_received_capabilities().unwrap();
+        let ip_network = records
+            .iter()
+            .find(|record| record.kind == ReceivedCapabilityKind::IpNetwork)
+            .expect("expected ip network record");
+        let api_session = records
+            .iter()
+            .rev()
+            .find(|record| record.kind == ReceivedCapabilityKind::ApiSession)
+            .expect("expected api session record");
 
         assert_eq!(ip_network.object_id, "remote-cap-3");
         assert_eq!(ip_network.export_id, "export-net");
@@ -4463,16 +6483,22 @@ mod tests {
             export_id: "export-net".to_string(),
             label: "Net".to_string(),
             kind: ImportedRemoteCapabilityKind::IpNetwork,
+            type_tag: imported_type_tag_for_kind(ImportedRemoteCapabilityKind::IpNetwork),
+            descriptor_json: None,
+            enabled: true,
         };
         let api_session = PersistedReceivedCapability {
             object_id: "remote-cap-12".to_string(),
             export_id: "export-api".to_string(),
             label: "Api".to_string(),
             kind: ImportedRemoteCapabilityKind::ApiSession,
+            type_tag: imported_type_tag_for_kind(ImportedRemoteCapabilityKind::ApiSession),
+            descriptor_json: None,
+            enabled: true,
         };
 
         assert_eq!(
-            max_persisted_received_cap_id(Some(&ip_network), Some(&api_session)),
+            max_persisted_received_cap_id(&[ip_network, api_session]),
             Some(12)
         );
     }
@@ -4490,9 +6516,15 @@ mod tests {
         )
         .unwrap();
 
-        let (ip_network, api_session) = storage.load_persisted_received_capabilities().unwrap();
-        let ip_network = ip_network.expect("expected ip network record");
-        let api_session = api_session.expect("expected api session record");
+        let records = storage.load_persisted_received_capabilities().unwrap();
+        let ip_network = records
+            .iter()
+            .find(|record| record.kind == ReceivedCapabilityKind::IpNetwork)
+            .expect("expected ip network record");
+        let api_session = records
+            .iter()
+            .find(|record| record.kind == ReceivedCapabilityKind::ApiSession)
+            .expect("expected api session record");
 
         assert_eq!(ip_network.object_id, "remote-cap-7");
         assert_eq!(api_session.object_id, "remote-cap-7");
@@ -4582,7 +6614,7 @@ mod tests {
     }
 
     #[test]
-    fn restore_collision_between_persisted_kinds_currently_prefers_ip_network_record() {
+    fn restore_collision_between_persisted_kinds_currently_prefers_first_record() {
         run_local_async_test(async {
             let app = App::new_for_test(
                 Storage::new(make_test_storage_root("restore-collision")),
@@ -4591,17 +6623,23 @@ mod tests {
             {
                 let state = app.shared_state_for_test();
                 let mut guard = state.lock().unwrap();
-                guard.persisted_received_ip_network = Some(PersistedReceivedCapability {
+                guard.persisted_received_caps.push(PersistedReceivedCapability {
                     object_id: "remote-cap-7".to_string(),
                     export_id: "export-net".to_string(),
                     label: "Net".to_string(),
                     kind: ImportedRemoteCapabilityKind::IpNetwork,
+                    type_tag: imported_type_tag_for_kind(ImportedRemoteCapabilityKind::IpNetwork),
+                    descriptor_json: None,
+                    enabled: true,
                 });
-                guard.persisted_received_api_session = Some(PersistedReceivedCapability {
+                guard.persisted_received_caps.push(PersistedReceivedCapability {
                     object_id: "remote-cap-7".to_string(),
                     export_id: "export-api".to_string(),
                     label: "Api".to_string(),
                     kind: ImportedRemoteCapabilityKind::ApiSession,
+                    type_tag: imported_type_tag_for_kind(ImportedRemoteCapabilityKind::ApiSession),
+                    descriptor_json: None,
+                    enabled: true,
                 });
             }
 
@@ -4865,6 +6903,72 @@ mod tests {
     }
 
     #[test]
+    fn peer_session_lists_and_fetches_multiple_api_session_exports() {
+        run_local_async_test(async {
+            let (exporter_app, _, exporter_sandstorm_api) =
+                build_test_app("multi-api-exporter", 53).await;
+            let (importer_app, _, importer_sandstorm_api) =
+                build_test_app("multi-api-importer", 54).await;
+
+            exporter_app
+                .seed_exported_api_session_for_test(
+                    "preview-api-a",
+                    "Preview API A",
+                    new_client(crate::test_support::FakePreviewApiSession {
+                        response_bytes: b"%PDF-A\n".to_vec(),
+                    }),
+                )
+                .unwrap();
+            exporter_app
+                .append_exported_api_session_for_test(
+                    "preview-api-b",
+                    "Preview API B",
+                    new_client(crate::test_support::FakePreviewApiSession {
+                        response_bytes: b"%PDF-B\n".to_vec(),
+                    }),
+                )
+                .unwrap();
+            importer_app
+                .set_remote_ticket_for_test(exporter_app.local_ticket_for_test().unwrap())
+                .unwrap();
+
+            let (_, api_exports) = importer_app
+                .connect_peer_rpc_session(importer_sandstorm_api.clone())
+                .await
+                .unwrap();
+            assert_eq!(api_exports.len(), 2);
+            assert!(api_exports.iter().any(|export| export.id == "preview-api-a"));
+            assert!(api_exports.iter().any(|export| export.id == "preview-api-b"));
+
+            let _ = importer_app
+                .import_remote_api_session_export("preview-api-a")
+                .await
+                .unwrap();
+            let summary_a = importer_app
+                .invoke_imported_remote_api_session("a.docx", b"a")
+                .await
+                .unwrap();
+            assert_eq!(summary_a.response_bytes, b"%PDF-A\n".to_vec());
+
+            let _ = importer_app.drop_received_remote_capability("remote-cap-1").unwrap();
+
+            let _ = importer_app
+                .import_remote_api_session_export("preview-api-b")
+                .await
+                .unwrap();
+            let summary_b = importer_app
+                .invoke_imported_remote_api_session("b.docx", b"b")
+                .await
+                .unwrap();
+            assert_eq!(summary_b.response_bytes, b"%PDF-B\n".to_vec());
+
+            let _ = exporter_sandstorm_api;
+            importer_app.close_test_endpoint().await;
+            exporter_app.close_test_endpoint().await;
+        });
+    }
+
+    #[test]
     fn dropped_api_session_does_not_reappear_after_reconnect() {
         run_local_async_test(async {
             let (exporter_app, _, exporter_sandstorm_api) =
@@ -5043,7 +7147,7 @@ mod tests {
     }
 
     #[test]
-    fn swapped_export_can_be_reimported_into_same_object_id() {
+    fn swapped_export_gets_a_new_object_id() {
         run_local_async_test(async {
             let (exporter_app, _, exporter_sandstorm_api) =
                 build_test_app("swap-exporter", 91).await;
@@ -5094,7 +7198,7 @@ mod tests {
                 .import_remote_api_session_export("preview-api-v2")
                 .await
                 .unwrap();
-            assert_eq!(new_object_id, object_id);
+            assert_ne!(new_object_id, object_id);
 
             let summary = importer_app
                 .invoke_imported_remote_api_session("swap.docx", b"swap")
@@ -5248,17 +7352,24 @@ struct PeerBootstrapImpl {
 }
 
 impl tunnel_capnp::peer_bootstrap::Server for PeerBootstrapImpl {
-    fn list_ip_network_exports(
+    fn list_capability_exports(
         self: Rc<Self>,
-        _: tunnel_capnp::peer_bootstrap::ListIpNetworkExportsParams,
-        mut results: tunnel_capnp::peer_bootstrap::ListIpNetworkExportsResults,
+        _: tunnel_capnp::peer_bootstrap::ListCapabilityExportsParams,
+        mut results: tunnel_capnp::peer_bootstrap::ListCapabilityExportsResults,
     ) -> Promise<(), capnp::Error> {
-        let export = match self.app_state.lock() {
+        let exports = match self.app_state.lock() {
             Ok(guard) => guard
-                .exported_ip_network_live
-                .as_ref()
-                .map(|value| value.saved_cap.clone())
-                .or_else(|| guard.exported_ip_network.clone()),
+                .shared_caps
+                .iter()
+                .filter(|cap| cap.enabled)
+                .map(|cap| PeerRpcCapabilityExport {
+                    id: cap.saved_cap.id.clone(),
+                    label: cap.label.clone(),
+                    kind: cap.kind,
+                    type_tag: shared_capability_type_tag(cap),
+                    descriptor_json: cap.saved_cap.descriptor_json.clone(),
+                })
+                .collect::<Vec<_>>(),
             Err(_) => {
                 return Promise::err(capnp::Error::failed(
                     "app state lock poisoned".to_string(),
@@ -5267,13 +7378,120 @@ impl tunnel_capnp::peer_bootstrap::Server for PeerBootstrapImpl {
         };
 
         let mut result = results.get();
-        let mut exports = result.reborrow().init_exports(if export.is_some() { 1 } else { 0 });
-        if let Some(export) = export {
-            let mut entry = exports.reborrow().get(0);
+        let mut entries = result.reborrow().init_exports(exports.len() as u32);
+        for (index, export) in exports.iter().enumerate() {
+            let mut entry = entries.reborrow().get(index as u32);
+            entry.set_id(&export.id);
+            entry.set_label(&export.label);
+            entry.set_kind(match export.kind {
+                SharedCapabilityKind::IpNetwork => tunnel_capnp::CapabilityKind::IpNetwork,
+                SharedCapabilityKind::ApiSession => tunnel_capnp::CapabilityKind::ApiSession,
+                SharedCapabilityKind::Other => tunnel_capnp::CapabilityKind::Other,
+            });
+            entry.set_type_tag(&export.type_tag);
+            entry.set_descriptor_json(export.descriptor_json.as_deref().unwrap_or(""));
+        }
+        Promise::ok(())
+    }
+
+    fn list_ip_network_exports(
+        self: Rc<Self>,
+        _: tunnel_capnp::peer_bootstrap::ListIpNetworkExportsParams,
+        mut results: tunnel_capnp::peer_bootstrap::ListIpNetworkExportsResults,
+    ) -> Promise<(), capnp::Error> {
+        let exports = match self.app_state.lock() {
+            Ok(guard) => guard
+                .shared_caps
+                .iter()
+                .filter(|cap| cap.kind == SharedCapabilityKind::IpNetwork && cap.enabled)
+                .map(|cap| cap.saved_cap.clone())
+                .collect::<Vec<_>>(),
+            Err(_) => {
+                return Promise::err(capnp::Error::failed(
+                    "app state lock poisoned".to_string(),
+                ));
+            }
+        };
+
+        let mut result = results.get();
+        let mut entries = result.reborrow().init_exports(exports.len() as u32);
+        for (index, export) in exports.iter().enumerate() {
+            let mut entry = entries.reborrow().get(index as u32);
             entry.set_id(&export.id);
             entry.set_label(&export.label);
         }
         Promise::ok(())
+    }
+
+    fn get_capability_export(
+        self: Rc<Self>,
+        params: tunnel_capnp::peer_bootstrap::GetCapabilityExportParams,
+        mut results: tunnel_capnp::peer_bootstrap::GetCapabilityExportResults,
+    ) -> Promise<(), capnp::Error> {
+        let requested_id = match params.get() {
+            Ok(params) => match params.get_id() {
+                Ok(value) => value.to_str().unwrap_or("").to_string(),
+                Err(err) => return Promise::err(err),
+            },
+            Err(err) => return Promise::err(err),
+        };
+
+        let export = match self.app_state.lock() {
+            Ok(guard) => match guard
+                .shared_caps
+                .iter()
+                .find(|cap| cap.enabled && cap.saved_cap.id == requested_id)
+            {
+                Some(cap) => cap.clone(),
+                None => {
+                    return Promise::err(capnp::Error::failed(format!(
+                        "unknown capability export id: {requested_id}"
+                    )))
+                }
+            },
+            Err(_) => {
+                return Promise::err(capnp::Error::failed(
+                    "app state lock poisoned".to_string(),
+                ));
+            }
+        };
+
+        let sandstorm_api = self.sandstorm_api.clone();
+        let app_state = self.app_state.clone();
+        Promise::from_future(async move {
+            let cap = {
+                let guard = app_state
+                    .lock()
+                    .map_err(|_| capnp::Error::failed("app state lock poisoned".to_string()))?;
+                guard.exported_caps_live.get(&export.saved_cap.id).cloned()
+            };
+            let cap = match cap {
+                Some(cap) => cap,
+                None => {
+                    let cap =
+                        restore_saved_generic_capability(sandstorm_api, &export.saved_cap.saved_token)
+                            .await
+                            .map_err(capnp::Error::failed)?;
+                    if let Ok(mut guard) = app_state.lock() {
+                        guard
+                            .exported_caps_live
+                            .insert(export.saved_cap.id.clone(), cap.clone());
+                    }
+                    cap
+                }
+            };
+            let mut result = results.get();
+            result.reborrow().get_cap().set_as_capability(cap.hook);
+            result.set_label(&export.label);
+            result.set_kind(match export.kind {
+                SharedCapabilityKind::IpNetwork => tunnel_capnp::CapabilityKind::IpNetwork,
+                SharedCapabilityKind::ApiSession => tunnel_capnp::CapabilityKind::ApiSession,
+                SharedCapabilityKind::Other => tunnel_capnp::CapabilityKind::Other,
+            });
+            result.set_type_tag(&shared_capability_type_tag(&export));
+            result.set_descriptor_json(export.saved_cap.descriptor_json.as_deref().unwrap_or(""));
+            Ok(())
+        })
     }
 
     fn get_ip_network_export(
@@ -5283,10 +7501,10 @@ impl tunnel_capnp::peer_bootstrap::Server for PeerBootstrapImpl {
     ) -> Promise<(), capnp::Error> {
         let export = match self.app_state.lock() {
             Ok(guard) => guard
-                .exported_ip_network_live
-                .as_ref()
-                .map(|value| value.saved_cap.clone())
-                .or_else(|| guard.exported_ip_network.clone()),
+                .shared_caps
+                .iter()
+                .find(|cap| cap.kind == SharedCapabilityKind::IpNetwork && cap.enabled)
+                .map(|cap| cap.saved_cap.clone()),
             Err(_) => {
                 return Promise::err(capnp::Error::failed(
                     "app state lock poisoned".to_string(),
@@ -5301,15 +7519,34 @@ impl tunnel_capnp::peer_bootstrap::Server for PeerBootstrapImpl {
             Err(err) => return Promise::err(err),
         };
 
-        let Some(export) = export else {
+        let Some(mut export) = export else {
             return Promise::err(capnp::Error::failed(
                 "no IpNetwork export is configured".to_string(),
             ));
         };
         if export.id != requested_id {
-            return Promise::err(capnp::Error::failed(format!(
-                "unknown IpNetwork export id: {requested_id}"
-            )));
+            export = match self.app_state.lock() {
+                Ok(guard) => match guard
+                    .shared_caps
+                    .iter()
+                    .find(|cap| {
+                        cap.kind == SharedCapabilityKind::IpNetwork
+                            && cap.enabled
+                            && cap.saved_cap.id == requested_id
+                    }) {
+                    Some(cap) => cap.saved_cap.clone(),
+                    None => {
+                        return Promise::err(capnp::Error::failed(format!(
+                            "unknown IpNetwork export id: {requested_id}"
+                        )))
+                    }
+                },
+                Err(_) => {
+                    return Promise::err(capnp::Error::failed(
+                        "app state lock poisoned".to_string(),
+                    ));
+                }
+            };
         }
 
         let sandstorm_api = self.sandstorm_api.clone();
@@ -5321,8 +7558,7 @@ impl tunnel_capnp::peer_bootstrap::Server for PeerBootstrapImpl {
                     .map_err(|_| capnp::Error::failed("app state lock poisoned".to_string()))?;
                 guard
                     .exported_ip_network_live
-                    .as_ref()
-                    .filter(|value| value.saved_cap.id == export.id)
+                    .get(&export.id)
                     .map(|value| value.client.clone())
             };
             let cap = match cap {
@@ -5332,10 +7568,12 @@ impl tunnel_capnp::peer_bootstrap::Server for PeerBootstrapImpl {
                         .await
                         .map_err(capnp::Error::failed)?;
                     if let Ok(mut guard) = app_state.lock() {
-                        guard.exported_ip_network_live = Some(ExportedIpNetworkState {
-                            saved_cap: export.clone(),
-                            client: cap.clone(),
-                        });
+                        guard.exported_ip_network_live.insert(
+                            export.id.clone(),
+                            ExportedIpNetworkState {
+                                client: cap.clone(),
+                            },
+                        );
                     }
                     cap
                 }
@@ -5352,12 +7590,13 @@ impl tunnel_capnp::peer_bootstrap::Server for PeerBootstrapImpl {
         _: tunnel_capnp::peer_bootstrap::ListApiSessionExportsParams,
         mut results: tunnel_capnp::peer_bootstrap::ListApiSessionExportsResults,
     ) -> Promise<(), capnp::Error> {
-        let export = match self.app_state.lock() {
+        let exports = match self.app_state.lock() {
             Ok(guard) => guard
-                .exported_api_session_live
-                .as_ref()
-                .map(|value| value.saved_cap.clone())
-                .or_else(|| guard.exported_api_session.clone()),
+                .shared_caps
+                .iter()
+                .filter(|cap| cap.kind == SharedCapabilityKind::ApiSession && cap.enabled)
+                .map(|cap| cap.saved_cap.clone())
+                .collect::<Vec<_>>(),
             Err(_) => {
                 return Promise::err(capnp::Error::failed(
                     "app state lock poisoned".to_string(),
@@ -5366,9 +7605,9 @@ impl tunnel_capnp::peer_bootstrap::Server for PeerBootstrapImpl {
         };
 
         let mut result = results.get();
-        let mut exports = result.reborrow().init_exports(if export.is_some() { 1 } else { 0 });
-        if let Some(export) = export {
-            let mut entry = exports.reborrow().get(0);
+        let mut entries = result.reborrow().init_exports(exports.len() as u32);
+        for (index, export) in exports.iter().enumerate() {
+            let mut entry = entries.reborrow().get(index as u32);
             entry.set_id(&export.id);
             entry.set_label(&export.label);
         }
@@ -5382,10 +7621,10 @@ impl tunnel_capnp::peer_bootstrap::Server for PeerBootstrapImpl {
     ) -> Promise<(), capnp::Error> {
         let export = match self.app_state.lock() {
             Ok(guard) => guard
-                .exported_api_session_live
-                .as_ref()
-                .map(|value| value.saved_cap.clone())
-                .or_else(|| guard.exported_api_session.clone()),
+                .shared_caps
+                .iter()
+                .find(|cap| cap.kind == SharedCapabilityKind::ApiSession && cap.enabled)
+                .map(|cap| cap.saved_cap.clone()),
             Err(_) => {
                 return Promise::err(capnp::Error::failed(
                     "app state lock poisoned".to_string(),
@@ -5400,15 +7639,34 @@ impl tunnel_capnp::peer_bootstrap::Server for PeerBootstrapImpl {
             Err(err) => return Promise::err(err),
         };
 
-        let Some(export) = export else {
+        let Some(mut export) = export else {
             return Promise::err(capnp::Error::failed(
                 "no ApiSession export is configured".to_string(),
             ));
         };
         if export.id != requested_id {
-            return Promise::err(capnp::Error::failed(format!(
-                "unknown ApiSession export id: {requested_id}"
-            )));
+            export = match self.app_state.lock() {
+                Ok(guard) => match guard
+                    .shared_caps
+                    .iter()
+                    .find(|cap| {
+                        cap.kind == SharedCapabilityKind::ApiSession
+                            && cap.enabled
+                            && cap.saved_cap.id == requested_id
+                    }) {
+                    Some(cap) => cap.saved_cap.clone(),
+                    None => {
+                        return Promise::err(capnp::Error::failed(format!(
+                            "unknown ApiSession export id: {requested_id}"
+                        )))
+                    }
+                },
+                Err(_) => {
+                    return Promise::err(capnp::Error::failed(
+                        "app state lock poisoned".to_string(),
+                    ));
+                }
+            };
         }
 
         let sandstorm_api = self.sandstorm_api.clone();
@@ -5420,8 +7678,7 @@ impl tunnel_capnp::peer_bootstrap::Server for PeerBootstrapImpl {
                     .map_err(|_| capnp::Error::failed("app state lock poisoned".to_string()))?;
                 guard
                     .exported_api_session_live
-                    .as_ref()
-                    .filter(|value| value.saved_cap.id == export.id)
+                    .get(&export.id)
                     .map(|value| value.client.clone())
             };
             let cap = match cap {
@@ -5431,10 +7688,12 @@ impl tunnel_capnp::peer_bootstrap::Server for PeerBootstrapImpl {
                         .await
                         .map_err(capnp::Error::failed)?;
                     if let Ok(mut guard) = app_state.lock() {
-                        guard.exported_api_session_live = Some(ExportedApiSessionState {
-                            saved_cap: export.clone(),
-                            client: cap.clone(),
-                        });
+                        guard.exported_api_session_live.insert(
+                            export.id.clone(),
+                            ExportedApiSessionState {
+                                client: cap.clone(),
+                            },
+                        );
                     }
                     cap
                 }
@@ -5466,6 +7725,9 @@ async fn run_iroh_accept_loop(
                     .map_err(|err| format!("failed to inspect incoming ALPN: {err}"))?;
                 if alpn == IROH_RPC_ALPN {
                     return accept_peer_rpc_connection(accepting, app_state, sandstorm_api).await;
+                }
+                if alpn == IROH_PAIR_ALPN {
+                    return accept_pair_connection(accepting, app_state, sandstorm_api).await;
                 }
                 accept_probe_connection(accepting).await
             }
@@ -5535,6 +7797,117 @@ async fn accept_peer_rpc_connection(
         .await
         .map_err(|err| format!("peer rpc system failed: {err}"))?;
     Ok(())
+}
+
+async fn accept_pair_connection(
+    accepting: iroh::endpoint::Accepting,
+    app_state: Arc<Mutex<AppState>>,
+    sandstorm_api: grain_capnp::sandstorm_api::Client<capnp::any_pointer::Owned>,
+) -> Result<(), String> {
+    eprintln!("iroh pair: incoming pairing connection detected");
+    let connection = accepting
+        .await
+        .map_err(|err| format!("incoming pairing connection failed: {err}"))?;
+    let remote_node_id = connection.remote_id().to_string();
+    let (send, mut recv) = connection
+        .accept_bi()
+        .await
+        .map_err(|err| format!("failed to accept pairing control stream: {err}"))?;
+    let request_bytes = recv
+        .read_to_end(4096)
+        .await
+        .map_err(|err| format!("failed to read pairing control request: {err}"))?;
+    let request = decode_pair_control_message(&request_bytes)?;
+    match request {
+        PairControlMessage::Request { version } => {
+            if version != PAIRING_PROTOCOL_VERSION {
+                connection.close(0u32.into(), b"unsupported pairing protocol");
+                return Err(format!("unsupported pairing protocol version: {version}"));
+            }
+        }
+        _ => {
+            connection.close(0u32.into(), b"invalid pairing request");
+            return Err("unexpected pairing control message".to_string());
+        }
+    }
+
+    enum IncomingPairAction {
+        Store(PairingStatus),
+        AutoAccept,
+        Reject(&'static [u8], &'static str),
+    }
+
+    let action = {
+        let guard = app_state
+            .lock()
+            .map_err(|_| "app state lock poisoned".to_string())?;
+        if guard.peer_rpc_session.is_some()
+            || guard.pending_incoming_connection.is_some()
+            || guard.pending_outgoing_peer_node_id.is_some()
+        {
+            IncomingPairAction::Reject(
+                b"pairing busy",
+                "cannot accept pairing while another connection is active or pending",
+            )
+        } else if let Some(approved_peer_node_id) = guard.approved_peer_node_id.as_ref() {
+            if approved_peer_node_id == &remote_node_id {
+                if guard.tunnel_enabled {
+                    IncomingPairAction::AutoAccept
+                } else {
+                    IncomingPairAction::Store(PairingStatus::Disabled)
+                }
+            } else {
+                IncomingPairAction::Reject(
+                    b"peer not approved",
+                    "incoming pairing request does not match the approved peer",
+                )
+            }
+        } else {
+            IncomingPairAction::Store(PairingStatus::IncomingRequest)
+        }
+    };
+
+    match action {
+        IncomingPairAction::Reject(close_reason, err) => {
+            let response = encode_pair_control_message(PairControlMessage::Response {
+                version: PAIRING_PROTOCOL_VERSION,
+                decision: PairControlDecision::Rejected,
+            })?;
+            let mut send = send;
+            let _ = send.write_all(&response).await;
+            let _ = send.finish();
+            connection.close(0u32.into(), close_reason);
+            Err(err.to_string())
+        }
+        IncomingPairAction::Store(status) => {
+            let mut guard = app_state
+                .lock()
+                .map_err(|_| "app state lock poisoned".to_string())?;
+            guard.pending_incoming_peer_node_id = Some(remote_node_id.clone());
+            guard.pending_incoming_connection = Some(PendingIncomingConnection {
+                remote_node_id,
+                connection,
+                handshake_send: send,
+            });
+            guard.pairing_status = status;
+            Ok(())
+        }
+        IncomingPairAction::AutoAccept => {
+            {
+                let mut guard = app_state
+                    .lock()
+                    .map_err(|_| "app state lock poisoned".to_string())?;
+                guard.pending_incoming_peer_node_id = Some(remote_node_id.clone());
+                guard.pending_incoming_connection = Some(PendingIncomingConnection {
+                    remote_node_id,
+                    connection,
+                    handshake_send: send,
+                });
+                guard.pairing_status = PairingStatus::IncomingRequest;
+            }
+            accept_pending_pair_connection(app_state, sandstorm_api).await
+        }
+    }
 }
 
 struct ProbeConnectionSummary {
