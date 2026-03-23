@@ -58,6 +58,8 @@ const IROH_ALPN: &[u8] = b"dev.iroh-tunnel.capnp/1";
 const IROH_RPC_ALPN: &[u8] = b"dev.iroh-tunnel.capnp/rpc/1";
 const IROH_PAIR_ALPN: &[u8] = b"dev.iroh-tunnel.capnp/pair/1";
 const PAIRING_PROTOCOL_VERSION: u16 = 1;
+const MANAGE_TUNNEL_PERMISSION_INDEX: u32 = 0;
+const USE_RECEIVED_CAPS_PERMISSION_INDEX: u32 = 1;
 const IROH_TRANSPORT_ASSESSMENT: &str = "Saved IpNetwork is proven for outbound TCP and UDP. Native iroh 0.97.0 now exposes custom transports behind unstable-custom-transports, and this prototype has both a proxy-based Quinn RawUdp adapter and a native iroh CustomTransport scaffold for Sandstorm RawUdp. The remaining work is application plumbing: restore an IpInterface capability early enough to bind RawUdp, publish custom transport addresses in tickets, and decide how Sandstorm mode is configured and discovered.";
 const IROH_SANDSTORM_RAW_UDP_INTERFACE_TOKEN_ENV: &str = "IROH_SANDSTORM_RAW_UDP_INTERFACE_TOKEN";
 const IROH_SANDSTORM_RAW_UDP_PORT_ENV: &str = "IROH_SANDSTORM_RAW_UDP_PORT";
@@ -295,9 +297,13 @@ impl grain_capnp::ui_view::Server for UiViewImpl {
         );
         let user_info = pry!(params.get_user_info());
         let permissions = pry!(user_info.get_permissions());
-        let can_manage = permissions.len() > 0 && permissions.get(0);
+        let can_manage = permissions.len() > MANAGE_TUNNEL_PERMISSION_INDEX
+            && permissions.get(MANAGE_TUNNEL_PERMISSION_INDEX);
+        let can_use_received = permissions.len() > USE_RECEIVED_CAPS_PERMISSION_INDEX
+            && permissions.get(USE_RECEIVED_CAPS_PERMISSION_INDEX);
         let session_client: web_session_capnp::web_session::Client = new_client(WebSessionImpl {
             can_manage,
+            can_use_received,
             sandstorm_api: self.sandstorm_api.clone(),
             session_context: pry!(params.get_context()),
             app_state: self.app_state.clone(),
@@ -330,7 +336,10 @@ impl grain_capnp::ui_view::Server for UiViewImpl {
         );
         let user_info = pry!(params.get_user_info());
         let permissions = pry!(user_info.get_permissions());
-        let can_manage = permissions.len() > 0 && permissions.get(0);
+        let can_manage = permissions.len() > MANAGE_TUNNEL_PERMISSION_INDEX
+            && permissions.get(MANAGE_TUNNEL_PERMISSION_INDEX);
+        let can_use_received = permissions.len() > USE_RECEIVED_CAPS_PERMISSION_INDEX
+            && permissions.get(USE_RECEIVED_CAPS_PERMISSION_INDEX);
         let request_descriptor_b64 = match pry!(params.get_request_info())
             .iter()
             .next()
@@ -343,6 +352,7 @@ impl grain_capnp::ui_view::Server for UiViewImpl {
 
         let session_client: web_session_capnp::web_session::Client = new_client(WebSessionImpl {
             can_manage,
+            can_use_received,
             sandstorm_api: self.sandstorm_api.clone(),
             session_context: pry!(params.get_context()),
             app_state: self.app_state.clone(),
@@ -434,6 +444,7 @@ impl grain_capnp::main_view::Server<text::Owned> for UiViewImpl {
 
 struct WebSessionImpl {
     can_manage: bool,
+    can_use_received: bool,
     sandstorm_api: grain_capnp::sandstorm_api::Client<capnp::any_pointer::Owned>,
     session_context: grain_capnp::session_context::Client,
     app_state: Arc<Mutex<AppState>>,
@@ -1130,138 +1141,6 @@ impl web_session_capnp::web_session::Server for WebSessionImpl {
             });
         }
 
-        if path == "api/tunnel/rpc/import-ip-network" {
-            if !self.can_manage {
-                let mut error = results.get().init_client_error();
-                error.set_status_code(
-                    web_session_capnp::web_session::response::ClientErrorCode::Forbidden,
-                );
-                return Promise::ok(());
-            }
-
-            let body = pry!(params.get_content())
-                .get_content()
-                .unwrap_or(&[])
-                .to_vec();
-            let export_id = match std::str::from_utf8(&body) {
-                Ok(value) => value.trim().to_string(),
-                Err(err) => {
-                    let mut error = results.get().init_client_error();
-                    let description =
-                        format!("<!doctype html><title>Bad Request</title><p>{err}</p>");
-                    error.set_status_code(
-                        web_session_capnp::web_session::response::ClientErrorCode::BadRequest,
-                    );
-                    error.set_description_html(description.as_str());
-                    return Promise::ok(());
-                }
-            };
-            if export_id.is_empty() {
-                let mut error = results.get().init_client_error();
-                error.set_status_code(
-                    web_session_capnp::web_session::response::ClientErrorCode::BadRequest,
-                );
-                error.set_description_html("missing remote export id");
-                return Promise::ok(());
-            }
-
-            let app_state = self.app_state.clone();
-            return Promise::from_future(async move {
-                match import_remote_ip_network_export(&app_state, &export_id).await {
-                    Ok((label, object_id)) => {
-                        let body = format!(
-                            "{{\"ok\":true,\"objectId\":\"{}\",\"exportId\":\"{}\",\"label\":\"{}\"}}",
-                            json_escape(&object_id),
-                            json_escape(&export_id),
-                            json_escape(&label)
-                        );
-                        let mut content = results.get().init_content();
-                        content.set_status_code(
-                            web_session_capnp::web_session::response::SuccessCode::Ok,
-                        );
-                        content.set_mime_type("application/json");
-                        content.init_body().set_bytes(body.as_bytes());
-                    }
-                    Err(err) => {
-                        eprintln!("peer rpc import failed: {err}");
-                        let mut error = results.get().init_server_error();
-                        let description = format!(
-                            "<!doctype html><title>Peer RPC Import Failed</title><pre>{}</pre>",
-                            escape_html(&err)
-                        );
-                        error.set_description_html(description.as_str());
-                    }
-                }
-                Ok(())
-            });
-        }
-
-        if path == "api/tunnel/rpc/import-api-session" {
-            if !self.can_manage {
-                let mut error = results.get().init_client_error();
-                error.set_status_code(
-                    web_session_capnp::web_session::response::ClientErrorCode::Forbidden,
-                );
-                return Promise::ok(());
-            }
-
-            let body = pry!(params.get_content())
-                .get_content()
-                .unwrap_or(&[])
-                .to_vec();
-            let export_id = match std::str::from_utf8(&body) {
-                Ok(value) => value.trim().to_string(),
-                Err(err) => {
-                    let mut error = results.get().init_client_error();
-                    let description =
-                        format!("<!doctype html><title>Bad Request</title><p>{err}</p>");
-                    error.set_status_code(
-                        web_session_capnp::web_session::response::ClientErrorCode::BadRequest,
-                    );
-                    error.set_description_html(description.as_str());
-                    return Promise::ok(());
-                }
-            };
-            if export_id.is_empty() {
-                let mut error = results.get().init_client_error();
-                error.set_status_code(
-                    web_session_capnp::web_session::response::ClientErrorCode::BadRequest,
-                );
-                error.set_description_html("missing remote export id");
-                return Promise::ok(());
-            }
-
-            let app_state = self.app_state.clone();
-            return Promise::from_future(async move {
-                match import_remote_api_session_export(&app_state, &export_id).await {
-                    Ok((label, object_id)) => {
-                        let body = format!(
-                            "{{\"ok\":true,\"objectId\":\"{}\",\"exportId\":\"{}\",\"label\":\"{}\"}}",
-                            json_escape(&object_id),
-                            json_escape(&export_id),
-                            json_escape(&label)
-                        );
-                        let mut content = results.get().init_content();
-                        content.set_status_code(
-                            web_session_capnp::web_session::response::SuccessCode::Ok,
-                        );
-                        content.set_mime_type("application/json");
-                        content.init_body().set_bytes(body.as_bytes());
-                    }
-                    Err(err) => {
-                        eprintln!("peer rpc api session import failed: {err}");
-                        let mut error = results.get().init_server_error();
-                        let description = format!(
-                            "<!doctype html><title>Peer RPC Import Failed</title><pre>{}</pre>",
-                            escape_html(&err)
-                        );
-                        error.set_description_html(description.as_str());
-                    }
-                }
-                Ok(())
-            });
-        }
-
         if path == "api/tunnel/rpc/import-capability" {
             if !self.can_manage {
                 let mut error = results.get().init_client_error();
@@ -1320,190 +1199,6 @@ impl web_session_capnp::web_session::Server for WebSessionImpl {
                         let mut error = results.get().init_server_error();
                         let description = format!(
                             "<!doctype html><title>Peer RPC Import Failed</title><pre>{}</pre>",
-                            escape_html(&err)
-                        );
-                        error.set_description_html(description.as_str());
-                    }
-                }
-                Ok(())
-            });
-        }
-
-        if path == "api/tunnel/rpc/invoke-ip-network" {
-            if !self.can_manage {
-                let mut error = results.get().init_client_error();
-                error.set_status_code(
-                    web_session_capnp::web_session::response::ClientErrorCode::Forbidden,
-                );
-                return Promise::ok(());
-            }
-
-            let body = pry!(params.get_content())
-                .get_content()
-                .unwrap_or(&[])
-                .to_vec();
-            let request = match std::str::from_utf8(&body) {
-                Ok(value) => parse_remote_ip_network_invoke_request(value),
-                Err(err) => {
-                    let mut error = results.get().init_client_error();
-                    let description =
-                        format!("<!doctype html><title>Bad Request</title><p>{err}</p>");
-                    error.set_status_code(
-                        web_session_capnp::web_session::response::ClientErrorCode::BadRequest,
-                    );
-                    error.set_description_html(description.as_str());
-                    return Promise::ok(());
-                }
-            };
-            let request = match request {
-                Ok(value) => value,
-                Err(err) => {
-                    let mut error = results.get().init_client_error();
-                    let description = format!(
-                        "<!doctype html><title>Bad Request</title><p>{}</p>",
-                        escape_html(&err)
-                    );
-                    error.set_status_code(
-                        web_session_capnp::web_session::response::ClientErrorCode::BadRequest,
-                    );
-                    error.set_description_html(description.as_str());
-                    return Promise::ok(());
-                }
-            };
-
-            let app_state = self.app_state.clone();
-            return Promise::from_future(async move {
-                match invoke_imported_remote_ip_network(&app_state, &request.host, request.port).await {
-                    Ok(summary) => {
-                        let preview = String::from_utf8_lossy(&summary.response_bytes)
-                            .lines()
-                            .take(12)
-                            .collect::<Vec<_>>()
-                            .join("\n");
-                        let body = format!(
-                            "{{\"ok\":true,\"host\":\"{}\",\"port\":{},\"responseByteCount\":{},\"responsePreview\":\"{}\",\"trace\":\"{}\"}}",
-                            json_escape(&summary.host),
-                            summary.port,
-                            summary.response_bytes.len(),
-                            json_escape(&preview),
-                            json_escape(&summary.trace)
-                        );
-                        let mut content = results.get().init_content();
-                        content.set_status_code(
-                            web_session_capnp::web_session::response::SuccessCode::Ok,
-                        );
-                        content.set_mime_type("application/json");
-                        content.init_body().set_bytes(body.as_bytes());
-                    }
-                    Err(err) => {
-                        eprintln!("peer rpc invoke failed: {err}");
-                        let mut error = results.get().init_server_error();
-                        let description = format!(
-                            "<!doctype html><title>Peer RPC Invoke Failed</title><pre>{}</pre>",
-                            escape_html(&err)
-                        );
-                        error.set_description_html(description.as_str());
-                    }
-                }
-                Ok(())
-            });
-        }
-
-        if path == "api/tunnel/rpc/invoke-api-session" {
-            if !self.can_manage {
-                let mut error = results.get().init_client_error();
-                error.set_status_code(
-                    web_session_capnp::web_session::response::ClientErrorCode::Forbidden,
-                );
-                return Promise::ok(());
-            }
-
-            let body = pry!(params.get_content())
-                .get_content()
-                .unwrap_or(&[])
-                .to_vec();
-            let filename = match params.get_context() {
-                Ok(context) => match get_request_header(context, "x-sandstorm-app-filename") {
-                    Ok(Some(value)) => value,
-                    Ok(None) => String::new(),
-                    Err(err) => {
-                        let mut error = results.get().init_client_error();
-                        let description = format!(
-                            "<!doctype html><title>Bad Request</title><p>{}</p>",
-                            escape_html(&err)
-                        );
-                        error.set_status_code(
-                            web_session_capnp::web_session::response::ClientErrorCode::BadRequest,
-                        );
-                        error.set_description_html(description.as_str());
-                        return Promise::ok(());
-                    }
-                },
-                Err(err) => {
-                    let mut error = results.get().init_client_error();
-                    let description =
-                        format!("<!doctype html><title>Bad Request</title><p>{err}</p>");
-                    error.set_status_code(
-                        web_session_capnp::web_session::response::ClientErrorCode::BadRequest,
-                    );
-                    error.set_description_html(description.as_str());
-                    return Promise::ok(());
-                }
-            };
-            let request = match parse_remote_api_session_invoke_request(&filename, &body) {
-                Ok(value) => value,
-                Err(err) => {
-                    let mut error = results.get().init_client_error();
-                    let description = format!(
-                        "<!doctype html><title>Bad Request</title><p>{}</p>",
-                        escape_html(&err)
-                    );
-                    error.set_status_code(
-                        web_session_capnp::web_session::response::ClientErrorCode::BadRequest,
-                    );
-                    error.set_description_html(description.as_str());
-                    return Promise::ok(());
-                }
-            };
-
-            let app_state = self.app_state.clone();
-            return Promise::from_future(async move {
-                match invoke_imported_remote_api_session(
-                    &app_state,
-                    &request.filename,
-                    &request.payload,
-                )
-                .await
-                {
-                    Ok(summary) => {
-                        let preview = String::from_utf8_lossy(&summary.response_bytes)
-                            .lines()
-                            .take(12)
-                            .collect::<Vec<_>>()
-                            .join("\n");
-                        let body = format!(
-                            "{{\"ok\":true,\"status\":{},\"contentType\":\"{}\",\"responseByteCount\":{},\"responsePreview\":\"{}\",\"responsePreviewBase64\":\"{}\",\"trace\":\"{}\"}}",
-                            summary.status_code,
-                            json_escape(&summary.content_type),
-                            summary.response_bytes.len(),
-                            json_escape(&preview),
-                            json_escape(&base64::engine::general_purpose::STANDARD.encode(
-                                summary.response_bytes.iter().take(256).copied().collect::<Vec<_>>()
-                            )),
-                            json_escape(&summary.trace)
-                        );
-                        let mut content = results.get().init_content();
-                        content.set_status_code(
-                            web_session_capnp::web_session::response::SuccessCode::Ok,
-                        );
-                        content.set_mime_type("application/json");
-                        content.init_body().set_bytes(body.as_bytes());
-                    }
-                    Err(err) => {
-                        eprintln!("peer rpc api session invoke failed: {err}");
-                        let mut error = results.get().init_server_error();
-                        let description = format!(
-                            "<!doctype html><title>Peer RPC Invoke Failed</title><pre>{}</pre>",
                             escape_html(&err)
                         );
                         error.set_description_html(description.as_str());
@@ -2646,6 +2341,13 @@ impl web_session_capnp::web_session::Server for WebSessionImpl {
                     Ok(())
                 });
             } else if path == "api/powerbox/fulfill-object" {
+                if !self.can_use_received {
+                    let mut error = results.get().init_client_error();
+                    error.set_status_code(
+                        web_session_capnp::web_session::response::ClientErrorCode::Forbidden,
+                    );
+                    return Promise::ok(());
+                }
                 let body = pry!(params.get_content())
                     .get_content()
                     .unwrap_or(&[])
@@ -2793,6 +2495,13 @@ impl web_session_capnp::web_session::Server for WebSessionImpl {
                     Ok(())
                 });
             } else if path == "api/powerbox/fulfill-export" {
+                if !self.can_use_received {
+                    let mut error = results.get().init_client_error();
+                    error.set_status_code(
+                        web_session_capnp::web_session::response::ClientErrorCode::Forbidden,
+                    );
+                    return Promise::ok(());
+                }
                 let body = pry!(params.get_content())
                     .get_content()
                     .unwrap_or(&[])
@@ -3086,6 +2795,19 @@ fn init_localized_text(mut builder: util_capnp::localized_text::Builder<'_>, tex
     builder.init_localizations(0);
 }
 
+fn set_required_permissions_for_manage_tunnel(
+    mut builder: capnp::primitive_list::Builder<'_, bool>,
+) {
+    builder.set(MANAGE_TUNNEL_PERMISSION_INDEX, true);
+}
+
+fn set_required_permissions_for_use_received_caps(
+    mut builder: capnp::primitive_list::Builder<'_, bool>,
+) {
+    builder.set(MANAGE_TUNNEL_PERMISSION_INDEX, false);
+    builder.set(USE_RECEIVED_CAPS_PERMISSION_INDEX, true);
+}
+
 async fn claim_and_save_capability(
     sandstorm_api: grain_capnp::sandstorm_api::Client<capnp::any_pointer::Owned>,
     session_context: grain_capnp::session_context::Client,
@@ -3094,7 +2816,8 @@ async fn claim_and_save_capability(
 ) -> Result<String, String> {
     let mut claim_req = session_context.claim_request_request();
     claim_req.get().set_request_token(request_token);
-    claim_req.get().init_required_permissions(0);
+    let required_permissions = claim_req.get().init_required_permissions(1);
+    set_required_permissions_for_manage_tunnel(required_permissions);
     let claim_resp = claim_req
         .send()
         .promise
@@ -3148,18 +2871,6 @@ async fn save_capability(
         .map_err(|err| format!("save() returned no token: {err}"))?;
 
     Ok(hex_encode(token))
-}
-
-async fn save_and_restore_capability(
-    sandstorm_api: grain_capnp::sandstorm_api::Client<capnp::any_pointer::Owned>,
-    cap: capnp::capability::Client,
-    save_label: &str,
-) -> Result<capnp::capability::Client, String> {
-    let saved_token = save_capability(sandstorm_api.clone(), cap, save_label).await?;
-    let token = hex_decode(&saved_token)?;
-    SandstormBackend::new(sandstorm_api)
-        .restore_capability(&token)
-        .await
 }
 
 async fn restore_saved_capability(
@@ -3398,9 +3109,94 @@ fn load_local_proxy_capabilities() -> Result<Vec<LocalProxyCapability>, String> 
                 .type_tag
                 .unwrap_or_else(|| imported_type_tag_for_kind(ImportedRemoteCapabilityKind::Other)),
             descriptor_json: record.descriptor_json,
+            enabled: record.enabled,
             created_at_ms: record.created_at_ms,
         })
         .collect())
+}
+
+fn shared_kind_for_imported_kind(kind: ImportedRemoteCapabilityKind) -> SharedCapabilityKind {
+    match kind {
+        ImportedRemoteCapabilityKind::IpNetwork => SharedCapabilityKind::IpNetwork,
+        ImportedRemoteCapabilityKind::ApiSession => SharedCapabilityKind::ApiSession,
+        ImportedRemoteCapabilityKind::Other => SharedCapabilityKind::Other,
+    }
+}
+
+fn migrate_persisted_received_capabilities(
+    storage: &Storage,
+    approved_peer_node_id: Option<&str>,
+    persisted_received_caps: Vec<PersistedReceivedCapability>,
+    local_proxy_caps: &mut Vec<LocalProxyCapability>,
+) -> Result<(), String> {
+    let Some(peer_node_id) = approved_peer_node_id else {
+        return Ok(());
+    };
+    if persisted_received_caps.is_empty() {
+        return Ok(());
+    }
+
+    let mut next_local_proxy_cap_id = max_local_proxy_cap_id(local_proxy_caps).unwrap_or(0);
+    let mut changed = false;
+    for record in persisted_received_caps {
+        if let Some(existing) = local_proxy_caps.iter_mut().find(|existing| {
+            existing.peer_node_id == peer_node_id
+                && existing.target_kind == LocalProxyTargetKindRuntime::ExportId
+                && existing.target_id == record.export_id
+        }) {
+            existing.enabled = existing.enabled || record.enabled;
+            if existing.descriptor_json.is_none() {
+                existing.descriptor_json = record.descriptor_json.clone();
+            }
+            if existing.type_tag == imported_type_tag_for_kind(ImportedRemoteCapabilityKind::Other)
+                && !record.type_tag.is_empty()
+            {
+                existing.type_tag = record.type_tag.clone();
+            }
+            changed = true;
+            continue;
+        }
+
+        next_local_proxy_cap_id += 1;
+        local_proxy_caps.push(LocalProxyCapability {
+            object_id: format!("local-proxy-cap-{next_local_proxy_cap_id}"),
+            peer_node_id: peer_node_id.to_string(),
+            target_kind: LocalProxyTargetKindRuntime::ExportId,
+            target_id: record.export_id,
+            label: record.label,
+            kind: shared_kind_for_imported_kind(record.kind),
+            type_tag: record.type_tag,
+            descriptor_json: record.descriptor_json,
+            enabled: record.enabled,
+            created_at_ms: now_ms(),
+        });
+        changed = true;
+    }
+
+    if changed {
+        let records = local_proxy_caps
+            .iter()
+            .map(|cap| LocalProxyCapabilityRecord {
+                object_id: cap.object_id.clone(),
+                peer_node_id: cap.peer_node_id.clone(),
+                target_kind: match cap.target_kind {
+                    LocalProxyTargetKindRuntime::ExportId => LocalProxyTargetKind::ExportId,
+                    LocalProxyTargetKindRuntime::RemoteObjectId => LocalProxyTargetKind::RemoteObjectId,
+                },
+                target_id: cap.target_id.clone(),
+                label: cap.label.clone(),
+                kind: cap.kind,
+                type_tag: Some(cap.type_tag.clone()),
+                descriptor_json: cap.descriptor_json.clone(),
+                enabled: cap.enabled,
+                created_at_ms: cap.created_at_ms,
+            })
+            .collect::<Vec<_>>();
+        storage.persist_local_proxy_capability_registry(&records)?;
+        storage.persist_received_capability_registry(&[])?;
+    }
+
+    Ok(())
 }
 
 fn load_registered_remote_capabilities() -> Result<Vec<RegisteredRemoteCapability>, String> {
@@ -3575,20 +3371,6 @@ struct PeerRpcSession {
     api_session_exports: Vec<PeerRpcExport>,
 }
 
-struct ImportedRemoteIpNetwork {
-    object_id: String,
-    export_id: String,
-    label: String,
-    client: ip_capnp::ip_network::Client,
-}
-
-struct ImportedRemoteApiSession {
-    object_id: String,
-    export_id: String,
-    label: String,
-    client: api_session_capnp::api_session::Client,
-}
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ImportedRemoteCapabilityKind {
     IpNetwork,
@@ -3634,6 +3416,7 @@ pub(crate) struct LocalProxyCapability {
     pub(crate) kind: SharedCapabilityKind,
     pub(crate) type_tag: String,
     pub(crate) descriptor_json: Option<String>,
+    pub(crate) enabled: bool,
     pub(crate) created_at_ms: u64,
 }
 
@@ -3656,14 +3439,6 @@ fn imported_kind_to_tunnel_kind(kind: ImportedRemoteCapabilityKind) -> tunnel_ca
         ImportedRemoteCapabilityKind::ApiSession => tunnel_capnp::CapabilityKind::ApiSession,
         ImportedRemoteCapabilityKind::Other => tunnel_capnp::CapabilityKind::Other,
     }
-}
-
-struct ExportedIpNetworkState {
-    client: ip_capnp::ip_network::Client,
-}
-
-struct ExportedApiSessionState {
-    client: api_session_capnp::api_session::Client,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -3755,19 +3530,13 @@ struct AppState {
     exported_ip_network: Option<SavedCapability>,
     exported_api_session: Option<SavedCapability>,
     exported_caps_live: HashMap<String, capnp::capability::Client>,
-    exported_ip_network_live: HashMap<String, ExportedIpNetworkState>,
-    exported_api_session_live: HashMap<String, ExportedApiSessionState>,
     peer_rpc_session: Option<PeerRpcSession>,
-    imported_remote_ip_network: Option<ImportedRemoteIpNetwork>,
-    imported_remote_api_session: Option<ImportedRemoteApiSession>,
     imported_remote_caps: HashMap<String, ImportedRemoteCapability>,
-    persisted_received_caps: Vec<PersistedReceivedCapability>,
     local_proxy_caps: Vec<LocalProxyCapability>,
     registered_remote_caps: HashMap<String, RegisteredRemoteCapability>,
     registered_remote_hook_object_ids: HashMap<usize, String>,
     local_proxy_hook_object_ids: HashMap<usize, String>,
     next_peer_rpc_session_id: u64,
-    next_imported_remote_cap_id: u64,
     next_local_proxy_cap_id: u64,
     next_registered_remote_cap_id: u64,
     peer_rpc_error: Option<String>,
@@ -3819,7 +3588,6 @@ impl AppState {
             first_enabled_shared_capability(&shared_caps, SharedCapabilityKind::IpNetwork);
         let exported_api_session =
             first_enabled_shared_capability(&shared_caps, SharedCapabilityKind::ApiSession);
-        let persisted_received_caps = load_persisted_received_capabilities()?;
         let mut local_proxy_caps = load_local_proxy_capabilities()?;
         let had_remote_object_local_proxies = local_proxy_caps
             .iter()
@@ -3837,14 +3605,19 @@ impl AppState {
                     kind: cap.kind,
                     type_tag: Some(cap.type_tag.clone()),
                     descriptor_json: cap.descriptor_json.clone(),
+                    enabled: cap.enabled,
                     created_at_ms: cap.created_at_ms,
                 })
                 .collect::<Vec<_>>();
             app_storage().persist_local_proxy_capability_registry(&records)?;
         }
+        migrate_persisted_received_capabilities(
+            &app_storage(),
+            approved_peer_node_id.as_deref(),
+            load_persisted_received_capabilities()?,
+            &mut local_proxy_caps,
+        )?;
         let registered_remote_caps = load_registered_remote_capabilities()?;
-        let next_imported_remote_cap_id =
-            max_persisted_received_cap_id(&persisted_received_caps).unwrap_or(0);
         let next_local_proxy_cap_id = max_local_proxy_cap_id(&local_proxy_caps).unwrap_or(0);
         let next_registered_remote_cap_id =
             max_registered_remote_cap_id(&registered_remote_caps).unwrap_or(0);
@@ -3871,13 +3644,8 @@ impl AppState {
             exported_ip_network,
             exported_api_session,
             exported_caps_live: HashMap::new(),
-            exported_ip_network_live: HashMap::new(),
-            exported_api_session_live: HashMap::new(),
             peer_rpc_session: None,
-            imported_remote_ip_network: None,
-            imported_remote_api_session: None,
             imported_remote_caps: HashMap::new(),
-            persisted_received_caps,
             local_proxy_caps,
             registered_remote_caps: registered_remote_caps
                 .into_iter()
@@ -3886,7 +3654,6 @@ impl AppState {
             registered_remote_hook_object_ids: HashMap::new(),
             local_proxy_hook_object_ids: HashMap::new(),
             next_peer_rpc_session_id: 0,
-            next_imported_remote_cap_id,
             next_local_proxy_cap_id,
             next_registered_remote_cap_id,
             peer_rpc_error: None,
@@ -3912,8 +3679,6 @@ async fn initialize_iroh_endpoint(
         let pending_incoming = guard.pending_incoming_connection.take();
         guard.pending_incoming_peer_node_id = None;
         guard.pending_outgoing_peer_node_id = None;
-        guard.imported_remote_ip_network = None;
-        guard.imported_remote_api_session = None;
         guard.peer_rpc_error = None;
         guard.pairing_status = if guard.tunnel_enabled {
             PairingStatus::Disconnected
@@ -4705,13 +4470,6 @@ fn collect_match_request_descriptors(
     Ok(encoded_descriptors)
 }
 
-pub(crate) fn advertised_powerbox_matches_json(
-    app_state: &Arc<Mutex<AppState>>,
-) -> Result<String, String> {
-    let descriptors = collect_match_request_descriptors(app_state)?;
-    advertised_powerbox_matches_json_from_b64(&descriptors)
-}
-
 pub(crate) fn advertised_powerbox_matches_json_from_b64(
     descriptors: &[String],
 ) -> Result<String, String> {
@@ -4854,13 +4612,6 @@ fn capability_label_for_object_id(
             return Ok(cap.label.clone());
         }
         if let Some(record) = guard
-            .persisted_received_caps
-            .iter()
-            .find(|record| record.object_id == object_id)
-        {
-            return Ok(record.label.clone());
-        }
-        if let Some(record) = guard
             .local_proxy_caps
             .iter()
             .find(|record| record.object_id == object_id)
@@ -4888,13 +4639,6 @@ fn capability_descriptor_for_object_id(
             return Ok(cap.descriptor_json.clone());
         }
         if let Some(record) = guard
-            .persisted_received_caps
-            .iter()
-            .find(|record| record.object_id == object_id)
-        {
-            return Ok(record.descriptor_json.clone());
-        }
-        if let Some(record) = guard
             .local_proxy_caps
             .iter()
             .find(|record| record.object_id == object_id)
@@ -4905,45 +4649,6 @@ fn capability_descriptor_for_object_id(
     let saved_cap = load_saved_capability_by_id(object_id)?
         .ok_or_else(|| format!("unknown capability object id: {object_id}"))?;
     Ok(saved_cap.descriptor_json)
-}
-
-fn capability_descriptor_for_remote_export_id(
-    app_state: &Arc<Mutex<AppState>>,
-    export_id: &str,
-) -> Result<Option<String>, String> {
-    let guard = app_state
-        .lock()
-        .map_err(|_| "app state lock poisoned".to_string())?;
-    let Some(session) = guard.peer_rpc_session.as_ref() else {
-        return Ok(None);
-    };
-    Ok(session
-        .capability_exports
-        .iter()
-        .find(|export| export.id == export_id)
-        .and_then(|export| export.descriptor_json.clone()))
-}
-
-async fn fetch_remote_capability_by_export_id(
-    app_state: &Arc<Mutex<AppState>>,
-    export_id: &str,
-) -> Result<(String, Option<String>, capnp::capability::Client), String> {
-    let remote_bootstrap = {
-        let guard = app_state
-            .lock()
-            .map_err(|_| "app state lock poisoned".to_string())?;
-        guard
-            .peer_rpc_session
-            .as_ref()
-            .ok_or_else(|| "peer rpc session is not connected".to_string())?
-            .remote_bootstrap
-            .clone()
-    };
-    let (label, _kind, _type_tag, descriptor_json, client) =
-        fetch_remote_capability_export(remote_bootstrap, export_id).await?;
-    let descriptor_json =
-        descriptor_json.or(capability_descriptor_for_remote_export_id(app_state, export_id)?);
-    Ok((label, descriptor_json, client))
 }
 
 async fn fulfill_powerbox_request_with_capability(
@@ -4961,7 +4666,8 @@ async fn fulfill_powerbox_request_with_capability(
 
     let mut request = session_context.fulfill_request_request();
     request.get().get_cap().set_as_capability(cap.hook);
-    request.get().init_required_permissions(0);
+    let required_permissions = request.get().init_required_permissions(2);
+    set_required_permissions_for_use_received_caps(required_permissions);
     request
         .get()
         .set_descriptor(descriptor)
@@ -5106,36 +4812,15 @@ async fn connect_ip_network_tcp_client(
 async fn list_remote_ip_network_exports(
     remote_bootstrap: tunnel_capnp::peer_bootstrap::Client,
 ) -> Result<Vec<PeerRpcExport>, String> {
-    let response = remote_bootstrap
-        .list_ip_network_exports_request()
-        .send()
-        .promise
-        .await
-        .map_err(|err| format!("PeerBootstrap.listIpNetworkExports() failed: {err}"))?;
-    let response = response
-        .get()
-        .map_err(|err| format!("failed to decode listIpNetworkExports() response: {err}"))?;
-    let exports = response
-        .get_exports()
-        .map_err(|err| format!("listIpNetworkExports() returned invalid exports: {err}"))?;
-    let mut values = Vec::new();
-    for export in exports.iter() {
-        values.push(PeerRpcExport {
-            id: export
-                .get_id()
-                .map_err(|err| format!("failed to read export id: {err}"))?
-                .to_str()
-                .unwrap_or("")
-                .to_string(),
-            label: export
-                .get_label()
-                .map_err(|err| format!("failed to read export label: {err}"))?
-                .to_str()
-                .unwrap_or("")
-                .to_string(),
-        });
-    }
-    Ok(values)
+    Ok(list_remote_capability_exports(remote_bootstrap)
+        .await?
+        .into_iter()
+        .filter(|export| export.kind == SharedCapabilityKind::IpNetwork)
+        .map(|export| PeerRpcExport {
+            id: export.id,
+            label: export.label,
+        })
+        .collect())
 }
 
 async fn list_remote_capability_exports(
@@ -5196,88 +4881,15 @@ async fn list_remote_capability_exports(
 async fn list_remote_api_session_exports(
     remote_bootstrap: tunnel_capnp::peer_bootstrap::Client,
 ) -> Result<Vec<PeerRpcExport>, String> {
-    let response = remote_bootstrap
-        .list_api_session_exports_request()
-        .send()
-        .promise
-        .await
-        .map_err(|err| format!("PeerBootstrap.listApiSessionExports() failed: {err}"))?;
-    let response = response
-        .get()
-        .map_err(|err| format!("failed to decode listApiSessionExports() response: {err}"))?;
-    let exports = response
-        .get_exports()
-        .map_err(|err| format!("listApiSessionExports() returned invalid exports: {err}"))?;
-    let mut values = Vec::new();
-    for export in exports.iter() {
-        values.push(PeerRpcExport {
-            id: export
-                .get_id()
-                .map_err(|err| format!("failed to read export id: {err}"))?
-                .to_str()
-                .unwrap_or("")
-                .to_string(),
-            label: export
-                .get_label()
-                .map_err(|err| format!("failed to read export label: {err}"))?
-                .to_str()
-                .unwrap_or("")
-                .to_string(),
-        });
-    }
-    Ok(values)
-}
-
-async fn fetch_remote_ip_network_export(
-    remote_bootstrap: tunnel_capnp::peer_bootstrap::Client,
-    export_id: &str,
-) -> Result<(String, ip_capnp::ip_network::Client), String> {
-    let mut request = remote_bootstrap.get_ip_network_export_request();
-    request.get().set_id(export_id);
-    let response = request
-        .send()
-        .promise
-        .await
-        .map_err(|err| format!("PeerBootstrap.getIpNetworkExport() failed: {err}"))?;
-    let response = response
-        .get()
-        .map_err(|err| format!("failed to decode getIpNetworkExport() response: {err}"))?;
-    let label = response
-        .get_label()
-        .map_err(|err| format!("failed to read imported label: {err}"))?
-        .to_str()
-        .unwrap_or("")
-        .to_string();
-    let client = response
-        .get_cap()
-        .map_err(|err| format!("failed to read imported IpNetwork capability: {err}"))?;
-    Ok((label, client))
-}
-
-async fn fetch_remote_api_session_export(
-    remote_bootstrap: tunnel_capnp::peer_bootstrap::Client,
-    export_id: &str,
-) -> Result<(String, api_session_capnp::api_session::Client), String> {
-    let mut request = remote_bootstrap.get_api_session_export_request();
-    request.get().set_id(export_id);
-    let response = request
-        .send()
-        .promise
-        .await
-        .map_err(|err| format!("PeerBootstrap.getApiSessionExport() failed: {err}"))?;
-    let response = response
-        .get()
-        .map_err(|err| format!("failed to decode getApiSessionExport() response: {err}"))?;
-    let label = response
-        .get_label()
-        .map_err(|err| format!("failed to read imported label: {err}"))?
-        .to_str()
-        .unwrap_or("")
-        .to_string();
-    let client = response
-        .get_cap()
-        .map_err(|err| format!("failed to read imported ApiSession capability: {err}"))?;
-    Ok((label, client))
+    Ok(list_remote_capability_exports(remote_bootstrap)
+        .await?
+        .into_iter()
+        .filter(|export| export.kind == SharedCapabilityKind::ApiSession)
+        .map(|export| PeerRpcExport {
+            id: export.id,
+            label: export.label,
+        })
+        .collect())
 }
 
 async fn fetch_remote_capability_export(
@@ -5367,48 +4979,6 @@ async fn register_remote_capability(
         .map_err(|err| format!("registered remote object id was not valid UTF-8: {err}"))
 }
 
-pub(crate) fn register_local_ephemeral_capability(
-    app_state: &Arc<Mutex<AppState>>,
-    client: capnp::capability::Client,
-    label: &str,
-    kind: ImportedRemoteCapabilityKind,
-    type_tag: &str,
-    descriptor_json: Option<&str>,
-) -> Result<String, String> {
-    let mut guard = app_state
-        .lock()
-        .map_err(|_| "app state lock poisoned".to_string())?;
-    guard.next_registered_remote_cap_id += 1;
-    let remote_object_id = format!("remote-registered-cap-{}", guard.next_registered_remote_cap_id);
-    guard.registered_remote_caps.insert(
-        remote_object_id.clone(),
-        RegisteredRemoteCapability {
-            remote_object_id: remote_object_id.clone(),
-            label: label.to_string(),
-            kind,
-            type_tag: type_tag.to_string(),
-            descriptor_json: descriptor_json.map(|value| value.to_string()),
-            durability: RegisteredRemoteCapabilityDurability::Ephemeral,
-            saved_token: None,
-            created_at_ms: now_ms(),
-            client: Some(client),
-        },
-    );
-    eprintln!(
-        "register_local_ephemeral_capability: remote_object_id={} label={} kind={} type_tag={} at_ms={}",
-        remote_object_id,
-        label,
-        match kind {
-            ImportedRemoteCapabilityKind::IpNetwork => "IpNetwork",
-            ImportedRemoteCapabilityKind::ApiSession => "ApiSession",
-            ImportedRemoteCapabilityKind::Other => "Other",
-        },
-        type_tag,
-        now_ms()
-    );
-    Ok(remote_object_id)
-}
-
 async fn fetch_remote_registered_capability(
     remote_bootstrap: tunnel_capnp::peer_bootstrap::Client,
     remote_object_id: &str,
@@ -5465,64 +5035,6 @@ async fn fetch_remote_registered_capability(
     Ok((label, kind, type_tag, descriptor_json, client))
 }
 
-pub(crate) async fn fetch_remote_local_proxy_for_peer_registered_capability(
-    remote_bootstrap: tunnel_capnp::peer_bootstrap::Client,
-    remote_object_id: &str,
-) -> Result<
-    (
-        String,
-        ImportedRemoteCapabilityKind,
-        String,
-        Option<String>,
-        capnp::capability::Client,
-    ),
-    String,
-> {
-    let mut request = remote_bootstrap.get_local_proxy_for_peer_registered_capability_request();
-    request.get().set_remote_object_id(remote_object_id);
-    let response = request
-        .send()
-        .promise
-        .await
-        .map_err(|err| {
-            format!("PeerBootstrap.getLocalProxyForPeerRegisteredCapability() failed: {err}")
-        })?;
-    let response = response
-        .get()
-        .map_err(|err| format!("failed to decode local proxy capability response: {err}"))?;
-    let label = response
-        .get_label()
-        .map_err(|err| format!("failed to read local proxy capability label: {err}"))?
-        .to_str()
-        .unwrap_or("")
-        .to_string();
-    let kind = match response
-        .get_kind()
-        .map_err(|err| format!("failed to read local proxy capability kind: {err}"))?
-    {
-        tunnel_capnp::CapabilityKind::IpNetwork => ImportedRemoteCapabilityKind::IpNetwork,
-        tunnel_capnp::CapabilityKind::ApiSession => ImportedRemoteCapabilityKind::ApiSession,
-        tunnel_capnp::CapabilityKind::Other => ImportedRemoteCapabilityKind::Other,
-    };
-    let type_tag = response
-        .get_type_tag()
-        .map_err(|err| format!("failed to read local proxy capability type tag: {err}"))?
-        .to_str()
-        .unwrap_or("")
-        .to_string();
-    let descriptor_json = response
-        .get_descriptor_json()
-        .ok()
-        .and_then(|value| value.to_str().ok())
-        .map(|value| value.to_string())
-        .filter(|value| !value.is_empty());
-    let client = response
-        .get_cap()
-        .get_as_capability::<capnp::capability::Client>()
-        .map_err(|err| format!("failed to read local proxy capability: {err}"))?;
-    Ok((label, kind, type_tag, descriptor_json, client))
-}
-
 async fn connect_peer_rpc_session(
     app_state: Arc<Mutex<AppState>>,
     sandstorm_api: grain_capnp::sandstorm_api::Client<capnp::any_pointer::Owned>,
@@ -5575,24 +5087,6 @@ fn disconnect_peer_rpc_session(app_state: &Arc<Mutex<AppState>>) -> Result<(), S
     app_core(app_state).disconnect_peer_rpc_session()
 }
 
-async fn import_remote_ip_network_export(
-    app_state: &Arc<Mutex<AppState>>,
-    export_id: &str,
-) -> Result<(String, String), String> {
-    app_core(app_state)
-        .import_remote_ip_network_export(export_id)
-        .await
-}
-
-async fn import_remote_api_session_export(
-    app_state: &Arc<Mutex<AppState>>,
-    export_id: &str,
-) -> Result<(String, String), String> {
-    app_core(app_state)
-        .import_remote_api_session_export(export_id)
-        .await
-}
-
 async fn import_remote_capability_export(
     app_state: &Arc<Mutex<AppState>>,
     export_id: &str,
@@ -5602,42 +5096,11 @@ async fn import_remote_capability_export(
         .await
 }
 
-async fn invoke_imported_remote_ip_network(
-    app_state: &Arc<Mutex<AppState>>,
-    host: &str,
-    port: u16,
-) -> Result<TcpProbeSummary, String> {
-    app_core(app_state)
-        .invoke_imported_remote_ip_network(host, port)
-        .await
-}
-
 fn api_session_as_web_session(
     api_session: api_session_capnp::api_session::Client,
 ) -> web_session_capnp::web_session::Client {
     web_session_capnp::web_session::Client {
         client: api_session.client,
-    }
-}
-
-async fn wait_for_byte_stream_completion(
-    incoming: &Arc<Mutex<TcpSessionBuffer>>,
-    notify: &Arc<Notify>,
-    timeout_ms: u64,
-) -> Result<(), String> {
-    loop {
-        {
-            let guard = incoming
-                .lock()
-                .map_err(|_| "byte stream buffer lock poisoned".to_string())?;
-            if guard.saw_done {
-                return Ok(());
-            }
-        }
-
-        timeout(Duration::from_millis(timeout_ms), notify.notified())
-            .await
-            .map_err(|_| format!("timed out waiting for streamed response after {timeout_ms}ms"))?;
     }
 }
 
@@ -5653,36 +5116,6 @@ fn response_success_code_to_status(
         web_session_capnp::web_session::response::SuccessCode::MultiStatus => 207,
         web_session_capnp::web_session::response::SuccessCode::NotModified => 304,
     }
-}
-
-fn response_client_error_code_to_status(
-    code: web_session_capnp::web_session::response::ClientErrorCode,
-) -> u16 {
-    match code {
-        web_session_capnp::web_session::response::ClientErrorCode::BadRequest => 400,
-        web_session_capnp::web_session::response::ClientErrorCode::Forbidden => 403,
-        web_session_capnp::web_session::response::ClientErrorCode::NotFound => 404,
-        web_session_capnp::web_session::response::ClientErrorCode::MethodNotAllowed => 405,
-        web_session_capnp::web_session::response::ClientErrorCode::NotAcceptable => 406,
-        web_session_capnp::web_session::response::ClientErrorCode::Conflict => 409,
-        web_session_capnp::web_session::response::ClientErrorCode::Gone => 410,
-        web_session_capnp::web_session::response::ClientErrorCode::PreconditionFailed => 412,
-        web_session_capnp::web_session::response::ClientErrorCode::RequestEntityTooLarge => 413,
-        web_session_capnp::web_session::response::ClientErrorCode::RequestUriTooLong => 414,
-        web_session_capnp::web_session::response::ClientErrorCode::UnsupportedMediaType => 415,
-        web_session_capnp::web_session::response::ClientErrorCode::ImATeapot => 418,
-        web_session_capnp::web_session::response::ClientErrorCode::UnprocessableEntity => 422,
-    }
-}
-
-async fn invoke_imported_remote_api_session(
-    app_state: &Arc<Mutex<AppState>>,
-    filename: &str,
-    payload: &[u8],
-) -> Result<ApiSessionInvokeSummary, String> {
-    app_core(app_state)
-        .invoke_imported_remote_api_session(filename, payload)
-        .await
 }
 
 fn parse_claim_payload(value: &str) -> Result<(String, String, Option<String>), String> {
@@ -5859,67 +5292,6 @@ fn parse_udp_probe_request(value: &str) -> Result<UdpProbeRequest, String> {
         payload,
         wait_ms,
     })
-}
-
-fn parse_remote_ip_network_invoke_request(
-    value: &str,
-) -> Result<RemoteIpNetworkInvokeRequest, String> {
-    let mut lines = value.lines();
-    let host = lines.next().unwrap_or("").trim().to_string();
-    let port_text = lines.next().unwrap_or("80").trim();
-    if host.is_empty() {
-        return Err("missing remote invoke host".to_string());
-    }
-    let port = port_text
-        .parse::<u16>()
-        .map_err(|_| format!("invalid remote invoke port: {port_text:?}"))?;
-    if port == 0 {
-        return Err("remote invoke port must be non-zero".to_string());
-    }
-    Ok(RemoteIpNetworkInvokeRequest { host, port })
-}
-
-fn parse_remote_api_session_invoke_request(
-    filename: &str,
-    payload: &[u8],
-) -> Result<RemoteApiSessionInvokeRequest, String> {
-    let filename = filename.trim().to_string();
-    if filename.is_empty() {
-        return Err("missing x-sandstorm-app-filename header".to_string());
-    }
-    if payload.is_empty() {
-        return Err("request body is empty".to_string());
-    }
-    Ok(RemoteApiSessionInvokeRequest {
-        filename,
-        payload: payload.to_vec(),
-    })
-}
-
-fn get_request_header(
-    context: web_session_capnp::web_session::context::Reader<'_>,
-    name: &str,
-) -> Result<Option<String>, String> {
-    let headers = context
-        .get_additional_headers()
-        .map_err(|err| format!("failed to read request headers: {err}"))?;
-    for header in headers.iter() {
-        let header_name = header
-            .get_name()
-            .map_err(|err| format!("failed to read request header name: {err}"))?
-            .to_str()
-            .unwrap_or("");
-        if header_name.eq_ignore_ascii_case(name) {
-            let value = header
-                .get_value()
-                .map_err(|err| format!("failed to read request header value: {err}"))?
-                .to_str()
-                .unwrap_or("")
-                .to_string();
-            return Ok(Some(value));
-        }
-    }
-    Ok(None)
 }
 
 fn parse_tcp_session_open_request(value: &str) -> Result<TcpSessionOpenRequest, String> {
@@ -6192,24 +5564,6 @@ mod tests {
         runtime.block_on(future);
     }
 
-    fn imported_api_session_object_id(app: &App) -> Option<String> {
-        let state = app.shared_state_for_test();
-        let guard = state.lock().unwrap();
-        guard
-            .imported_remote_api_session
-            .as_ref()
-            .map(|value| value.object_id.clone())
-    }
-
-    fn imported_ip_network_object_id(app: &App) -> Option<String> {
-        let state = app.shared_state_for_test();
-        let guard = state.lock().unwrap();
-        guard
-            .imported_remote_ip_network
-            .as_ref()
-            .map(|value| value.object_id.clone())
-    }
-
     async fn wait_for_test_condition<F>(label: &str, mut predicate: F)
     where
         F: FnMut() -> bool,
@@ -6226,20 +5580,14 @@ mod tests {
         }
     }
 
-    fn persisted_api_session_object_id(app: &App) -> Option<String> {
+    fn local_proxy_api_session_object_id(app: &App) -> Option<String> {
         let state = app.shared_state_for_test();
         let guard = state.lock().unwrap();
         guard
-            .persisted_received_caps
+            .local_proxy_caps
             .iter()
-            .find(|record| record.kind == ImportedRemoteCapabilityKind::ApiSession)
+            .find(|record| record.kind == SharedCapabilityKind::ApiSession)
             .map(|value| value.object_id.clone())
-    }
-
-    fn imported_remote_cap_count(app: &App) -> usize {
-        let state = app.shared_state_for_test();
-        let guard = state.lock().unwrap();
-        guard.imported_remote_caps.len()
     }
 
     #[test]
@@ -6584,19 +5932,13 @@ mod tests {
             exported_ip_network: None,
             exported_api_session: None,
             exported_caps_live: HashMap::new(),
-            exported_ip_network_live: HashMap::new(),
-            exported_api_session_live: HashMap::new(),
             peer_rpc_session: None,
-            imported_remote_ip_network: None,
-            imported_remote_api_session: None,
             imported_remote_caps: HashMap::new(),
-            persisted_received_caps: Vec::new(),
             local_proxy_caps: Vec::new(),
             registered_remote_caps: HashMap::new(),
             registered_remote_hook_object_ids: HashMap::new(),
             local_proxy_hook_object_ids: HashMap::new(),
             next_peer_rpc_session_id: 0,
-            next_imported_remote_cap_id: 0,
             next_local_proxy_cap_id: 0,
             next_registered_remote_cap_id: 0,
             peer_rpc_error: None,
@@ -6637,7 +5979,6 @@ mod tests {
 
             let initial_state = importer_app.render_state_json().unwrap();
             assert!(initial_state.contains("\"peerRpc\":{\"connected\":false"));
-            assert!(initial_state.contains("\"importedRemoteApiSession\":null"));
             assert!(initial_state.contains("\"persistedReceivedCaps\":[]"));
 
             importer_app
@@ -6645,22 +5986,22 @@ mod tests {
                 .await
                 .unwrap();
             importer_app
-                .import_remote_api_session_export("preview-api")
+                .create_local_proxy_for_remote_export("preview-api")
                 .await
                 .unwrap();
 
             let live_state = importer_app.render_state_json().unwrap();
             assert!(live_state.contains("\"connected\":true"));
             assert!(live_state.contains("\"exportedApiSession\":null"));
-            assert!(live_state.contains("\"importedRemoteApiSession\":{\"objectId\":\"remote-cap-1\""));
-            assert!(live_state.contains("\"persistedReceivedCaps\":[{\"objectId\":\"remote-cap-1\""));
+            assert!(live_state.contains("\"importedRemoteCaps\":[{\"objectId\":\"local-proxy-cap-1\""));
+            assert!(live_state.contains("\"persistedReceivedCaps\":[]"));
             assert!(live_state.contains("\"peerRpcError\":null"));
 
             importer_app.disconnect_peer_rpc_session().unwrap();
             let disconnected_state = importer_app.render_state_json().unwrap();
             assert!(disconnected_state.contains("\"connected\":false"));
-            assert!(disconnected_state.contains("\"importedRemoteApiSession\":null"));
-            assert!(disconnected_state.contains("\"persistedReceivedCaps\":[{\"objectId\":\"remote-cap-1\""));
+            assert!(disconnected_state.contains("\"importedRemoteCaps\":[]"));
+            assert!(disconnected_state.contains("\"persistedReceivedCaps\":[]"));
             assert!(disconnected_state.contains("\"peerRpcError\":null"));
 
             importer_app
@@ -6675,15 +6016,15 @@ mod tests {
                 .unwrap();
             let cleared_state = importer_app.render_state_json().unwrap();
             assert!(cleared_state.contains("\"connected\":true"));
-            assert!(cleared_state.contains("\"importedRemoteApiSession\":null"));
-            assert!(cleared_state.contains("\"persistedReceivedCaps\":[{\"objectId\":\"remote-cap-1\""));
+            assert!(cleared_state.contains("\"importedRemoteCaps\":[]"));
+            assert!(cleared_state.contains("\"persistedReceivedCaps\":[]"));
             assert!(cleared_state.contains("\"apiSessionExports\":[]"));
 
             importer_app
-                .drop_received_remote_capability("remote-cap-1")
+                .drop_received_remote_capability("local-proxy-cap-1")
                 .unwrap();
             let dropped_state = importer_app.render_state_json().unwrap();
-            assert!(dropped_state.contains("\"importedRemoteApiSession\":null"));
+            assert!(dropped_state.contains("\"importedRemoteCaps\":[]"));
             assert!(dropped_state.contains("\"persistedReceivedCaps\":[]"));
 
             let _ = exporter_sandstorm_api;
@@ -7092,7 +6433,7 @@ mod tests {
                 .await
                 .unwrap();
             let (_, object_id) = importer_app
-                .import_remote_api_session_export("preview-api")
+                .create_local_proxy_for_remote_export("preview-api")
                 .await
                 .unwrap();
 
@@ -7214,12 +6555,7 @@ mod tests {
         run_local_async_test(async {
             let (app, _, _) = build_test_app("import-without-connect", 142).await;
             let err = app
-                .import_remote_api_session_export("preview-api")
-                .await
-                .unwrap_err();
-            assert!(err.contains("peer rpc session is not connected"));
-            let err = app
-                .import_remote_ip_network_export("ip-network-export")
+                .create_local_proxy_for_remote_export("preview-api")
                 .await
                 .unwrap_err();
             assert!(err.contains("peer rpc session is not connected"));
@@ -7228,7 +6564,7 @@ mod tests {
     }
 
     #[test]
-    fn reimporting_same_export_keeps_same_object_id_and_single_live_cap() {
+    fn reimporting_same_export_keeps_same_object_id() {
         run_local_async_test(async {
             let (exporter_app, _, exporter_sandstorm_api) =
                 build_test_app("same-export-exporter", 151).await;
@@ -7253,19 +6589,23 @@ mod tests {
                 .unwrap();
 
             let (_, object_id_a) = importer_app
-                .import_remote_api_session_export("preview-api")
+                .create_local_proxy_for_remote_export("preview-api")
                 .await
                 .unwrap();
             let (_, object_id_b) = importer_app
-                .import_remote_api_session_export("preview-api")
+                .create_local_proxy_for_remote_export("preview-api")
                 .await
                 .unwrap();
 
-            assert_eq!(object_id_a, "remote-cap-1");
+            assert_eq!(object_id_a, "local-proxy-cap-1");
             assert_eq!(object_id_b, object_id_a);
-            assert_eq!(imported_remote_cap_count(&importer_app), 1);
             let summary = importer_app
-                .invoke_imported_remote_api_session("same.docx", b"same")
+                .invoke_restored_api_session_for_test(
+                    importer_sandstorm_api.clone(),
+                    &object_id_a,
+                    "same.docx",
+                    b"same",
+                )
                 .await
                 .unwrap();
             assert_eq!(summary.response_bytes, b"%PDF-SAME\n".to_vec());
@@ -7273,47 +6613,6 @@ mod tests {
             let _ = exporter_sandstorm_api;
             importer_app.close_test_endpoint().await;
             exporter_app.close_test_endpoint().await;
-        });
-    }
-
-    #[test]
-    fn restore_collision_between_persisted_kinds_currently_prefers_first_record() {
-        run_local_async_test(async {
-            let app = App::new_for_test(
-                Storage::new(make_test_storage_root("restore-collision")),
-                SecretKey::from_bytes(&[0x99; 32]),
-            );
-            {
-                let state = app.shared_state_for_test();
-                let mut guard = state.lock().unwrap();
-                guard.persisted_received_caps.push(PersistedReceivedCapability {
-                    object_id: "remote-cap-7".to_string(),
-                    export_id: "export-net".to_string(),
-                    label: "Net".to_string(),
-                    kind: ImportedRemoteCapabilityKind::IpNetwork,
-                    type_tag: imported_type_tag_for_kind(ImportedRemoteCapabilityKind::IpNetwork),
-                    descriptor_json: None,
-                    enabled: true,
-                });
-                guard.persisted_received_caps.push(PersistedReceivedCapability {
-                    object_id: "remote-cap-7".to_string(),
-                    export_id: "export-api".to_string(),
-                    label: "Api".to_string(),
-                    kind: ImportedRemoteCapabilityKind::ApiSession,
-                    type_tag: imported_type_tag_for_kind(ImportedRemoteCapabilityKind::ApiSession),
-                    descriptor_json: None,
-                    enabled: true,
-                });
-            }
-
-            let err = app
-                .restore_object_capability(dummy_sandstorm_api_client(), "remote-cap-7")
-                .await;
-            let err = match err {
-                Ok(_) => panic!("restore unexpectedly succeeded for collided object id"),
-                Err(err) => err,
-            };
-            assert!(err.contains("received IpNetwork object remote-cap-7 is known"));
         });
     }
 
@@ -7347,13 +6646,18 @@ mod tests {
             assert_eq!(api_exports[0].id, "preview-api");
 
             let (_label, object_id) = importer_app
-                .import_remote_api_session_export("preview-api")
+                .create_local_proxy_for_remote_export("preview-api")
                 .await
                 .unwrap();
-            assert_eq!(object_id, "remote-cap-1");
+            assert_eq!(object_id, "local-proxy-cap-1");
 
             let imported_summary = importer_app
-                .invoke_imported_remote_api_session("document.docx", b"fake office bytes")
+                .invoke_restored_api_session_for_test(
+                    importer_sandstorm_api.clone(),
+                    &object_id,
+                    "document.docx",
+                    b"fake office bytes",
+                )
                 .await
                 .unwrap();
             assert_eq!(imported_summary.status_code, 200);
@@ -7375,10 +6679,15 @@ mod tests {
 
             importer_app.disconnect_peer_rpc_session().unwrap();
             let disconnected_err = match importer_app
-                .restore_object_capability(importer_sandstorm_api.clone(), &object_id)
+                .invoke_restored_api_session_for_test(
+                    importer_sandstorm_api.clone(),
+                    &object_id,
+                    "disconnected.docx",
+                    b"disconnected bytes",
+                )
                 .await
             {
-                Ok(_) => panic!("restore unexpectedly succeeded while disconnected"),
+                Ok(_) => panic!("invoke unexpectedly succeeded while disconnected"),
                 Err(err) => err,
             };
             assert!(disconnected_err.contains("not currently connected"));
@@ -7388,7 +6697,12 @@ mod tests {
                 .await
                 .unwrap();
             let reimported_summary = importer_app
-                .invoke_imported_remote_api_session("reconnected.docx", b"reconnected bytes")
+                .invoke_restored_api_session_for_test(
+                    importer_sandstorm_api.clone(),
+                    &object_id,
+                    "reconnected.docx",
+                    b"reconnected bytes",
+                )
                 .await
                 .unwrap();
             assert_eq!(reimported_summary.response_bytes, expected_pdf);
@@ -7444,13 +6758,18 @@ mod tests {
             assert_eq!(ip_exports[0].id, "ip-network-export");
 
             let (_label, object_id) = importer_app
-                .import_remote_ip_network_export("ip-network-export")
+                .create_local_proxy_for_remote_export("ip-network-export")
                 .await
                 .unwrap();
-            assert_eq!(object_id, "remote-cap-1");
+            assert_eq!(object_id, "local-proxy-cap-1");
 
             let imported_summary = importer_app
-                .invoke_imported_remote_ip_network("example.test", 8080)
+                .invoke_restored_ip_network_for_test(
+                    importer_sandstorm_api.clone(),
+                    &object_id,
+                    "example.test",
+                    8080,
+                )
                 .await
                 .unwrap();
             assert_eq!(imported_summary.response_bytes, expected_response);
@@ -7469,10 +6788,15 @@ mod tests {
 
             importer_app.disconnect_peer_rpc_session().unwrap();
             let disconnected_err = match importer_app
-                .restore_object_capability(importer_sandstorm_api.clone(), &object_id)
+                .invoke_restored_ip_network_for_test(
+                    importer_sandstorm_api.clone(),
+                    &object_id,
+                    "disconnected.example",
+                    8080,
+                )
                 .await
             {
-                Ok(_) => panic!("restore unexpectedly succeeded while disconnected"),
+                Ok(_) => panic!("invoke unexpectedly succeeded while disconnected"),
                 Err(err) => err,
             };
             assert!(disconnected_err.contains("not currently connected"));
@@ -7482,7 +6806,12 @@ mod tests {
                 .await
                 .unwrap();
             let reimported_summary = importer_app
-                .invoke_imported_remote_ip_network("reconnected.example", 8080)
+                .invoke_restored_ip_network_for_test(
+                    importer_sandstorm_api.clone(),
+                    &object_id,
+                    "reconnected.example",
+                    8080,
+                )
                 .await
                 .unwrap();
             assert_eq!(reimported_summary.response_bytes, expected_response);
@@ -7507,7 +6836,7 @@ mod tests {
     }
 
     #[test]
-    fn reconnect_auto_reimports_same_api_session_object_id() {
+    fn reconnect_keeps_same_local_proxy_api_session_object_id() {
         run_local_async_test(async {
             let (exporter_app, _, exporter_sandstorm_api) =
                 build_test_app("reimport-exporter", 51).await;
@@ -7532,20 +6861,26 @@ mod tests {
                 .await
                 .unwrap();
             let (_, object_id) = importer_app
-                .import_remote_api_session_export("preview-api")
+                .create_local_proxy_for_remote_export("preview-api")
                 .await
                 .unwrap();
-            assert_eq!(imported_api_session_object_id(&importer_app).as_deref(), Some("remote-cap-1"));
+            assert_eq!(
+                local_proxy_api_session_object_id(&importer_app).as_deref(),
+                Some("local-proxy-cap-1")
+            );
 
             importer_app.disconnect_peer_rpc_session().unwrap();
-            assert_eq!(imported_api_session_object_id(&importer_app), None);
+            assert_eq!(
+                local_proxy_api_session_object_id(&importer_app).as_deref(),
+                Some(object_id.as_str())
+            );
 
             importer_app
                 .connect_peer_rpc_session(importer_sandstorm_api.clone())
                 .await
                 .unwrap();
             assert_eq!(
-                imported_api_session_object_id(&importer_app).as_deref(),
+                local_proxy_api_session_object_id(&importer_app).as_deref(),
                 Some(object_id.as_str())
             );
             let restored = importer_app
@@ -7603,24 +6938,36 @@ mod tests {
             assert!(api_exports.iter().any(|export| export.id == "preview-api-a"));
             assert!(api_exports.iter().any(|export| export.id == "preview-api-b"));
 
-            let _ = importer_app
-                .import_remote_api_session_export("preview-api-a")
+            let (_, object_id_a) = importer_app
+                .create_local_proxy_for_remote_export("preview-api-a")
                 .await
                 .unwrap();
             let summary_a = importer_app
-                .invoke_imported_remote_api_session("a.docx", b"a")
+                .invoke_restored_api_session_for_test(
+                    importer_sandstorm_api.clone(),
+                    &object_id_a,
+                    "a.docx",
+                    b"a",
+                )
                 .await
                 .unwrap();
             assert_eq!(summary_a.response_bytes, b"%PDF-A\n".to_vec());
 
-            let _ = importer_app.drop_received_remote_capability("remote-cap-1").unwrap();
-
             let _ = importer_app
-                .import_remote_api_session_export("preview-api-b")
+                .drop_received_remote_capability("local-proxy-cap-1")
+                .unwrap();
+
+            let (_, object_id_b) = importer_app
+                .create_local_proxy_for_remote_export("preview-api-b")
                 .await
                 .unwrap();
             let summary_b = importer_app
-                .invoke_imported_remote_api_session("b.docx", b"b")
+                .invoke_restored_api_session_for_test(
+                    importer_sandstorm_api.clone(),
+                    &object_id_b,
+                    "b.docx",
+                    b"b",
+                )
                 .await
                 .unwrap();
             assert_eq!(summary_b.response_bytes, b"%PDF-B\n".to_vec());
@@ -7657,13 +7004,16 @@ mod tests {
                 .await
                 .unwrap();
             let (_, object_id) = importer_app
-                .import_remote_api_session_export("preview-api")
+                .create_local_proxy_for_remote_export("preview-api")
                 .await
                 .unwrap();
-            assert_eq!(persisted_api_session_object_id(&importer_app).as_deref(), Some(object_id.as_str()));
+            assert_eq!(
+                local_proxy_api_session_object_id(&importer_app).as_deref(),
+                Some(object_id.as_str())
+            );
 
             assert!(importer_app.drop_received_remote_capability(&object_id).unwrap());
-            assert_eq!(persisted_api_session_object_id(&importer_app), None);
+            assert_eq!(local_proxy_api_session_object_id(&importer_app), None);
 
             importer_app.disconnect_peer_rpc_session().unwrap();
             importer_app
@@ -7671,8 +7021,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            assert_eq!(imported_api_session_object_id(&importer_app), None);
-            assert_eq!(persisted_api_session_object_id(&importer_app), None);
+            assert_eq!(local_proxy_api_session_object_id(&importer_app), None);
             let err = match importer_app
                 .restore_object_capability(importer_sandstorm_api, &object_id)
                 .await
@@ -7714,7 +7063,7 @@ mod tests {
                 .await
                 .unwrap();
             let (_, object_id) = importer_app
-                .import_remote_api_session_export("preview-api")
+                .create_local_proxy_for_remote_export("preview-api")
                 .await
                 .unwrap();
 
@@ -7734,19 +7083,23 @@ mod tests {
                 .await
                 .unwrap();
 
-            assert_eq!(imported_api_session_object_id(&importer_app), None);
             assert_eq!(
-                persisted_api_session_object_id(&importer_app).as_deref(),
+                local_proxy_api_session_object_id(&importer_app).as_deref(),
                 Some(object_id.as_str())
             );
             let err = match importer_app
-                .restore_object_capability(importer_sandstorm_api, &object_id)
+                .invoke_restored_api_session_for_test(
+                    importer_sandstorm_api,
+                    &object_id,
+                    "missing.docx",
+                    b"missing bytes",
+                )
                 .await
             {
-                Ok(_) => panic!("restore unexpectedly succeeded with missing export"),
+                Ok(_) => panic!("invoke unexpectedly succeeded with missing export"),
                 Err(err) => err,
             };
-            assert!(err.contains("not currently connected"));
+            assert!(err.contains("getCapabilityExport") || err.contains("imported capability"));
 
             let _ = exporter_sandstorm_api;
             importer_app.close_test_endpoint().await;
@@ -9073,7 +8426,7 @@ mod tests {
                 .await
                 .unwrap();
             let (_, object_id) = importer_app
-                .import_remote_ip_network_export("ip-network-export")
+                .create_local_proxy_for_remote_export("ip-network-export")
                 .await
                 .unwrap();
 
@@ -9083,15 +8436,16 @@ mod tests {
                     .connect_peer_rpc_session(importer_sandstorm_api.clone())
                     .await
                     .unwrap();
-                assert_eq!(
-                    imported_ip_network_object_id(&importer_app).as_deref(),
-                    Some(object_id.as_str())
-                );
-                assert_eq!(imported_remote_cap_count(&importer_app), 1);
+                assert_eq!(object_id, "local-proxy-cap-1");
             }
 
             let summary = importer_app
-                .invoke_imported_remote_ip_network("churn.example", 8080)
+                .invoke_restored_ip_network_for_test(
+                    importer_sandstorm_api.clone(),
+                    &object_id,
+                    "churn.example",
+                    8080,
+                )
                 .await
                 .unwrap();
             assert_eq!(summary.response_bytes, b"HTTP/1.1 200 OK\r\n\r\nchurn".to_vec());
@@ -9129,10 +8483,10 @@ mod tests {
                 .unwrap();
             assert_eq!(exports[0].id, "preview-api-v1");
             let (_, object_id) = importer_app
-                .import_remote_api_session_export("preview-api-v1")
+                .create_local_proxy_for_remote_export("preview-api-v1")
                 .await
                 .unwrap();
-            assert_eq!(object_id, "remote-cap-1");
+            assert_eq!(object_id, "local-proxy-cap-1");
 
             importer_app.disconnect_peer_rpc_session().unwrap();
             exporter_app
@@ -9151,13 +8505,18 @@ mod tests {
                 .unwrap();
             assert_eq!(exports[0].id, "preview-api-v2");
             let (_, new_object_id) = importer_app
-                .import_remote_api_session_export("preview-api-v2")
+                .create_local_proxy_for_remote_export("preview-api-v2")
                 .await
                 .unwrap();
             assert_ne!(new_object_id, object_id);
 
             let summary = importer_app
-                .invoke_imported_remote_api_session("swap.docx", b"swap")
+                .invoke_restored_api_session_for_test(
+                    importer_sandstorm_api.clone(),
+                    &new_object_id,
+                    "swap.docx",
+                    b"swap",
+                )
                 .await
                 .unwrap();
             assert_eq!(summary.response_bytes, b"%PDF-V2\n".to_vec());
@@ -9194,7 +8553,7 @@ mod tests {
                 .await
                 .unwrap();
             let (_, object_id) = importer_app
-                .import_remote_api_session_export("preview-api")
+                .create_local_proxy_for_remote_export("preview-api")
                 .await
                 .unwrap();
 
@@ -9206,20 +8565,24 @@ mod tests {
                 .await
                 .unwrap();
             assert!(exports.is_empty());
-            assert_eq!(imported_api_session_object_id(&importer_app), None);
             assert_eq!(
-                persisted_api_session_object_id(&importer_app).as_deref(),
+                local_proxy_api_session_object_id(&importer_app).as_deref(),
                 Some(object_id.as_str())
             );
 
             let err = match importer_app
-                .restore_object_capability(importer_sandstorm_api, &object_id)
+                .invoke_restored_api_session_for_test(
+                    importer_sandstorm_api,
+                    &object_id,
+                    "cleared.docx",
+                    b"cleared bytes",
+                )
                 .await
             {
-                Ok(_) => panic!("restore unexpectedly succeeded after export clear"),
+                Ok(_) => panic!("invoke unexpectedly succeeded after export clear"),
                 Err(err) => err,
             };
-            assert!(err.contains("not currently connected"));
+            assert!(err.contains("getCapabilityExport") || err.contains("imported capability"));
 
             let _ = exporter_sandstorm_api;
             importer_app.close_test_endpoint().await;
@@ -9228,7 +8591,7 @@ mod tests {
     }
 
     #[test]
-    fn reconnecting_to_different_peer_reuses_object_id_when_export_id_matches() {
+    fn reconnecting_to_different_peer_creates_new_object_id_even_if_export_id_matches() {
         run_local_async_test(async {
             let (exporter_a_app, _, exporter_a_sandstorm_api) =
                 build_test_app("peer-a-exporter", 111).await;
@@ -9264,11 +8627,16 @@ mod tests {
                 .await
                 .unwrap();
             let (_, object_id) = importer_app
-                .import_remote_api_session_export("shared-export")
+                .create_local_proxy_for_remote_export("shared-export")
                 .await
                 .unwrap();
             let summary_a = importer_app
-                .invoke_imported_remote_api_session("peer-a.docx", b"a")
+                .invoke_restored_api_session_for_test(
+                    importer_sandstorm_api.clone(),
+                    &object_id,
+                    "peer-a.docx",
+                    b"a",
+                )
                 .await
                 .unwrap();
             assert_eq!(summary_a.response_bytes, b"%PDF-PEER-A\n".to_vec());
@@ -9282,12 +8650,18 @@ mod tests {
                 .await
                 .unwrap();
 
-            assert_eq!(
-                imported_api_session_object_id(&importer_app).as_deref(),
-                Some(object_id.as_str())
-            );
+            let (_, new_object_id) = importer_app
+                .create_local_proxy_for_remote_export("shared-export")
+                .await
+                .unwrap();
+            assert_ne!(new_object_id, object_id);
             let summary_b = importer_app
-                .invoke_imported_remote_api_session("peer-b.docx", b"b")
+                .invoke_restored_api_session_for_test(
+                    importer_sandstorm_api.clone(),
+                    &new_object_id,
+                    "peer-b.docx",
+                    b"b",
+                )
                 .await
                 .unwrap();
             assert_eq!(summary_b.response_bytes, b"%PDF-PEER-B\n".to_vec());
@@ -9346,35 +8720,6 @@ impl tunnel_capnp::peer_bootstrap::Server for PeerBootstrapImpl {
             });
             entry.set_type_tag(&export.type_tag);
             entry.set_descriptor_json(export.descriptor_json.as_deref().unwrap_or(""));
-        }
-        Promise::ok(())
-    }
-
-    fn list_ip_network_exports(
-        self: Rc<Self>,
-        _: tunnel_capnp::peer_bootstrap::ListIpNetworkExportsParams,
-        mut results: tunnel_capnp::peer_bootstrap::ListIpNetworkExportsResults,
-    ) -> Promise<(), capnp::Error> {
-        let exports = match self.app_state.lock() {
-            Ok(guard) => guard
-                .shared_caps
-                .iter()
-                .filter(|cap| cap.kind == SharedCapabilityKind::IpNetwork && cap.enabled)
-                .map(|cap| cap.saved_cap.clone())
-                .collect::<Vec<_>>(),
-            Err(_) => {
-                return Promise::err(capnp::Error::failed(
-                    "app state lock poisoned".to_string(),
-                ));
-            }
-        };
-
-        let mut result = results.get();
-        let mut entries = result.reborrow().init_exports(exports.len() as u32);
-        for (index, export) in exports.iter().enumerate() {
-            let mut entry = entries.reborrow().get(index as u32);
-            entry.set_id(&export.id);
-            entry.set_label(&export.label);
         }
         Promise::ok(())
     }
@@ -9639,265 +8984,6 @@ impl tunnel_capnp::peer_bootstrap::Server for PeerBootstrapImpl {
         })
     }
 
-    fn get_local_proxy_for_peer_registered_capability(
-        self: Rc<Self>,
-        params: tunnel_capnp::peer_bootstrap::GetLocalProxyForPeerRegisteredCapabilityParams,
-        mut results: tunnel_capnp::peer_bootstrap::GetLocalProxyForPeerRegisteredCapabilityResults,
-    ) -> Promise<(), capnp::Error> {
-        let requested_id = match params.get() {
-            Ok(params) => match params.get_remote_object_id() {
-                Ok(value) => value.to_str().unwrap_or("").to_string(),
-                Err(err) => return Promise::err(err),
-            },
-            Err(err) => return Promise::err(err),
-        };
-        let app_state = self.app_state.clone();
-        let sandstorm_api = self.sandstorm_api.clone();
-        Promise::from_future(async move {
-            let (label, object_id) =
-                create_local_proxy_for_registered_remote_object(&app_state, &requested_id)
-                    .await
-                    .map_err(capnp::Error::failed)?;
-            let cap = restore_app_object_capability(sandstorm_api, &app_state, &object_id)
-                .await
-                .map_err(capnp::Error::failed)?;
-            let type_tag = {
-                let guard = app_state
-                    .lock()
-                    .map_err(|_| capnp::Error::failed("app state lock poisoned".to_string()))?;
-                let record = guard
-                    .local_proxy_caps
-                    .iter()
-                    .find(|record| record.object_id == object_id)
-                    .ok_or_else(|| {
-                        capnp::Error::failed(format!(
-                            "missing local proxy record after creation: {object_id}"
-                        ))
-                    })?;
-                record.type_tag.clone()
-            };
-            let descriptor_json =
-                capability_descriptor_for_object_id(&app_state, &object_id).map_err(capnp::Error::failed)?;
-            let mut result = results.get();
-            result.reborrow().get_cap().set_as_capability(cap.hook);
-            result.set_label(&label);
-            result.set_kind(tunnel_capnp::CapabilityKind::Other);
-            result.set_type_tag(&type_tag);
-            result.set_descriptor_json(descriptor_json.as_deref().unwrap_or(""));
-            Ok(())
-        })
-    }
-
-    fn get_ip_network_export(
-        self: Rc<Self>,
-        params: tunnel_capnp::peer_bootstrap::GetIpNetworkExportParams,
-        mut results: tunnel_capnp::peer_bootstrap::GetIpNetworkExportResults,
-    ) -> Promise<(), capnp::Error> {
-        let export = match self.app_state.lock() {
-            Ok(guard) => guard
-                .shared_caps
-                .iter()
-                .find(|cap| cap.kind == SharedCapabilityKind::IpNetwork && cap.enabled)
-                .map(|cap| cap.saved_cap.clone()),
-            Err(_) => {
-                return Promise::err(capnp::Error::failed(
-                    "app state lock poisoned".to_string(),
-                ));
-            }
-        };
-        let requested_id = match params.get() {
-            Ok(params) => match params.get_id() {
-                Ok(value) => value.to_str().unwrap_or("").to_string(),
-                Err(err) => return Promise::err(err),
-            },
-            Err(err) => return Promise::err(err),
-        };
-
-        let Some(mut export) = export else {
-            return Promise::err(capnp::Error::failed(
-                "no IpNetwork export is configured".to_string(),
-            ));
-        };
-        if export.id != requested_id {
-            export = match self.app_state.lock() {
-                Ok(guard) => match guard
-                    .shared_caps
-                    .iter()
-                    .find(|cap| {
-                        cap.kind == SharedCapabilityKind::IpNetwork
-                            && cap.enabled
-                            && cap.saved_cap.id == requested_id
-                    }) {
-                    Some(cap) => cap.saved_cap.clone(),
-                    None => {
-                        return Promise::err(capnp::Error::failed(format!(
-                            "unknown IpNetwork export id: {requested_id}"
-                        )))
-                    }
-                },
-                Err(_) => {
-                    return Promise::err(capnp::Error::failed(
-                        "app state lock poisoned".to_string(),
-                    ));
-                }
-            };
-        }
-
-        let sandstorm_api = self.sandstorm_api.clone();
-        let app_state = self.app_state.clone();
-        Promise::from_future(async move {
-            let cap = {
-                let guard = app_state
-                    .lock()
-                    .map_err(|_| capnp::Error::failed("app state lock poisoned".to_string()))?;
-                guard
-                    .exported_ip_network_live
-                    .get(&export.id)
-                    .map(|value| value.client.clone())
-            };
-            let cap = match cap {
-                Some(cap) => cap,
-                None => {
-                    let cap = restore_saved_ip_network(sandstorm_api, &export.saved_token)
-                        .await
-                        .map_err(capnp::Error::failed)?;
-                    if let Ok(mut guard) = app_state.lock() {
-                        guard.exported_ip_network_live.insert(
-                            export.id.clone(),
-                            ExportedIpNetworkState {
-                                client: cap.clone(),
-                            },
-                        );
-                    }
-                    cap
-                }
-            };
-            let mut result = results.get();
-            result.set_label(&export.label);
-            result.set_cap(cap);
-            Ok(())
-        })
-    }
-
-    fn list_api_session_exports(
-        self: Rc<Self>,
-        _: tunnel_capnp::peer_bootstrap::ListApiSessionExportsParams,
-        mut results: tunnel_capnp::peer_bootstrap::ListApiSessionExportsResults,
-    ) -> Promise<(), capnp::Error> {
-        let exports = match self.app_state.lock() {
-            Ok(guard) => guard
-                .shared_caps
-                .iter()
-                .filter(|cap| cap.kind == SharedCapabilityKind::ApiSession && cap.enabled)
-                .map(|cap| cap.saved_cap.clone())
-                .collect::<Vec<_>>(),
-            Err(_) => {
-                return Promise::err(capnp::Error::failed(
-                    "app state lock poisoned".to_string(),
-                ));
-            }
-        };
-
-        let mut result = results.get();
-        let mut entries = result.reborrow().init_exports(exports.len() as u32);
-        for (index, export) in exports.iter().enumerate() {
-            let mut entry = entries.reborrow().get(index as u32);
-            entry.set_id(&export.id);
-            entry.set_label(&export.label);
-        }
-        Promise::ok(())
-    }
-
-    fn get_api_session_export(
-        self: Rc<Self>,
-        params: tunnel_capnp::peer_bootstrap::GetApiSessionExportParams,
-        mut results: tunnel_capnp::peer_bootstrap::GetApiSessionExportResults,
-    ) -> Promise<(), capnp::Error> {
-        let export = match self.app_state.lock() {
-            Ok(guard) => guard
-                .shared_caps
-                .iter()
-                .find(|cap| cap.kind == SharedCapabilityKind::ApiSession && cap.enabled)
-                .map(|cap| cap.saved_cap.clone()),
-            Err(_) => {
-                return Promise::err(capnp::Error::failed(
-                    "app state lock poisoned".to_string(),
-                ));
-            }
-        };
-        let requested_id = match params.get() {
-            Ok(params) => match params.get_id() {
-                Ok(value) => value.to_str().unwrap_or("").to_string(),
-                Err(err) => return Promise::err(err),
-            },
-            Err(err) => return Promise::err(err),
-        };
-
-        let Some(mut export) = export else {
-            return Promise::err(capnp::Error::failed(
-                "no ApiSession export is configured".to_string(),
-            ));
-        };
-        if export.id != requested_id {
-            export = match self.app_state.lock() {
-                Ok(guard) => match guard
-                    .shared_caps
-                    .iter()
-                    .find(|cap| {
-                        cap.kind == SharedCapabilityKind::ApiSession
-                            && cap.enabled
-                            && cap.saved_cap.id == requested_id
-                    }) {
-                    Some(cap) => cap.saved_cap.clone(),
-                    None => {
-                        return Promise::err(capnp::Error::failed(format!(
-                            "unknown ApiSession export id: {requested_id}"
-                        )))
-                    }
-                },
-                Err(_) => {
-                    return Promise::err(capnp::Error::failed(
-                        "app state lock poisoned".to_string(),
-                    ));
-                }
-            };
-        }
-
-        let sandstorm_api = self.sandstorm_api.clone();
-        let app_state = self.app_state.clone();
-        Promise::from_future(async move {
-            let cap = {
-                let guard = app_state
-                    .lock()
-                    .map_err(|_| capnp::Error::failed("app state lock poisoned".to_string()))?;
-                guard
-                    .exported_api_session_live
-                    .get(&export.id)
-                    .map(|value| value.client.clone())
-            };
-            let cap = match cap {
-                Some(cap) => cap,
-                None => {
-                    let cap = restore_saved_api_session(sandstorm_api, &export.saved_token)
-                        .await
-                        .map_err(capnp::Error::failed)?;
-                    if let Ok(mut guard) = app_state.lock() {
-                        guard.exported_api_session_live.insert(
-                            export.id.clone(),
-                            ExportedApiSessionState {
-                                client: cap.clone(),
-                            },
-                        );
-                    }
-                    cap
-                }
-            };
-            let mut result = results.get();
-            result.set_label(&export.label);
-            result.set_cap(cap);
-            Ok(())
-        })
-    }
 }
 
 async fn run_iroh_accept_loop(
@@ -10174,16 +9260,6 @@ struct TcpSessionCloseRequest {
     session_id: String,
 }
 
-struct RemoteIpNetworkInvokeRequest {
-    host: String,
-    port: u16,
-}
-
-struct RemoteApiSessionInvokeRequest {
-    filename: String,
-    payload: Vec<u8>,
-}
-
 struct TcpSessionBuffer {
     bytes: Vec<u8>,
     read_offset: usize,
@@ -10237,6 +9313,7 @@ struct ApiSessionInvokeSummary {
     status_code: u16,
     content_type: String,
     response_bytes: Vec<u8>,
+    #[allow(dead_code)]
     trace: String,
 }
 

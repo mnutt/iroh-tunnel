@@ -1,7 +1,6 @@
 import {
   legacyCopyText,
   postText,
-  previewBase64Payload,
   responseTextToStatus,
 } from "./http.js";
 
@@ -151,44 +150,6 @@ export async function probeTicket(context) {
   setStatus(`Probe succeeded with ${result.remoteNodeId}: ${result.response}`);
 }
 
-export async function importRemoteIpNetwork(context) {
-  const { remoteIpNetworkExportSelectEl, setStatus, refreshState } = context;
-  const exportId = remoteIpNetworkExportSelectEl.value;
-  if (!exportId) {
-    setStatus("Select a remote IpNetwork export first.");
-    return;
-  }
-  setStatus(`Importing remote IpNetwork ${exportId}...`);
-  const response = await postText("api/tunnel/rpc/import-ip-network", exportId);
-  if (!response.ok) {
-    const body = await response.text();
-    setStatus(responseTextToStatus("Remote IpNetwork import failed", response, body));
-    return;
-  }
-  const result = await response.json();
-  setStatus(`Imported remote IpNetwork ${result.label} as object ${result.objectId}.`);
-  await refreshState();
-}
-
-export async function importRemoteApiSession(context) {
-  const { remoteApiSessionExportSelectEl, setStatus, refreshState } = context;
-  const exportId = remoteApiSessionExportSelectEl.value;
-  if (!exportId) {
-    setStatus("Select a remote ApiSession export first.");
-    return;
-  }
-  setStatus(`Importing remote ApiSession ${exportId}...`);
-  const response = await postText("api/tunnel/rpc/import-api-session", exportId);
-  if (!response.ok) {
-    const body = await response.text();
-    setStatus(responseTextToStatus("Remote ApiSession import failed", response, body));
-    return;
-  }
-  const result = await response.json();
-  setStatus(`Imported remote ApiSession ${result.label} as object ${result.objectId}.`);
-  await refreshState();
-}
-
 export async function importRemoteCapability(context) {
   const { remoteCapabilityExportSelectEl, setStatus, refreshState } = context;
   const selected = remoteCapabilityExportSelectEl.value;
@@ -213,136 +174,6 @@ export async function importRemoteCapability(context) {
   const result = await response.json();
   setStatus(`Imported remote capability ${result.label} as object ${result.objectId}.`);
   await refreshState();
-}
-
-export async function invokeRemoteIpNetwork(context) {
-  const { remoteInvokeHostEl, remoteInvokePortEl, setStatus, refreshState } = context;
-  const host = (remoteInvokeHostEl.value || "").trim() || "neverssl.com";
-  const port = (remoteInvokePortEl.value || "").trim() || "80";
-  setStatus(`Invoking imported remote IpNetwork for ${host}:${port}...`);
-  const response = await postText("api/tunnel/rpc/invoke-ip-network", `${host}\n${port}`);
-  if (!response.ok) {
-    const body = await response.text();
-    setStatus(responseTextToStatus("Remote IpNetwork invoke failed", response, body));
-    return;
-  }
-  const result = await response.json();
-  setStatus(`Remote IpNetwork invocation succeeded for ${result.host}:${result.port}: ${result.responsePreview} [${result.trace}]`);
-  await refreshState();
-}
-
-export async function invokeRemoteApiSession(context) {
-  const { remoteApiFileEl, remoteApiFilenameEl, setStatus, refreshState } = context;
-  const file = remoteApiFileEl.files && remoteApiFileEl.files[0];
-  if (!file) {
-    setStatus("Choose a file to send to the imported ApiSession first.");
-    return;
-  }
-  const filename = (remoteApiFilenameEl.value || "").trim() || file.name || "upload.bin";
-  setStatus(`Invoking imported ApiSession with ${filename}...`);
-  const response = await fetch("api/tunnel/rpc/invoke-api-session", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/octet-stream",
-      "x-sandstorm-app-filename": filename,
-    },
-    body: await file.arrayBuffer(),
-  });
-  if (!response.ok) {
-    const body = await response.text();
-    setStatus(responseTextToStatus("Remote ApiSession invoke failed", response, body));
-    return;
-  }
-  const result = await response.json();
-  const preview = result.responsePreview || previewBase64Payload(result.responsePreviewBase64 || "");
-  setStatus(`Remote ApiSession invocation succeeded with HTTP ${result.status} ${result.contentType || ""}: ${preview} [${result.trace}]`);
-  await refreshState();
-}
-
-export async function restoreImportedIpNetwork(context) {
-  const { getImportedRemoteIpNetworkObjectId, setStatus } = context;
-  const objectId = getImportedRemoteIpNetworkObjectId();
-  if (!objectId) {
-    setStatus("No imported remote IpNetwork object is loaded.");
-    return;
-  }
-  setStatus(`Resolving imported remote IpNetwork object ${objectId}...`);
-  const response = await fetch("api/saved-cap/resolve-object", {
-    method: "PUT",
-    headers: { "Content-Type": "text/plain" },
-    body: objectId,
-  });
-  if (response.ok) {
-    setStatus(`Imported remote IpNetwork object restore succeeded for ${objectId}`);
-  } else {
-    const body = await response.text();
-    setStatus(responseTextToStatus("Imported remote IpNetwork object restore failed", response, body));
-  }
-}
-
-export async function restoreImportedApiSession(context) {
-  const { getImportedRemoteApiSessionObjectId, setStatus } = context;
-  const objectId = getImportedRemoteApiSessionObjectId();
-  if (!objectId) {
-    setStatus("No imported remote ApiSession object is loaded.");
-    return;
-  }
-  setStatus(`Resolving imported remote ApiSession object ${objectId}...`);
-  const response = await fetch("api/saved-cap/resolve-object", {
-    method: "PUT",
-    headers: { "Content-Type": "text/plain" },
-    body: objectId,
-  });
-  if (response.ok) {
-    setStatus(`Imported remote ApiSession object restore succeeded for ${objectId}`);
-  } else {
-    const body = await response.text();
-    setStatus(responseTextToStatus("Imported remote ApiSession object restore failed", response, body));
-  }
-}
-
-export async function dropImportedIpNetwork(context) {
-  const { getImportedRemoteIpNetworkObjectId, setStatus, refreshState } = context;
-  const objectId = getImportedRemoteIpNetworkObjectId();
-  if (!objectId) {
-    setStatus("No imported remote IpNetwork object is loaded.");
-    return;
-  }
-  setStatus(`Dropping imported remote IpNetwork object ${objectId}...`);
-  const response = await fetch("api/saved-cap/drop-object", {
-    method: "PUT",
-    headers: { "Content-Type": "text/plain" },
-    body: objectId,
-  });
-  if (response.ok) {
-    setStatus(`Imported remote IpNetwork object dropped: ${objectId}`);
-    await refreshState();
-  } else {
-    const body = await response.text();
-    setStatus(responseTextToStatus("Imported remote IpNetwork object drop failed", response, body));
-  }
-}
-
-export async function dropImportedApiSession(context) {
-  const { getImportedRemoteApiSessionObjectId, setStatus, refreshState } = context;
-  const objectId = getImportedRemoteApiSessionObjectId();
-  if (!objectId) {
-    setStatus("No imported remote ApiSession object is loaded.");
-    return;
-  }
-  setStatus(`Dropping imported remote ApiSession object ${objectId}...`);
-  const response = await fetch("api/saved-cap/drop-object", {
-    method: "PUT",
-    headers: { "Content-Type": "text/plain" },
-    body: objectId,
-  });
-  if (response.ok) {
-    setStatus(`Imported remote ApiSession object dropped: ${objectId}`);
-    await refreshState();
-  } else {
-    const body = await response.text();
-    setStatus(responseTextToStatus("Imported remote ApiSession object drop failed", response, body));
-  }
 }
 
 export function requestPowerboxCapability(context, query, saveLabel, options = {}) {

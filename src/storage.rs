@@ -2,6 +2,10 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+fn default_enabled() -> bool {
+    true
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SavedCapabilityRecord {
     pub id: String,
@@ -16,16 +20,6 @@ pub enum ReceivedCapabilityKind {
     IpNetwork,
     ApiSession,
     Other,
-}
-
-impl ReceivedCapabilityKind {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::IpNetwork => "IpNetwork",
-            Self::ApiSession => "ApiSession",
-            Self::Other => "Other",
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -84,6 +78,8 @@ pub struct LocalProxyCapabilityRecord {
     pub kind: SharedCapabilityKind,
     pub type_tag: Option<String>,
     pub descriptor_json: Option<String>,
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
     pub created_at_ms: u64,
 }
 

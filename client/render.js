@@ -588,12 +588,10 @@ function renderReceivedCapabilities(context, data) {
   receivedCapsEl.innerHTML = "";
 
   const peerRpc = data.peerRpc || { connected: false };
-  const liveByObjectId = new Map();
-  for (const cap of data.importedRemoteCaps || []) {
-    liveByObjectId.set(cap.objectId, cap);
-  }
-
   const persisted = data.persistedReceivedCaps || [];
+  const durableReceived = (data.localProxyCaps || []).filter(
+    (entry) => entry.targetKind === "exportId"
+  );
   const isPowerboxRequestSession =
     data.powerboxRequestSession && data.powerboxRequestSession.active;
   const remoteExports = (peerRpc.capabilityExports && peerRpc.capabilityExports.length)
@@ -612,9 +610,9 @@ function renderReceivedCapabilities(context, data) {
         typeTag: "sandstorm/api-session",
       })),
     ];
-  const persistedByExportId = new Map();
-  for (const entry of persisted) {
-    persistedByExportId.set(entry.exportId, entry);
+  const durableByExportId = new Map();
+  for (const entry of durableReceived) {
+    durableByExportId.set(entry.targetId, entry);
   }
 
   if (isPowerboxRequestSession) {
@@ -692,9 +690,9 @@ function renderReceivedCapabilities(context, data) {
       itemsRendered.count += 1;
     }
 
-    for (const entry of persisted) {
-      const live = liveByObjectId.get(entry.objectId);
-      if (!live) {
+    for (const entry of durableReceived) {
+      const isAvailable = peerRpc.connected && remoteExports.some((remote) => remote.id === entry.targetId);
+      if (!isAvailable || entry.enabled === false) {
         continue;
       }
       const item = document.createElement("li");
@@ -732,7 +730,7 @@ function renderReceivedCapabilities(context, data) {
     }
 
     for (const entry of remoteExports) {
-      if (persistedByExportId.has(entry.id)) {
+      if (durableByExportId.has(entry.id)) {
         continue;
       }
       const item = document.createElement("li");
@@ -775,14 +773,13 @@ function renderReceivedCapabilities(context, data) {
     return;
   }
 
-  if (!persisted.length && !remoteExports.length) {
+  if (!durableReceived.length && !remoteExports.length) {
     renderEmptyList(receivedCapsEl, "No capabilities received.");
     return;
   }
 
-  for (const entry of persisted) {
-    const live = liveByObjectId.get(entry.objectId);
-    const isAvailable = !!live;
+  for (const entry of durableReceived) {
+    const isAvailable = peerRpc.connected && remoteExports.some((remote) => remote.id === entry.targetId);
     const isEnabled = entry.enabled !== false;
 
     const item = document.createElement("li");
@@ -912,7 +909,7 @@ function renderReceivedCapabilities(context, data) {
   }
 
   for (const entry of remoteExports) {
-    if (persistedByExportId.has(entry.id)) {
+    if (durableByExportId.has(entry.id)) {
       continue;
     }
 

@@ -5,18 +5,12 @@ import {
   copyTicket,
   disableTunnel,
   disconnectTunnel,
-  dropImportedApiSession,
-  dropImportedIpNetwork,
   enableTunnel,
   forgetConnection,
   importRemoteCapability,
-  invokeRemoteApiSession,
-  invokeRemoteIpNetwork,
   probeTicket,
   requestPowerboxCapability,
   rejectTunnel,
-  restoreImportedApiSession,
-  restoreImportedIpNetwork,
 } from "./actions.js";
 import { renderApp } from "./render.js";
 
@@ -46,18 +40,8 @@ const receivedTitleEl = document.getElementById("received-title");
 const receivedCopyEl = document.getElementById("received-copy");
 const savedCapsEl = document.getElementById("saved-caps");
 const activeTcpSessionsEl = document.getElementById("active-tcp-sessions");
-const restoreImportedIpNetworkButton = document.getElementById("restore-imported-ip-network");
-const restoreImportedApiSessionButton = document.getElementById("restore-imported-api-session");
-const dropImportedIpNetworkButton = document.getElementById("drop-imported-ip-network");
-const dropImportedApiSessionButton = document.getElementById("drop-imported-api-session");
 const remoteCapabilityExportSelectEl = document.getElementById("remote-capability-export-select");
 const importRemoteCapabilityButton = document.getElementById("import-remote-capability");
-const remoteInvokeHostEl = document.getElementById("remote-invoke-host");
-const remoteInvokePortEl = document.getElementById("remote-invoke-port");
-const invokeRemoteIpNetworkButton = document.getElementById("invoke-remote-ip-network");
-const remoteApiFilenameEl = document.getElementById("remote-api-filename");
-const remoteApiFileEl = document.getElementById("remote-api-file");
-const invokeRemoteApiSessionButton = document.getElementById("invoke-remote-api-session");
 const requestButton = document.getElementById("request-cap");
 const requestIpNetworkButton = document.getElementById("request-ip-network");
 const requestIpInterfaceButton = document.getElementById("request-ip-interface");
@@ -95,8 +79,6 @@ let powerboxQueries = {
   ipNetwork: "",
   ipInterface: "",
 };
-let importedRemoteIpNetworkObjectId = "";
-let importedRemoteApiSessionObjectId = "";
 let currentState = null;
 let refreshTimerId = 0;
 let refreshInFlight = false;
@@ -245,12 +227,6 @@ async function refreshState() {
     currentState = data;
     powerboxQueries = data.powerboxQueries || powerboxQueries;
 
-    importedRemoteIpNetworkObjectId = data.importedRemoteIpNetwork
-      ? (data.importedRemoteIpNetwork.objectId || "")
-      : "";
-    importedRemoteApiSessionObjectId = data.importedRemoteApiSession
-      ? (data.importedRemoteApiSession.objectId || "")
-      : "";
     renderCurrentState();
   } finally {
     refreshInFlight = false;
@@ -288,14 +264,8 @@ const appContext = {
   localTicketEl,
   remoteTicketEl,
   remoteCapabilityExportSelectEl,
-  remoteInvokeHostEl,
-  remoteInvokePortEl,
-  remoteApiFilenameEl,
-  remoteApiFileEl,
   setStatus,
   refreshState,
-  getImportedRemoteIpNetworkObjectId: () => importedRemoteIpNetworkObjectId,
-  getImportedRemoteApiSessionObjectId: () => importedRemoteApiSessionObjectId,
 };
 
 remoteTicketEl.addEventListener("input", () => {
@@ -366,30 +336,6 @@ disconnectPeerRpcButton.addEventListener("click", async () => {
 
 importRemoteCapabilityButton.addEventListener("click", async () => {
   await importRemoteCapability(appContext);
-});
-
-invokeRemoteIpNetworkButton.addEventListener("click", async () => {
-  await invokeRemoteIpNetwork(appContext);
-});
-
-invokeRemoteApiSessionButton.addEventListener("click", async () => {
-  await invokeRemoteApiSession(appContext);
-});
-
-restoreImportedIpNetworkButton.addEventListener("click", async () => {
-  await restoreImportedIpNetwork(appContext);
-});
-
-restoreImportedApiSessionButton.addEventListener("click", async () => {
-  await restoreImportedApiSession(appContext);
-});
-
-dropImportedIpNetworkButton.addEventListener("click", async () => {
-  await dropImportedIpNetwork(appContext);
-});
-
-dropImportedApiSessionButton.addEventListener("click", async () => {
-  await dropImportedApiSession(appContext);
 });
 
 requestButton.addEventListener("click", () => {

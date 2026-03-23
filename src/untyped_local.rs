@@ -12,13 +12,6 @@ use capnp::{Error, any_pointer, message};
 use futures::TryFutureExt;
 use futures::channel::oneshot;
 
-pub(crate) fn new_client<S>(server: S) -> capnp::capability::Client
-where
-    S: capability::Server + Clone + 'static,
-{
-    capnp::capability::Client::new(Box::new(LocalClient::new(server, None)))
-}
-
 pub(crate) type ResponseCapTableTransform = Rc<
     dyn Fn(
         Vec<Option<Box<dyn ClientHook>>>,
@@ -34,16 +27,6 @@ pub(crate) type RequestCapTableTransform = Rc<
         Box<dyn Future<Output = capnp::Result<Vec<Option<Box<dyn ClientHook>>>>> + 'static>,
     >,
 >;
-
-pub(crate) fn new_client_with_response_transform<S>(
-    server: S,
-    transform: ResponseCapTableTransform,
-) -> capnp::capability::Client
-where
-    S: capability::Server + Clone + 'static,
-{
-    capnp::capability::Client::new(Box::new(LocalClient::new(server, Some(transform))))
-}
 
 pub(crate) fn new_client_with_transforms<S>(
     server: S,
@@ -441,15 +424,6 @@ impl<S> LocalClient<S>
 where
     S: capability::Server + Clone,
 {
-    fn new(server: S, response_cap_table_transform: Option<ResponseCapTableTransform>) -> Self {
-        Self {
-            inner: server,
-            broken_error: Rc::new(RefCell::new(None)),
-            request_cap_table_transform: None,
-            response_cap_table_transform,
-        }
-    }
-
     fn new_with_transforms(
         server: S,
         request_cap_table_transform: Option<RequestCapTableTransform>,
