@@ -184,11 +184,8 @@ impl App {
             tunnel_enabled: true,
             pairing_status: crate::PairingStatus::Disconnected,
             shared_caps: Vec::new(),
-            exported_ip_network: None,
-            exported_api_session: None,
             exported_caps_live: std::collections::HashMap::new(),
             peer_rpc_session: None,
-            imported_remote_caps: std::collections::HashMap::new(),
             local_proxy_caps: Vec::new(),
             registered_remote_caps: std::collections::HashMap::new(),
             registered_remote_hook_object_ids: std::collections::HashMap::new(),
@@ -372,11 +369,8 @@ impl App {
                 crate::PairingStatus::Disabled
             },
             shared_caps,
-            exported_ip_network: None,
-            exported_api_session: None,
             exported_caps_live: std::collections::HashMap::new(),
             peer_rpc_session: None,
-            imported_remote_caps: std::collections::HashMap::new(),
             local_proxy_caps,
             registered_remote_caps,
             registered_remote_hook_object_ids: std::collections::HashMap::new(),
@@ -542,7 +536,6 @@ impl App {
             created_at_ms: saved_cap.created_at_ms,
             saved_cap: saved_cap.clone(),
         });
-        guard.exported_api_session = Some(saved_cap.clone());
         guard
             .exported_caps_live
             .insert(saved_cap.id.clone(), client.client.clone());
@@ -620,7 +613,6 @@ impl App {
             created_at_ms: saved_cap.created_at_ms,
             saved_cap: saved_cap.clone(),
         });
-        guard.exported_ip_network = Some(saved_cap.clone());
         guard
             .exported_caps_live
             .insert(saved_cap.id.clone(), client.client.clone());
@@ -638,7 +630,6 @@ impl App {
                 shared_cap.enabled = false;
             }
         }
-        guard.exported_api_session = None;
         let disabled_ids = guard
             .shared_caps
             .iter()
@@ -696,16 +687,6 @@ impl App {
     ) -> Result<capnp::capability::Client, String> {
         if object_id == LOCAL_TEST_API_SESSION_OBJECT_ID {
             return self.build_local_test_api_session_client();
-        }
-        let imported_remote_cap = {
-            let guard = self
-                .state
-                .lock()
-                .map_err(|_| "app state lock poisoned".to_string())?;
-            guard.imported_remote_caps.get(object_id).cloned()
-        };
-        if let Some(imported_remote_cap) = imported_remote_cap {
-            return Ok(imported_remote_cap.client);
         }
         let local_proxy_cap = {
             let guard = self
@@ -862,45 +843,6 @@ impl App {
                 fetched_type_tag
             },
             fetched_descriptor_json.or(export_metadata.descriptor_json.clone()),
-        )
-    }
-
-    pub(crate) async fn create_local_proxy_for_received_object(
-        &self,
-        object_id: &str,
-    ) -> Result<(String, String), String> {
-        let (remote_node_id, export_id, label, kind, type_tag, descriptor_json) = {
-            let guard = self
-                .state
-                .lock()
-                .map_err(|_| "app state lock poisoned".to_string())?;
-            let session = guard
-                .peer_rpc_session
-                .as_ref()
-                .ok_or_else(|| "peer rpc session is not connected".to_string())?;
-
-            if let Some(cap) = guard.imported_remote_caps.get(object_id) {
-                (
-                    session.remote_node_id.clone(),
-                    cap.export_id.clone(),
-                    cap.label.clone(),
-                    cap.kind,
-                    cap.type_tag.clone(),
-                    cap.descriptor_json.clone(),
-                )
-            } else {
-                return Err(format!("object {} is not a received remote capability", object_id));
-            }
-        };
-
-        self.create_local_proxy_record(
-            remote_node_id,
-            crate::LocalProxyTargetKindRuntime::ExportId,
-            export_id,
-            label,
-            kind,
-            type_tag,
-            descriptor_json,
         )
     }
 
@@ -1102,9 +1044,7 @@ impl App {
                 .state
                 .lock()
                 .map_err(|_| "app state lock poisoned".to_string())?;
-            if let Some(cap) = guard.imported_remote_caps.get(object_id) {
-                (cap.label.clone(), cap.descriptor_json.clone())
-            } else if let Some(record) = guard
+            if let Some(record) = guard
                 .local_proxy_caps
                 .iter()
                 .find(|record| record.object_id == object_id)
@@ -1180,8 +1120,7 @@ impl App {
         saved_cap_id: &str,
     ) -> Result<(), String> {
         if let Some(saved_cap_id) = saved_cap_id.strip_prefix('!') {
-            let path = crate::exported_ip_network_id_path();
-            let (shared_caps, selected_export) = {
+            let shared_caps = {
                 let mut guard = self
                     .state
                     .lock()
@@ -1194,24 +1133,12 @@ impl App {
                     }
                 }
                 guard.exported_caps_live.remove(saved_cap_id);
-                guard.exported_ip_network = crate::first_enabled_shared_capability(
-                    &guard.shared_caps,
-                    SharedCapabilityKind::IpNetwork,
-                );
-                (guard.shared_caps.clone(), guard.exported_ip_network.clone())
+                guard.shared_caps.clone()
             };
             self.persist_shared_capability_registry(&shared_caps)?;
-            match selected_export {
-                Some(saved_cap) => {
-                    crate::persist_configured_exported_capability(path.as_path(), &saved_cap.id)?
-                }
-                None => crate::clear_configured_exported_capability(path.as_path())?,
-            }
             return Ok(());
         }
         if saved_cap_id.trim().is_empty() {
-            let path = crate::exported_ip_network_id_path();
-            crate::clear_configured_exported_capability(path.as_path())?;
             let shared_caps = {
                 let mut guard = self
                     .state
@@ -1231,7 +1158,6 @@ impl App {
                 for disabled_id in disabled_ids {
                     guard.exported_caps_live.remove(&disabled_id);
                 }
-                guard.exported_ip_network = None;
                 guard.shared_caps.clone()
             };
             self.persist_shared_capability_registry(&shared_caps)?;
@@ -1243,8 +1169,6 @@ impl App {
         let client =
             crate::validate_saved_ip_network_capability(sandstorm_api, &saved_cap.saved_token)
                 .await?;
-        let path = crate::exported_ip_network_id_path();
-        crate::persist_configured_exported_capability(path.as_path(), &saved_cap.id)?;
 
         let shared_caps = {
             let mut guard = self
@@ -1275,10 +1199,6 @@ impl App {
                     saved_cap: saved_cap.clone(),
                 });
             }
-            guard.exported_ip_network = crate::first_enabled_shared_capability(
-                &guard.shared_caps,
-                SharedCapabilityKind::IpNetwork,
-            );
             guard
                 .exported_caps_live
                 .insert(saved_cap.id.clone(), client.client.clone());
@@ -1294,8 +1214,7 @@ impl App {
         saved_cap_id: &str,
     ) -> Result<(), String> {
         if let Some(saved_cap_id) = saved_cap_id.strip_prefix('!') {
-            let path = crate::exported_api_session_id_path();
-            let (shared_caps, selected_export) = {
+            let shared_caps = {
                 let mut guard = self
                     .state
                     .lock()
@@ -1308,24 +1227,12 @@ impl App {
                     }
                 }
                 guard.exported_caps_live.remove(saved_cap_id);
-                guard.exported_api_session = crate::first_enabled_shared_capability(
-                    &guard.shared_caps,
-                    SharedCapabilityKind::ApiSession,
-                );
-                (guard.shared_caps.clone(), guard.exported_api_session.clone())
+                guard.shared_caps.clone()
             };
             self.persist_shared_capability_registry(&shared_caps)?;
-            match selected_export {
-                Some(saved_cap) => {
-                    crate::persist_configured_exported_capability(path.as_path(), &saved_cap.id)?
-                }
-                None => crate::clear_configured_exported_capability(path.as_path())?,
-            }
             return Ok(());
         }
         if saved_cap_id.trim().is_empty() {
-            let path = crate::exported_api_session_id_path();
-            crate::clear_configured_exported_capability(path.as_path())?;
             let shared_caps = {
                 let mut guard = self
                     .state
@@ -1345,7 +1252,6 @@ impl App {
                 for disabled_id in disabled_ids {
                     guard.exported_caps_live.remove(&disabled_id);
                 }
-                guard.exported_api_session = None;
                 guard.shared_caps.clone()
             };
             self.persist_shared_capability_registry(&shared_caps)?;
@@ -1357,8 +1263,6 @@ impl App {
         let client =
             crate::validate_saved_api_session_capability(sandstorm_api, &saved_cap.saved_token)
                 .await?;
-        let path = crate::exported_api_session_id_path();
-        crate::persist_configured_exported_capability(path.as_path(), &saved_cap.id)?;
 
         let shared_caps = {
             let mut guard = self
@@ -1389,10 +1293,6 @@ impl App {
                     saved_cap: saved_cap.clone(),
                 });
             }
-            guard.exported_api_session = crate::first_enabled_shared_capability(
-                &guard.shared_caps,
-                SharedCapabilityKind::ApiSession,
-            );
             guard
                 .exported_caps_live
                 .insert(saved_cap.id.clone(), client.client.clone());
@@ -1405,7 +1305,7 @@ impl App {
     pub(crate) async fn connect_peer_rpc_session(
         &self,
         sandstorm_api: crate::grain_capnp::sandstorm_api::Client<capnp::any_pointer::Owned>,
-    ) -> Result<(Vec<crate::PeerRpcExport>, Vec<crate::PeerRpcExport>), String> {
+    ) -> Result<(), String> {
         let (endpoint, remote_ticket, old_connection) = {
             let mut guard = self
                 .state
@@ -1455,7 +1355,6 @@ impl App {
                 .clone()
                 .ok_or_else(|| "no remote ticket configured".to_string())?;
             let old_connection = guard.peer_rpc_session.take().map(|session| session.connection);
-            guard.imported_remote_caps.clear();
             guard.peer_rpc_error = None;
             guard.pending_outgoing_peer_node_id = None;
             guard.pairing_status = crate::PairingStatus::Connecting;
@@ -1689,7 +1588,7 @@ impl App {
         connection: iroh::endpoint::Connection,
         remote_node_id: String,
         sandstorm_api: crate::grain_capnp::sandstorm_api::Client<capnp::any_pointer::Owned>,
-    ) -> Result<(Vec<crate::PeerRpcExport>, Vec<crate::PeerRpcExport>), String> {
+    ) -> Result<(), String> {
         let (send, recv) = connection
             .open_bi()
             .await
@@ -1730,8 +1629,6 @@ impl App {
                 connection: connection.clone(),
                 remote_bootstrap: remote_bootstrap.clone(),
                 capability_exports: Vec::new(),
-                ip_network_exports: Vec::new(),
-                api_session_exports: Vec::new(),
             });
             guard.pairing_status = crate::PairingStatus::Connected;
             session_id
@@ -1741,14 +1638,8 @@ impl App {
             let app = self.clone();
             let remote_bootstrap = remote_bootstrap.clone();
             async move {
-                let capability_exports =
-                    crate::list_remote_capability_exports(remote_bootstrap.clone()).await;
-                let ip_network_exports =
-                    crate::list_remote_ip_network_exports(remote_bootstrap.clone()).await;
-                let api_session_exports =
-                    crate::list_remote_api_session_exports(remote_bootstrap.clone()).await;
-                match (capability_exports, ip_network_exports, api_session_exports) {
-                    (Ok(capability_exports), Ok(ip_network_exports), Ok(api_session_exports)) => {
+                match crate::list_remote_capability_exports(remote_bootstrap.clone()).await {
+                    Ok(capability_exports) => {
                         if let Ok(mut guard) = app.state.lock() {
                             let is_current = guard
                                 .peer_rpc_session
@@ -1758,13 +1649,11 @@ impl App {
                             if is_current {
                                 if let Some(session) = guard.peer_rpc_session.as_mut() {
                                     session.capability_exports = capability_exports;
-                                    session.ip_network_exports = ip_network_exports;
-                                    session.api_session_exports = api_session_exports;
                                 }
                             }
                         }
                     }
-                    (Err(err), _, _) | (_, Err(err), _) | (_, _, Err(err)) => {
+                    Err(err) => {
                         if let Ok(mut guard) = app.state.lock() {
                             guard.peer_rpc_error = Some(err);
                         }
@@ -1797,7 +1686,7 @@ impl App {
             }
         });
 
-        Ok((Vec::new(), Vec::new()))
+        Ok(())
     }
 
     async fn attach_client_peer_rpc_session_eager(
@@ -1805,7 +1694,7 @@ impl App {
         connection: iroh::endpoint::Connection,
         remote_node_id: String,
         sandstorm_api: crate::grain_capnp::sandstorm_api::Client<capnp::any_pointer::Owned>,
-    ) -> Result<(Vec<crate::PeerRpcExport>, Vec<crate::PeerRpcExport>), String> {
+    ) -> Result<(), String> {
         let (send, recv) = connection
             .open_bi()
             .await
@@ -1835,10 +1724,6 @@ impl App {
 
         let capability_exports =
             crate::list_remote_capability_exports(remote_bootstrap.clone()).await?;
-        let ip_network_exports =
-            crate::list_remote_ip_network_exports(remote_bootstrap.clone()).await?;
-        let api_session_exports =
-            crate::list_remote_api_session_exports(remote_bootstrap.clone()).await?;
         let session_id = {
             let mut guard = self
                 .state
@@ -1852,8 +1737,6 @@ impl App {
                 connection: connection.clone(),
                 remote_bootstrap,
                 capability_exports,
-                ip_network_exports: ip_network_exports.clone(),
-                api_session_exports: api_session_exports.clone(),
             });
             guard.pairing_status = crate::PairingStatus::Connected;
             session_id
@@ -1883,7 +1766,7 @@ impl App {
             }
         });
 
-        Ok((ip_network_exports, api_session_exports))
+        Ok(())
     }
 
     async fn attach_server_peer_rpc_session(
@@ -1926,8 +1809,6 @@ impl App {
                 connection: connection.clone(),
                 remote_bootstrap: remote_bootstrap.clone(),
                 capability_exports: Vec::new(),
-                ip_network_exports: Vec::new(),
-                api_session_exports: Vec::new(),
             });
             guard.pairing_status = crate::PairingStatus::Connected;
             session_id
@@ -1937,14 +1818,8 @@ impl App {
             let app = self.clone();
             let remote_bootstrap = remote_bootstrap.clone();
             async move {
-                let capability_exports =
-                    crate::list_remote_capability_exports(remote_bootstrap.clone()).await;
-                let ip_network_exports =
-                    crate::list_remote_ip_network_exports(remote_bootstrap.clone()).await;
-                let api_session_exports =
-                    crate::list_remote_api_session_exports(remote_bootstrap.clone()).await;
-                match (capability_exports, ip_network_exports, api_session_exports) {
-                    (Ok(capability_exports), Ok(ip_network_exports), Ok(api_session_exports)) => {
+                match crate::list_remote_capability_exports(remote_bootstrap.clone()).await {
+                    Ok(capability_exports) => {
                         if let Ok(mut guard) = app.state.lock() {
                             let is_current = guard
                                 .peer_rpc_session
@@ -1954,13 +1829,11 @@ impl App {
                             if is_current {
                                 if let Some(session) = guard.peer_rpc_session.as_mut() {
                                     session.capability_exports = capability_exports;
-                                    session.ip_network_exports = ip_network_exports;
-                                    session.api_session_exports = api_session_exports;
                                 }
                             }
                         }
                     }
-                    (Err(err), _, _) | (_, Err(err), _) | (_, _, Err(err)) => {
+                    Err(err) => {
                         if let Ok(mut guard) = app.state.lock() {
                             guard.peer_rpc_error = Some(err);
                         }
@@ -1984,7 +1857,6 @@ impl App {
                         .unwrap_or(false);
                     if is_current {
                         guard.peer_rpc_session = None;
-                        guard.imported_remote_caps.clear();
                         guard.peer_rpc_error =
                             Some(format!("peer rpc session closed: {close_reason}"));
                         guard.pairing_status = if guard.tunnel_enabled {
@@ -2014,10 +1886,6 @@ impl App {
 
         let capability_exports =
             crate::list_remote_capability_exports(remote_bootstrap.clone()).await?;
-        let ip_network_exports =
-            crate::list_remote_ip_network_exports(remote_bootstrap.clone()).await?;
-        let api_session_exports =
-            crate::list_remote_api_session_exports(remote_bootstrap.clone()).await?;
 
         {
             let mut guard = self
@@ -2034,8 +1902,6 @@ impl App {
             }
             if let Some(session) = guard.peer_rpc_session.as_mut() {
                 session.capability_exports = capability_exports;
-                session.ip_network_exports = ip_network_exports;
-                session.api_session_exports = api_session_exports;
             }
         }
 
@@ -2066,42 +1932,33 @@ impl App {
         &self,
         export_id: &str,
     ) -> Result<(String, String, crate::ImportedRemoteCapabilityKind), String> {
-        let remote_bootstrap = {
+        let (remote_bootstrap, remote_node_id) = {
             let guard = self
                 .state
                 .lock()
                 .map_err(|_| "app state lock poisoned".to_string())?;
-            guard
+            let session = guard
                 .peer_rpc_session
                 .as_ref()
-                .ok_or_else(|| "peer rpc session is not connected".to_string())?
-                .remote_bootstrap
-                .clone()
+                .ok_or_else(|| "peer rpc session is not connected".to_string())?;
+            (session.remote_bootstrap.clone(), session.remote_node_id.clone())
         };
-        let (fetched_label, fetched_kind, fetched_type_tag, fetched_descriptor_json, client) =
+        let (fetched_label, fetched_kind, fetched_type_tag, fetched_descriptor_json, _client) =
             crate::fetch_remote_capability_export(remote_bootstrap, export_id).await?;
-        let kind = crate::ImportedRemoteCapabilityKind::IpNetwork;
-        if fetched_kind == crate::ImportedRemoteCapabilityKind::ApiSession {
-            return Err(format!(
-                "remote export {export_id} is {} rather than IpNetwork",
-                crate::imported_kind_label(fetched_kind)
-            ));
-        }
-        let (label, object_id) = self.create_local_proxy_for_remote_export(export_id).await?;
-        self.store_live_imported_remote_capability(
-            object_id.clone(),
+        let (label, object_id) = self.create_local_proxy_record(
+            remote_node_id,
+            crate::LocalProxyTargetKindRuntime::ExportId,
             export_id.to_string(),
             fetched_label,
-            kind,
+            fetched_kind,
             if fetched_type_tag.is_empty() {
-                crate::imported_type_tag_for_kind(kind)
+                crate::imported_type_tag_for_kind(fetched_kind)
             } else {
                 fetched_type_tag
             },
             fetched_descriptor_json,
-            client,
         )?;
-        Ok((label, object_id, kind))
+        Ok((label, object_id, fetched_kind))
     }
 
     pub(crate) fn render_state_json(&self) -> Result<String, String> {
@@ -2163,15 +2020,6 @@ impl App {
                     .and_then(crate::descriptor_json_to_match_request_b64)
             })
             .collect::<Vec<_>>();
-        advertised_match_descriptors.extend(
-            guard.imported_remote_caps
-                .values()
-                .filter_map(|cap| {
-                    cap.descriptor_json
-                        .as_deref()
-                        .and_then(crate::descriptor_json_to_match_request_b64)
-                }),
-        );
         if let Some(session) = guard.peer_rpc_session.as_ref() {
             advertised_match_descriptors.extend(
                 session
@@ -2200,27 +2048,9 @@ impl App {
             ),
             None => "null".to_string(),
         };
-        let exported_ip_network = match &guard.exported_ip_network {
-            Some(value) => format!(
-                "{{\"id\":\"{}\",\"label\":\"{}\",\"savedToken\":\"{}\"}}",
-                crate::json_escape(&value.id),
-                crate::json_escape(&value.label),
-                crate::json_escape(&value.saved_token)
-            ),
-            None => "null".to_string(),
-        };
-        let exported_api_session = match &guard.exported_api_session {
-            Some(value) => format!(
-                "{{\"id\":\"{}\",\"label\":\"{}\",\"savedToken\":\"{}\"}}",
-                crate::json_escape(&value.id),
-                crate::json_escape(&value.label),
-                crate::json_escape(&value.saved_token)
-            ),
-            None => "null".to_string(),
-        };
         let peer_rpc = match &guard.peer_rpc_session {
             Some(session) => {
-                let ip_network_exports = session
+                let capability_exports = session
                     .capability_exports
                     .iter()
                     .map(|export| {
@@ -2238,63 +2068,17 @@ impl App {
                     })
                     .collect::<Vec<_>>()
                     .join(",");
-                let network_exports = session
-                    .ip_network_exports
-                    .iter()
-                    .map(|export| {
-                        format!(
-                            "{{\"id\":\"{}\",\"label\":\"{}\"}}",
-                            crate::json_escape(&export.id),
-                            crate::json_escape(&export.label)
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join(",");
-                let api_session_exports = session
-                    .api_session_exports
-                    .iter()
-                    .map(|export| {
-                        format!(
-                            "{{\"id\":\"{}\",\"label\":\"{}\"}}",
-                            crate::json_escape(&export.id),
-                            crate::json_escape(&export.label)
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join(",");
                 format!(
-                    "{{\"connected\":true,\"sessionId\":{},\"remoteNodeId\":\"{}\",\"capabilityExports\":[{}],\"ipNetworkExports\":[{}],\"apiSessionExports\":[{}]}}",
+                    "{{\"connected\":true,\"sessionId\":{},\"remoteNodeId\":\"{}\",\"capabilityExports\":[{}]}}",
                     session.session_id,
                     crate::json_escape(&session.remote_node_id),
-                    ip_network_exports,
-                    network_exports,
-                    api_session_exports
+                    capability_exports
                 )
             }
             None => {
-                "{\"connected\":false,\"capabilityExports\":[],\"ipNetworkExports\":[],\"apiSessionExports\":[]}".to_string()
+                "{\"connected\":false,\"capabilityExports\":[]}".to_string()
             }
         };
-        let imported_remote_caps = guard
-            .imported_remote_caps
-            .values()
-            .map(|cap| {
-                format!(
-                    "{{\"objectId\":\"{}\",\"exportId\":\"{}\",\"label\":\"{}\",\"kind\":\"{}\",\"typeTag\":\"{}\",\"descriptorJson\":{}}}",
-                    crate::json_escape(&cap.object_id),
-                    crate::json_escape(&cap.export_id),
-                    crate::json_escape(&cap.label),
-                    crate::json_escape(crate::imported_kind_label(cap.kind)),
-                    crate::json_escape(&cap.type_tag),
-                    match &cap.descriptor_json {
-                        Some(value) => format!("\"{}\"", crate::json_escape(value)),
-                        None => "null".to_string(),
-                    }
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(",");
-        let persisted_received_caps = String::new();
         let local_proxy_caps = guard
             .local_proxy_caps
             .iter()
@@ -2380,7 +2164,7 @@ impl App {
             crate::advertised_powerbox_matches_json_from_b64(&advertised_match_descriptors)?;
 
         Ok(format!(
-            "{{\"powerboxQueries\":{{\"apiSession\":\"{}\",\"ipNetwork\":\"{}\",\"ipInterface\":\"{}\"}},\"powerboxAdvertisedMatches\":{},\"irohNodeId\":\"{}\",\"irohEndpoint\":{{\"bound\":{},\"nodeId\":\"{}\",\"relayUrls\":[{}],\"directAddrs\":[{}],\"customAddrs\":[{}],\"error\":{},\"localTicket\":{},\"rawUdpInterface\":{}}},\"pairing\":{{\"status\":\"{}\",\"approvedPeerNodeId\":{},\"pendingIncomingPeerNodeId\":{},\"pendingOutgoingPeerNodeId\":{},\"tunnelEnabled\":{}}},\"peerRpc\":{},\"peerRpcError\":{},\"exportedIpNetwork\":{},\"exportedApiSession\":{},\"importedRemoteCaps\":[{}],\"persistedReceivedCaps\":[{}],\"localProxyCaps\":[{}],\"transportAssessment\":\"{}\",\"remoteTicket\":{},\"savedCaps\":[{}],\"sharedCaps\":[{}],\"activeTcpSessions\":[{}]}}",
+            "{{\"powerboxQueries\":{{\"apiSession\":\"{}\",\"ipNetwork\":\"{}\",\"ipInterface\":\"{}\"}},\"powerboxAdvertisedMatches\":{},\"irohNodeId\":\"{}\",\"irohEndpoint\":{{\"bound\":{},\"nodeId\":\"{}\",\"relayUrls\":[{}],\"directAddrs\":[{}],\"customAddrs\":[{}],\"error\":{},\"localTicket\":{},\"rawUdpInterface\":{}}},\"pairing\":{{\"status\":\"{}\",\"approvedPeerNodeId\":{},\"pendingIncomingPeerNodeId\":{},\"pendingOutgoingPeerNodeId\":{},\"tunnelEnabled\":{}}},\"peerRpc\":{},\"peerRpcError\":{},\"localProxyCaps\":[{}],\"transportAssessment\":\"{}\",\"remoteTicket\":{},\"savedCaps\":[{}],\"sharedCaps\":[{}],\"activeTcpSessions\":[{}]}}",
             crate::json_escape(&crate::powerbox_query_for_interface(
                 crate::api_session_capnp::api_session::Client::TYPE_ID
             )?),
@@ -2407,10 +2191,6 @@ impl App {
             if guard.tunnel_enabled { "true" } else { "false" },
             peer_rpc,
             peer_rpc_error,
-            exported_ip_network,
-            exported_api_session,
-            imported_remote_caps,
-            persisted_received_caps,
             local_proxy_caps,
             crate::json_escape(crate::IROH_TRANSPORT_ASSESSMENT),
             remote_ticket,
@@ -2467,64 +2247,6 @@ impl App {
         self.storage.persist_local_proxy_capability_registry(&records)
     }
 
-    fn replace_imported_remote_capability(
-        &self,
-        guard: &mut crate::AppState,
-        previous_object_id: Option<String>,
-        capability: crate::ImportedRemoteCapability,
-    ) {
-        if let Some(previous_object_id) = previous_object_id {
-            guard.imported_remote_caps.remove(&previous_object_id);
-        }
-        guard
-            .imported_remote_caps
-            .insert(capability.object_id.clone(), capability);
-    }
-
-    fn store_live_imported_remote_capability(
-        &self,
-        object_id: String,
-        export_id: String,
-        label: String,
-        kind: crate::ImportedRemoteCapabilityKind,
-        type_tag: String,
-        descriptor_json: Option<String>,
-        client: capnp::capability::Client,
-    ) -> Result<(), String> {
-        let mut guard = self
-            .state
-            .lock()
-            .map_err(|_| "app state lock poisoned".to_string())?;
-        let previous_object_id = match kind {
-            crate::ImportedRemoteCapabilityKind::IpNetwork => guard
-                .imported_remote_caps
-                .values()
-                .find(|cap| cap.kind == crate::ImportedRemoteCapabilityKind::IpNetwork)
-                .map(|cap| cap.object_id.clone()),
-            crate::ImportedRemoteCapabilityKind::ApiSession => guard
-                .imported_remote_caps
-                .values()
-                .find(|cap| cap.kind == crate::ImportedRemoteCapabilityKind::ApiSession)
-                .map(|cap| cap.object_id.clone()),
-            crate::ImportedRemoteCapabilityKind::Other => None,
-        };
-        self.replace_imported_remote_capability(
-            &mut guard,
-            previous_object_id,
-            crate::ImportedRemoteCapability {
-                object_id,
-                export_id,
-                label,
-                kind,
-                type_tag,
-                descriptor_json,
-                client,
-            },
-        );
-        guard.peer_rpc_error = None;
-        Ok(())
-    }
-
     fn close_peer_rpc_session_locked(
         &self,
         guard: &mut crate::AppState,
@@ -2533,7 +2255,6 @@ impl App {
         if let Some(session) = guard.peer_rpc_session.take() {
             session.connection.close(0u32.into(), reason);
         }
-        guard.imported_remote_caps.clear();
         guard.pairing_status = if guard.tunnel_enabled {
             crate::PairingStatus::Disconnected
         } else {

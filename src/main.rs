@@ -18,7 +18,6 @@ mod test_support;
 use base64::Engine as _;
 use std::collections::{HashMap, HashSet};
 use std::os::fd::FromRawFd;
-use std::path::Path;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -74,14 +73,6 @@ fn app_core(app_state: &Arc<Mutex<AppState>>) -> App {
         .map(|guard| guard.storage.clone())
         .unwrap_or_else(|_| app_storage());
     App::new(app_state.clone(), storage)
-}
-
-fn exported_ip_network_id_path() -> std::path::PathBuf {
-    app_storage().exported_ip_network_id_path()
-}
-
-fn exported_api_session_id_path() -> std::path::PathBuf {
-    app_storage().exported_api_session_id_path()
 }
 
 fn raw_udp_interface_token_path() -> std::path::PathBuf {
@@ -1026,39 +1017,13 @@ impl web_session_capnp::web_session::Server for WebSessionImpl {
             let sandstorm_api = self.sandstorm_api.clone();
             return Promise::from_future(async move {
                 match connect_peer_rpc_session(app_state, sandstorm_api).await {
-                    Ok((ip_network_exports, api_session_exports)) => {
-                        let ip_network_exports_json = ip_network_exports
-                            .iter()
-                            .map(|export| {
-                                format!(
-                                    "{{\"id\":\"{}\",\"label\":\"{}\"}}",
-                                    json_escape(&export.id),
-                                    json_escape(&export.label)
-                                )
-                            })
-                            .collect::<Vec<_>>()
-                            .join(",");
-                        let api_session_exports_json = api_session_exports
-                            .iter()
-                            .map(|export| {
-                                format!(
-                                    "{{\"id\":\"{}\",\"label\":\"{}\"}}",
-                                    json_escape(&export.id),
-                                    json_escape(&export.label)
-                                )
-                            })
-                            .collect::<Vec<_>>()
-                            .join(",");
-                        let body = format!(
-                            "{{\"ok\":true,\"ipNetworkExports\":[{}],\"apiSessionExports\":[{}]}}",
-                            ip_network_exports_json, api_session_exports_json
-                        );
+                    Ok(_) => {
                         let mut content = results.get().init_content();
                         content.set_status_code(
                             web_session_capnp::web_session::response::SuccessCode::Ok,
                         );
                         content.set_mime_type("application/json");
-                        content.init_body().set_bytes(body.as_bytes());
+                        content.init_body().set_bytes(br#"{"ok":true}"#);
                     }
                     Err(err) => {
                         eprintln!("peer rpc connect failed: {err}");
@@ -2378,11 +2343,7 @@ impl web_session_capnp::web_session::Server for WebSessionImpl {
                 let sandstorm_api = self.sandstorm_api.clone();
                 let session_context = self.session_context.clone();
                 return Promise::from_future(async move {
-                    let effective_object_id =
-                        match create_local_proxy_for_received_object(&app_state, &object_id).await {
-                            Ok((_label, local_proxy_object_id)) => local_proxy_object_id,
-                            Err(_) => object_id.clone(),
-                        };
+                    let effective_object_id = object_id.clone();
                     let label = match capability_label_for_object_id(&app_state, &effective_object_id) {
                         Ok(label) => label,
                         Err(err) => {
@@ -3016,57 +2977,6 @@ fn load_shared_capabilities() -> Result<Vec<SharedCapability>, String> {
         .collect::<Result<Vec<_>, _>>()?)
 }
 
-fn persist_shared_capabilities(records: &[SharedCapability]) -> Result<(), String> {
-    let rows = records
-        .iter()
-        .map(|record| SharedCapabilityRecord {
-            id: record.id.clone(),
-            saved_cap_id: record.saved_cap.id.clone(),
-            label: record.label.clone(),
-            kind: record.kind,
-            type_tag: Some(shared_capability_type_tag(record)),
-            enabled: record.enabled,
-            created_at_ms: record.created_at_ms,
-            descriptor_json: record.saved_cap.descriptor_json.clone(),
-        })
-        .collect::<Vec<_>>();
-    app_storage().persist_shared_capabilities(&rows)
-}
-
-fn first_enabled_shared_capability(
-    shared_caps: &[SharedCapability],
-    kind: SharedCapabilityKind,
-) -> Option<SavedCapability> {
-    shared_caps
-        .iter()
-        .find(|cap| cap.kind == kind && cap.enabled)
-        .map(|cap| cap.saved_cap.clone())
-}
-
-fn load_configured_exported_capability(
-    path: &Path,
-    fallback_label: &str,
-) -> Result<Option<SavedCapability>, String> {
-    match app_storage().load_text_file(path)? {
-        Some(trimmed) => Ok(load_saved_capability_by_id(&trimmed)?.or(Some(SavedCapability {
-            id: trimmed,
-            label: fallback_label.to_string(),
-            saved_token: String::new(),
-            created_at_ms: 0,
-            descriptor_json: None,
-        }))),
-        None => Ok(None),
-    }
-}
-
-fn persist_configured_exported_capability(path: &Path, saved_cap_id: &str) -> Result<(), String> {
-    app_storage().persist_text_file(path, saved_cap_id)
-}
-
-fn clear_configured_exported_capability(path: &Path) -> Result<(), String> {
-    app_storage().clear_file(path)
-}
-
 fn load_persisted_received_capabilities() -> Result<Vec<PersistedReceivedCapability>, String> {
     Ok(app_storage()
         .load_persisted_received_capabilities()?
@@ -3347,12 +3257,6 @@ pub(crate) struct SharedCapability {
 }
 
 #[derive(Clone)]
-struct PeerRpcExport {
-    id: String,
-    label: String,
-}
-
-#[derive(Clone)]
 struct PeerRpcCapabilityExport {
     id: String,
     label: String,
@@ -3367,8 +3271,6 @@ struct PeerRpcSession {
     connection: iroh::endpoint::Connection,
     remote_bootstrap: tunnel_capnp::peer_bootstrap::Client,
     capability_exports: Vec<PeerRpcCapabilityExport>,
-    ip_network_exports: Vec<PeerRpcExport>,
-    api_session_exports: Vec<PeerRpcExport>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -3387,17 +3289,6 @@ struct PersistedReceivedCapability {
     type_tag: String,
     descriptor_json: Option<String>,
     enabled: bool,
-}
-
-#[derive(Clone)]
-struct ImportedRemoteCapability {
-    object_id: String,
-    export_id: String,
-    label: String,
-    kind: ImportedRemoteCapabilityKind,
-    type_tag: String,
-    descriptor_json: Option<String>,
-    client: capnp::capability::Client,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -3527,11 +3418,8 @@ struct AppState {
     tunnel_enabled: bool,
     pairing_status: PairingStatus,
     shared_caps: Vec<SharedCapability>,
-    exported_ip_network: Option<SavedCapability>,
-    exported_api_session: Option<SavedCapability>,
     exported_caps_live: HashMap<String, capnp::capability::Client>,
     peer_rpc_session: Option<PeerRpcSession>,
-    imported_remote_caps: HashMap<String, ImportedRemoteCapability>,
     local_proxy_caps: Vec<LocalProxyCapability>,
     registered_remote_caps: HashMap<String, RegisteredRemoteCapability>,
     registered_remote_hook_object_ids: HashMap<usize, String>,
@@ -3550,44 +3438,7 @@ impl AppState {
         let remote_ticket = load_remote_ticket()?;
         let approved_peer_node_id = load_approved_peer_node_id()?;
         let tunnel_enabled = load_tunnel_enabled()?;
-        let legacy_exported_ip_network = load_configured_exported_capability(
-            exported_ip_network_id_path().as_path(),
-            "Configured IpNetwork export",
-        )?;
-        let legacy_exported_api_session = load_configured_exported_capability(
-            exported_api_session_id_path().as_path(),
-            "Configured ApiSession export",
-        )?;
-        let mut shared_caps = load_shared_capabilities()?;
-        if shared_caps.is_empty() {
-            if let Some(saved_cap) = legacy_exported_ip_network.clone() {
-                shared_caps.push(SharedCapability {
-                    id: make_shared_cap_id(),
-                    label: saved_cap.label.clone(),
-                    kind: SharedCapabilityKind::IpNetwork,
-                    enabled: true,
-                    created_at_ms: saved_cap.created_at_ms,
-                    saved_cap,
-                });
-            }
-            if let Some(saved_cap) = legacy_exported_api_session.clone() {
-                shared_caps.push(SharedCapability {
-                    id: make_shared_cap_id(),
-                    label: saved_cap.label.clone(),
-                    kind: SharedCapabilityKind::ApiSession,
-                    enabled: true,
-                    created_at_ms: saved_cap.created_at_ms,
-                    saved_cap,
-                });
-            }
-            if !shared_caps.is_empty() {
-                persist_shared_capabilities(&shared_caps)?;
-            }
-        }
-        let exported_ip_network =
-            first_enabled_shared_capability(&shared_caps, SharedCapabilityKind::IpNetwork);
-        let exported_api_session =
-            first_enabled_shared_capability(&shared_caps, SharedCapabilityKind::ApiSession);
+        let shared_caps = load_shared_capabilities()?;
         let mut local_proxy_caps = load_local_proxy_capabilities()?;
         let had_remote_object_local_proxies = local_proxy_caps
             .iter()
@@ -3641,11 +3492,8 @@ impl AppState {
                 PairingStatus::Disabled
             },
             shared_caps,
-            exported_ip_network,
-            exported_api_session,
             exported_caps_live: HashMap::new(),
             peer_rpc_session: None,
-            imported_remote_caps: HashMap::new(),
             local_proxy_caps,
             registered_remote_caps: registered_remote_caps
                 .into_iter()
@@ -4442,11 +4290,7 @@ fn collect_match_request_descriptors(
         let guard = app_state
             .lock()
             .map_err(|_| "app state lock poisoned".to_string())?;
-        let mut values = guard
-            .imported_remote_caps
-            .values()
-            .filter_map(|cap| cap.descriptor_json.clone())
-            .collect::<Vec<_>>();
+        let mut values: Vec<String> = Vec::new();
         if let Some(session) = guard.peer_rpc_session.as_ref() {
             values.extend(
                 session
@@ -4579,15 +4423,6 @@ async fn create_local_proxy_for_remote_export(
         .await
 }
 
-async fn create_local_proxy_for_received_object(
-    app_state: &Arc<Mutex<AppState>>,
-    object_id: &str,
-) -> Result<(String, String), String> {
-    app_core(app_state)
-        .create_local_proxy_for_received_object(object_id)
-        .await
-}
-
 async fn create_local_proxy_for_registered_remote_object(
     app_state: &Arc<Mutex<AppState>>,
     remote_object_id: &str,
@@ -4608,9 +4443,6 @@ fn capability_label_for_object_id(
         let guard = app_state
             .lock()
             .map_err(|_| "app state lock poisoned".to_string())?;
-        if let Some(cap) = guard.imported_remote_caps.get(object_id) {
-            return Ok(cap.label.clone());
-        }
         if let Some(record) = guard
             .local_proxy_caps
             .iter()
@@ -4635,9 +4467,6 @@ fn capability_descriptor_for_object_id(
         let guard = app_state
             .lock()
             .map_err(|_| "app state lock poisoned".to_string())?;
-        if let Some(cap) = guard.imported_remote_caps.get(object_id) {
-            return Ok(cap.descriptor_json.clone());
-        }
         if let Some(record) = guard
             .local_proxy_caps
             .iter()
@@ -4809,20 +4638,6 @@ async fn connect_ip_network_tcp_client(
     })
 }
 
-async fn list_remote_ip_network_exports(
-    remote_bootstrap: tunnel_capnp::peer_bootstrap::Client,
-) -> Result<Vec<PeerRpcExport>, String> {
-    Ok(list_remote_capability_exports(remote_bootstrap)
-        .await?
-        .into_iter()
-        .filter(|export| export.kind == SharedCapabilityKind::IpNetwork)
-        .map(|export| PeerRpcExport {
-            id: export.id,
-            label: export.label,
-        })
-        .collect())
-}
-
 async fn list_remote_capability_exports(
     remote_bootstrap: tunnel_capnp::peer_bootstrap::Client,
 ) -> Result<Vec<PeerRpcCapabilityExport>, String> {
@@ -4876,20 +4691,6 @@ async fn list_remote_capability_exports(
         });
     }
     Ok(values)
-}
-
-async fn list_remote_api_session_exports(
-    remote_bootstrap: tunnel_capnp::peer_bootstrap::Client,
-) -> Result<Vec<PeerRpcExport>, String> {
-    Ok(list_remote_capability_exports(remote_bootstrap)
-        .await?
-        .into_iter()
-        .filter(|export| export.kind == SharedCapabilityKind::ApiSession)
-        .map(|export| PeerRpcExport {
-            id: export.id,
-            label: export.label,
-        })
-        .collect())
 }
 
 async fn fetch_remote_capability_export(
@@ -5038,7 +4839,7 @@ async fn fetch_remote_registered_capability(
 async fn connect_peer_rpc_session(
     app_state: Arc<Mutex<AppState>>,
     sandstorm_api: grain_capnp::sandstorm_api::Client<capnp::any_pointer::Owned>,
-) -> Result<(Vec<PeerRpcExport>, Vec<PeerRpcExport>), String> {
+) -> Result<(), String> {
     app_core(&app_state)
         .connect_peer_rpc_session(sandstorm_api)
         .await
@@ -5590,6 +5391,22 @@ mod tests {
             .map(|value| value.object_id.clone())
     }
 
+    fn peer_rpc_capability_export_ids(app: &App) -> Vec<String> {
+        let state = app.shared_state_for_test();
+        let guard = state.lock().unwrap();
+        guard
+            .peer_rpc_session
+            .as_ref()
+            .map(|session| {
+                session
+                    .capability_exports
+                    .iter()
+                    .map(|export| export.id.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     #[test]
     fn parse_sandstorm_raw_udp_bind_config_defaults_port() {
         let config = parse_sandstorm_raw_udp_bind_config(Some("deadbeef"), None)
@@ -5929,11 +5746,8 @@ mod tests {
             tunnel_enabled: true,
             pairing_status: PairingStatus::Disconnected,
             shared_caps: Vec::new(),
-            exported_ip_network: None,
-            exported_api_session: None,
             exported_caps_live: HashMap::new(),
             peer_rpc_session: None,
-            imported_remote_caps: HashMap::new(),
             local_proxy_caps: Vec::new(),
             registered_remote_caps: HashMap::new(),
             registered_remote_hook_object_ids: HashMap::new(),
@@ -5979,7 +5793,6 @@ mod tests {
 
             let initial_state = importer_app.render_state_json().unwrap();
             assert!(initial_state.contains("\"peerRpc\":{\"connected\":false"));
-            assert!(initial_state.contains("\"persistedReceivedCaps\":[]"));
 
             importer_app
                 .connect_peer_rpc_session(importer_sandstorm_api.clone())
@@ -5992,16 +5805,12 @@ mod tests {
 
             let live_state = importer_app.render_state_json().unwrap();
             assert!(live_state.contains("\"connected\":true"));
-            assert!(live_state.contains("\"exportedApiSession\":null"));
-            assert!(live_state.contains("\"importedRemoteCaps\":[{\"objectId\":\"local-proxy-cap-1\""));
-            assert!(live_state.contains("\"persistedReceivedCaps\":[]"));
+            assert!(live_state.contains("\"localProxyCaps\":[{\"objectId\":\"local-proxy-cap-1\""));
             assert!(live_state.contains("\"peerRpcError\":null"));
 
             importer_app.disconnect_peer_rpc_session().unwrap();
             let disconnected_state = importer_app.render_state_json().unwrap();
             assert!(disconnected_state.contains("\"connected\":false"));
-            assert!(disconnected_state.contains("\"importedRemoteCaps\":[]"));
-            assert!(disconnected_state.contains("\"persistedReceivedCaps\":[]"));
             assert!(disconnected_state.contains("\"peerRpcError\":null"));
 
             importer_app
@@ -6016,16 +5825,13 @@ mod tests {
                 .unwrap();
             let cleared_state = importer_app.render_state_json().unwrap();
             assert!(cleared_state.contains("\"connected\":true"));
-            assert!(cleared_state.contains("\"importedRemoteCaps\":[]"));
-            assert!(cleared_state.contains("\"persistedReceivedCaps\":[]"));
-            assert!(cleared_state.contains("\"apiSessionExports\":[]"));
+            assert!(cleared_state.contains("\"capabilityExports\":[]"));
 
             importer_app
                 .drop_received_remote_capability("local-proxy-cap-1")
                 .unwrap();
             let dropped_state = importer_app.render_state_json().unwrap();
-            assert!(dropped_state.contains("\"importedRemoteCaps\":[]"));
-            assert!(dropped_state.contains("\"persistedReceivedCaps\":[]"));
+            assert!(dropped_state.contains("\"localProxyCaps\":[]"));
 
             let _ = exporter_sandstorm_api;
             importer_app.close_test_endpoint().await;
@@ -6638,12 +6444,13 @@ mod tests {
                 .set_remote_ticket_for_test(exporter_app.local_ticket_for_test().unwrap())
                 .unwrap();
 
-            let (_ip_exports, api_exports) = importer_app
+            importer_app
                 .connect_peer_rpc_session(importer_sandstorm_api.clone())
                 .await
                 .unwrap();
+            let api_exports = peer_rpc_capability_export_ids(&importer_app);
             assert_eq!(api_exports.len(), 1);
-            assert_eq!(api_exports[0].id, "preview-api");
+            assert_eq!(api_exports[0], "preview-api");
 
             let (_label, object_id) = importer_app
                 .create_local_proxy_for_remote_export("preview-api")
@@ -6750,12 +6557,13 @@ mod tests {
                 .set_remote_ticket_for_test(exporter_app.local_ticket_for_test().unwrap())
                 .unwrap();
 
-            let (ip_exports, _api_exports) = importer_app
+            importer_app
                 .connect_peer_rpc_session(importer_sandstorm_api.clone())
                 .await
                 .unwrap();
+            let ip_exports = peer_rpc_capability_export_ids(&importer_app);
             assert_eq!(ip_exports.len(), 1);
-            assert_eq!(ip_exports[0].id, "ip-network-export");
+            assert_eq!(ip_exports[0], "ip-network-export");
 
             let (_label, object_id) = importer_app
                 .create_local_proxy_for_remote_export("ip-network-export")
@@ -6930,13 +6738,14 @@ mod tests {
                 .set_remote_ticket_for_test(exporter_app.local_ticket_for_test().unwrap())
                 .unwrap();
 
-            let (_, api_exports) = importer_app
+            importer_app
                 .connect_peer_rpc_session(importer_sandstorm_api.clone())
                 .await
                 .unwrap();
+            let api_exports = peer_rpc_capability_export_ids(&importer_app);
             assert_eq!(api_exports.len(), 2);
-            assert!(api_exports.iter().any(|export| export.id == "preview-api-a"));
-            assert!(api_exports.iter().any(|export| export.id == "preview-api-b"));
+            assert!(api_exports.iter().any(|export| export == "preview-api-a"));
+            assert!(api_exports.iter().any(|export| export == "preview-api-b"));
 
             let (_, object_id_a) = importer_app
                 .create_local_proxy_for_remote_export("preview-api-a")
@@ -7605,7 +7414,7 @@ mod tests {
         run_local_async_test(async {
             let (exporter_app, _, exporter_sandstorm_api) =
                 build_test_app("fulfill-received-exporter", 197).await;
-            let (importer_app, importer_state, importer_sandstorm_api) =
+            let (importer_app, _importer_state, importer_sandstorm_api) =
                 build_test_app("fulfill-received-importer", 198).await;
 
             exporter_app
@@ -7625,18 +7434,11 @@ mod tests {
                 .await
                 .unwrap();
 
-            let (_label, received_object_id) = importer_app
+            let (_label, local_proxy_object_id) = importer_app
                 .import_remote_capability_export("preview-api")
                 .await
                 .map(|(label, object_id, _kind)| (label, object_id))
                 .unwrap();
-            assert_eq!(received_object_id, "remote-cap-1");
-
-            let (_label, local_proxy_object_id) =
-                create_local_proxy_for_received_object(&importer_state, &received_object_id)
-                    .await
-                    .unwrap();
-            assert_ne!(local_proxy_object_id, received_object_id);
             assert!(local_proxy_object_id.starts_with("local-proxy-cap-"));
 
             let capture = Arc::new(Mutex::new(crate::test_support::FakeFulfillCapture::default()));
@@ -7692,7 +7494,7 @@ mod tests {
             let importer_storage_root = make_test_storage_root("restart-provide-importer");
             let (exporter_app, _, exporter_sandstorm_api) =
                 build_test_app_with_storage(exporter_storage_root.clone(), 201).await;
-            let (importer_app, importer_state, importer_sandstorm_api) =
+            let (importer_app, _importer_state, importer_sandstorm_api) =
                 build_test_app_with_storage(importer_storage_root.clone(), 202).await;
 
             exporter_app
@@ -7712,15 +7514,11 @@ mod tests {
                 .await
                 .unwrap();
 
-            let (_label, received_object_id) = importer_app
+            let (_label, local_proxy_object_id) = importer_app
                 .import_remote_capability_export("preview-api")
                 .await
                 .map(|(label, object_id, _kind)| (label, object_id))
                 .unwrap();
-            let (_label, local_proxy_object_id) =
-                create_local_proxy_for_received_object(&importer_state, &received_object_id)
-                    .await
-                    .unwrap();
 
             let initial_capture =
                 Arc::new(Mutex::new(crate::test_support::FakeFulfillCapture::default()));
@@ -7763,7 +7561,7 @@ mod tests {
 
             let (restarted_exporter_app, _, restarted_exporter_sandstorm_api) =
                 build_test_app_with_storage_loaded(exporter_storage_root, 201).await;
-            let (restarted_importer_app, restarted_importer_state, restarted_importer_sandstorm_api) =
+            let (restarted_importer_app, _restarted_importer_state, restarted_importer_sandstorm_api) =
                 build_test_app_with_storage_loaded(importer_storage_root, 202).await;
 
             restarted_exporter_app
@@ -7783,10 +7581,8 @@ mod tests {
                 .await
                 .unwrap();
 
-            let (_label, restarted_local_proxy_object_id) =
-                create_local_proxy_for_received_object(&restarted_importer_state, &received_object_id)
-                    .await
-                    .unwrap();
+            let restarted_local_proxy_object_id =
+                local_proxy_api_session_object_id(&restarted_importer_app).unwrap();
             assert_eq!(restarted_local_proxy_object_id, local_proxy_object_id);
 
             let restarted_capture =
@@ -8477,11 +8273,12 @@ mod tests {
                 .set_remote_ticket_for_test(exporter_app.local_ticket_for_test().unwrap())
                 .unwrap();
 
-            let (_, exports) = importer_app
+            importer_app
                 .connect_peer_rpc_session(importer_sandstorm_api.clone())
                 .await
                 .unwrap();
-            assert_eq!(exports[0].id, "preview-api-v1");
+            let exports = peer_rpc_capability_export_ids(&importer_app);
+            assert_eq!(exports[0], "preview-api-v1");
             let (_, object_id) = importer_app
                 .create_local_proxy_for_remote_export("preview-api-v1")
                 .await
@@ -8499,11 +8296,12 @@ mod tests {
                 )
                 .unwrap();
 
-            let (_, exports) = importer_app
+            importer_app
                 .connect_peer_rpc_session(importer_sandstorm_api.clone())
                 .await
                 .unwrap();
-            assert_eq!(exports[0].id, "preview-api-v2");
+            let exports = peer_rpc_capability_export_ids(&importer_app);
+            assert_eq!(exports[0], "preview-api-v2");
             let (_, new_object_id) = importer_app
                 .create_local_proxy_for_remote_export("preview-api-v2")
                 .await
@@ -8560,10 +8358,11 @@ mod tests {
             importer_app.disconnect_peer_rpc_session().unwrap();
             exporter_app.clear_exported_api_session_for_test().unwrap();
 
-            let (_, exports) = importer_app
+            importer_app
                 .connect_peer_rpc_session(importer_sandstorm_api.clone())
                 .await
                 .unwrap();
+            let exports = peer_rpc_capability_export_ids(&importer_app);
             assert!(exports.is_empty());
             assert_eq!(
                 local_proxy_api_session_object_id(&importer_app).as_deref(),

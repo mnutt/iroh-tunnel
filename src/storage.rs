@@ -155,14 +155,6 @@ impl Storage {
         std::fs::write(path, body).map_err(|err| format!("{write_error}: {err}"))
     }
 
-    pub fn exported_ip_network_id_path(&self) -> PathBuf {
-        self.root.join("exported-ip-network-id")
-    }
-
-    pub fn exported_api_session_id_path(&self) -> PathBuf {
-        self.root.join("exported-api-session-id")
-    }
-
     pub fn raw_udp_interface_token_path(&self) -> PathBuf {
         self.root.join("raw-udp-interface-token")
     }

@@ -549,22 +549,7 @@ function renderRemoteExports(selectEl, exports, emptyText) {
 }
 
 function renderCombinedRemoteExports(selectEl, peerRpc) {
-  const combined = (peerRpc.capabilityExports && peerRpc.capabilityExports.length)
-    ? peerRpc.capabilityExports
-    : [
-      ...(peerRpc.ipNetworkExports || []).map((entry) => ({
-        kind: "IpNetwork",
-        id: entry.id,
-        label: entry.label,
-        typeTag: "sandstorm/ip-network",
-      })),
-      ...(peerRpc.apiSessionExports || []).map((entry) => ({
-        kind: "ApiSession",
-        id: entry.id,
-        label: entry.label,
-        typeTag: "sandstorm/api-session",
-      })),
-    ];
+  const combined = peerRpc.capabilityExports || [];
 
   selectEl.innerHTML = "";
   if (!combined.length) {
@@ -588,28 +573,12 @@ function renderReceivedCapabilities(context, data) {
   receivedCapsEl.innerHTML = "";
 
   const peerRpc = data.peerRpc || { connected: false };
-  const persisted = data.persistedReceivedCaps || [];
   const durableReceived = (data.localProxyCaps || []).filter(
     (entry) => entry.targetKind === "exportId"
   );
   const isPowerboxRequestSession =
     data.powerboxRequestSession && data.powerboxRequestSession.active;
-  const remoteExports = (peerRpc.capabilityExports && peerRpc.capabilityExports.length)
-    ? peerRpc.capabilityExports
-    : [
-      ...(peerRpc.ipNetworkExports || []).map((entry) => ({
-        kind: "IpNetwork",
-        id: entry.id,
-        label: entry.label,
-        typeTag: "sandstorm/ip-network",
-      })),
-      ...(peerRpc.apiSessionExports || []).map((entry) => ({
-        kind: "ApiSession",
-        id: entry.id,
-        label: entry.label,
-        typeTag: "sandstorm/api-session",
-      })),
-    ];
+  const remoteExports = peerRpc.capabilityExports || [];
   const durableByExportId = new Map();
   for (const entry of durableReceived) {
     durableByExportId.set(entry.targetId, entry);
@@ -1078,7 +1047,7 @@ export function renderApp(context, data) {
     debugPanelEl,
   } = context;
   const endpoint = data.irohEndpoint || {};
-  const peerRpc = data.peerRpc || { connected: false, ipNetworkExports: [], apiSessionExports: [] };
+  const peerRpc = data.peerRpc || { connected: false, capabilityExports: [] };
   const pairing = data.pairing || {};
   const directAddrs = endpoint.directAddrs || [];
   const customAddrs = endpoint.customAddrs || [];
