@@ -1606,6 +1606,7 @@ dependencies = [
  "noq-udp",
  "quinn",
  "quinn-udp",
+ "serde",
  "serde_json",
  "tokio",
  "tokio-util",

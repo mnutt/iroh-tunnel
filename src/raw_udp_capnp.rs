@@ -264,13 +264,6 @@ async fn run_capnp_raw_udp_custom_transport_driver(
             }
         };
 
-        eprintln!(
-            "raw udp custom transport: sending {} bytes src={} dst={}",
-            packet.payload.len(),
-            packet.src,
-            packet.dst
-        );
-
         if let Err(err) = send_custom_transport_packet(&socket, &packet).await {
             close_custom_transport_driver(&driver, err);
             return;
@@ -352,15 +345,6 @@ impl SandstormUdpReceiver for ProxyUdpDriver {
 
 impl SandstormUdpReceiver for SandstormCustomTransportDriver {
     fn receive_packet(&self, packet: OwnedUdpPacket) {
-        eprintln!(
-            "raw udp custom transport: received {} bytes src={} dst={}",
-            packet.payload.len(),
-            packet
-                .src
-                .map(|addr| addr.to_string())
-                .unwrap_or_else(|| "<missing>".to_string()),
-            packet.dst
-        );
         SandstormCustomTransportDriver::receive_packet(
             self,
             crate::sandstorm_custom_transport::OwnedUdpPacket {

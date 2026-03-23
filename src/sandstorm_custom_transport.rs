@@ -116,12 +116,6 @@ impl SandstormCustomTransportDriver {
     }
 
     pub fn receive_packet(&self, packet: OwnedUdpPacket) {
-        eprintln!(
-            "sandstorm custom transport driver: queue recv {} bytes src={} dst={}",
-            packet.payload.len(),
-            packet.src,
-            packet.dst
-        );
         if let Ok(mut recv) = self.shared.recv.lock() {
             recv.queue.push_back(packet);
             if let Some(waker) = recv.recv_waker.take() {
@@ -277,12 +271,6 @@ impl CustomSender for SandstormCustomSender {
             ecn: None,
             dst_ip: Some(dst.ip()),
         };
-        eprintln!(
-            "sandstorm custom transport sender: queue send {} bytes src={} dst={}",
-            packet.payload.len(),
-            packet.src,
-            packet.dst
-        );
         send.queue.push_back(packet);
         drop(send);
         self.shared.send_notify.notify_one();

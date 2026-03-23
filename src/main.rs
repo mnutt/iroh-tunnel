@@ -4,6 +4,7 @@ include!("sandstorm_capnp.rs");
 
 mod app;
 mod backend;
+mod untyped_local;
 #[allow(dead_code)]
 mod quinn_adapter;
 #[allow(dead_code)]
@@ -44,8 +45,10 @@ use crate::sandstorm_custom_transport::{
     socket_addr_to_custom_addr, SANDSTORM_RAW_UDP_TRANSPORT_ID,
 };
 use crate::storage::{
-    PersistedReceivedCapabilityRecord, ReceivedCapabilityKind, SavedCapabilityRecord,
-    SharedCapabilityKind, SharedCapabilityRecord, Storage,
+    LocalProxyCapabilityRecord, LocalProxyTargetKind, PersistedReceivedCapabilityRecord,
+    ReceivedCapabilityKind, RegisteredRemoteCapabilityDurability,
+    RegisteredRemoteCapabilityRecord, SavedCapabilityRecord, SharedCapabilityKind,
+    SharedCapabilityRecord, Storage,
 };
 
 const CLIENT_ROOT: &str = "/opt/app/client";
@@ -366,10 +369,24 @@ impl grain_capnp::main_view::Server<text::Owned> for UiViewImpl {
         let sandstorm_api = self.sandstorm_api.clone();
         let app_state = self.app_state.clone();
         Promise::from_future(async move {
+            eprintln!(
+                "main_view.restore: object_id={object_id} at_ms={}",
+                now_ms()
+            );
             let restored_cap =
                 restore_app_object_capability(sandstorm_api, &app_state, &object_id)
                     .await
-                    .map_err(capnp::Error::failed)?;
+                    .map_err(|err| {
+                        eprintln!(
+                            "main_view.restore: object_id={object_id} failed at_ms={} err={err}",
+                            now_ms()
+                        );
+                        capnp::Error::failed(err)
+                    })?;
+            eprintln!(
+                "main_view.restore: object_id={object_id} ok at_ms={}",
+                now_ms()
+            );
             results
                 .get()
                 .get_cap()
@@ -390,10 +407,26 @@ impl grain_capnp::main_view::Server<text::Owned> for UiViewImpl {
             .to_string();
         let app_state = self.app_state.clone();
         Promise::from_future(async move {
+            eprintln!("main_view.drop: object_id={object_id} at_ms={}", now_ms());
             match drop_received_remote_capability(&app_state, &object_id) {
-                Ok(true) => Ok(()),
-                Ok(false) => Ok(()),
-                Err(err) => Err(capnp::Error::failed(err)),
+                Ok(true) => {
+                    eprintln!("main_view.drop: object_id={object_id} dropped at_ms={}", now_ms());
+                    Ok(())
+                }
+                Ok(false) => {
+                    eprintln!(
+                        "main_view.drop: object_id={object_id} no-op at_ms={}",
+                        now_ms()
+                    );
+                    Ok(())
+                }
+                Err(err) => {
+                    eprintln!(
+                        "main_view.drop: object_id={object_id} failed at_ms={} err={err}",
+                        now_ms()
+                    );
+                    Err(capnp::Error::failed(err))
+                }
             }
         })
     }
@@ -461,6 +494,19 @@ impl web_session_capnp::web_session::Server for WebSessionImpl {
                 };
                 body["powerboxRequestSession"] = serde_json::json!({
                     "active": request_descriptor_active,
+                    "localProvideCaps": if request_descriptor_active {
+                        serde_json::json!([
+                            {
+                                "objectId": crate::app::LOCAL_TEST_API_SESSION_OBJECT_ID,
+                                "label": crate::app::LOCAL_TEST_API_SESSION_LABEL,
+                                "kind": "ApiSession",
+                                "typeTag": "sandstorm/api-session",
+                                "source": "local-test"
+                            }
+                        ])
+                    } else {
+                        serde_json::json!([])
+                    },
                 });
                 let body = match serde_json::to_string(&body) {
                     Ok(body) => body,
@@ -2630,9 +2676,21 @@ impl web_session_capnp::web_session::Server for WebSessionImpl {
                 let sandstorm_api = self.sandstorm_api.clone();
                 let session_context = self.session_context.clone();
                 return Promise::from_future(async move {
-                    let label = match capability_label_for_object_id(&app_state, &object_id) {
+                    let effective_object_id =
+                        match create_local_proxy_for_received_object(&app_state, &object_id).await {
+                            Ok((_label, local_proxy_object_id)) => local_proxy_object_id,
+                            Err(_) => object_id.clone(),
+                        };
+                    let label = match capability_label_for_object_id(&app_state, &effective_object_id) {
                         Ok(label) => label,
                         Err(err) => {
+                            eprintln!(
+                                "powerbox.fulfill_object: label lookup failed object_id={} effective_object_id={} at_ms={} err={}",
+                                object_id,
+                                effective_object_id,
+                                now_ms(),
+                                err
+                            );
                             let mut error = results.get().init_server_error();
                             error.set_description_html(
                                 format!(
@@ -2644,11 +2702,22 @@ impl web_session_capnp::web_session::Server for WebSessionImpl {
                             return Ok(());
                         }
                     };
-                    let cap = match restore_app_object_capability(sandstorm_api, &app_state, &object_id)
+                    let cap = match restore_app_object_capability(
+                        sandstorm_api.clone(),
+                        &app_state,
+                        &effective_object_id,
+                    )
                         .await
                     {
                         Ok(cap) => cap,
                         Err(err) => {
+                            eprintln!(
+                                "powerbox.fulfill_object: restore_app_object_capability failed object_id={} effective_object_id={} at_ms={} err={}",
+                                object_id,
+                                effective_object_id,
+                                now_ms(),
+                                err
+                            );
                             let mut error = results.get().init_server_error();
                             error.set_description_html(
                                 format!(
@@ -2660,11 +2729,21 @@ impl web_session_capnp::web_session::Server for WebSessionImpl {
                             return Ok(());
                         }
                     };
-                    let descriptor_source = match capability_descriptor_for_object_id(&app_state, &object_id)
+                    let descriptor_source = match capability_descriptor_for_object_id(
+                        &app_state,
+                        &effective_object_id,
+                    )
                     {
                         Ok(Some(value)) => value,
                         Ok(None) => request_descriptor_b64,
                         Err(err) => {
+                            eprintln!(
+                                "powerbox.fulfill_object: descriptor lookup failed object_id={} effective_object_id={} at_ms={} err={}",
+                                object_id,
+                                effective_object_id,
+                                now_ms(),
+                                err
+                            );
                             let mut error = results.get().init_server_error();
                             error.set_description_html(
                                 format!(
@@ -2693,6 +2772,14 @@ impl web_session_capnp::web_session::Server for WebSessionImpl {
                             content.init_body().set_bytes(br#"{"ok":true}"#);
                         }
                         Err(err) => {
+                            eprintln!(
+                                "powerbox.fulfill_object: fulfill failed object_id={} effective_object_id={} label={} at_ms={} err={}",
+                                object_id,
+                                effective_object_id,
+                                label,
+                                now_ms(),
+                                err
+                            );
                             let mut error = results.get().init_server_error();
                             error.set_description_html(
                                 format!(
@@ -2733,10 +2820,11 @@ impl web_session_capnp::web_session::Server for WebSessionImpl {
                 };
 
                 let app_state = self.app_state.clone();
+                let sandstorm_api = self.sandstorm_api.clone();
                 let session_context = self.session_context.clone();
                 return Promise::from_future(async move {
-                    let (label, descriptor_json, cap) =
-                        match fetch_remote_capability_by_export_id(&app_state, &export_id).await {
+                    let (_label, object_id) =
+                        match create_local_proxy_for_remote_export(&app_state, &export_id).await {
                             Ok(value) => value,
                             Err(err) => {
                                 let mut error = results.get().init_server_error();
@@ -2750,10 +2838,55 @@ impl web_session_capnp::web_session::Server for WebSessionImpl {
                                 return Ok(());
                             }
                         };
-                    let descriptor_source = descriptor_json
-                        .and_then(|value| descriptor_json_to_b64(&value))
-                        .unwrap_or(request_descriptor_b64);
-
+                    let label = match capability_label_for_object_id(&app_state, &object_id) {
+                        Ok(value) => value,
+                        Err(err) => {
+                            let mut error = results.get().init_server_error();
+                            error.set_description_html(
+                                format!(
+                                    "<!doctype html><title>Fulfill Request Failed</title><pre>{}</pre>",
+                                    escape_html(&err)
+                                )
+                                .as_str(),
+                            );
+                            return Ok(());
+                        }
+                    };
+                    let descriptor_source = match capability_descriptor_for_object_id(&app_state, &object_id) {
+                        Ok(Some(value)) => descriptor_json_to_b64(&value).unwrap_or(request_descriptor_b64.clone()),
+                        Ok(None) => request_descriptor_b64.clone(),
+                        Err(err) => {
+                            let mut error = results.get().init_server_error();
+                            error.set_description_html(
+                                format!(
+                                    "<!doctype html><title>Fulfill Request Failed</title><pre>{}</pre>",
+                                    escape_html(&err)
+                                )
+                                .as_str(),
+                            );
+                            return Ok(());
+                        }
+                    };
+                    let cap = match restore_app_object_capability(
+                        sandstorm_api.clone(),
+                        &app_state,
+                        &object_id,
+                    )
+                    .await
+                    {
+                        Ok(cap) => cap,
+                        Err(err) => {
+                            let mut error = results.get().init_server_error();
+                            error.set_description_html(
+                                format!(
+                                    "<!doctype html><title>Fulfill Request Failed</title><pre>{}</pre>",
+                                    escape_html(&err)
+                                )
+                                .as_str(),
+                            );
+                            return Ok(());
+                        }
+                    };
                     match fulfill_powerbox_request_with_capability(
                         session_context,
                         cap,
@@ -3017,6 +3150,18 @@ async fn save_capability(
     Ok(hex_encode(token))
 }
 
+async fn save_and_restore_capability(
+    sandstorm_api: grain_capnp::sandstorm_api::Client<capnp::any_pointer::Owned>,
+    cap: capnp::capability::Client,
+    save_label: &str,
+) -> Result<capnp::capability::Client, String> {
+    let saved_token = save_capability(sandstorm_api.clone(), cap, save_label).await?;
+    let token = hex_decode(&saved_token)?;
+    SandstormBackend::new(sandstorm_api)
+        .restore_capability(&token)
+        .await
+}
+
 async fn restore_saved_capability(
     sandstorm_api: grain_capnp::sandstorm_api::Client<capnp::any_pointer::Owned>,
     saved_token_hex: &str,
@@ -3235,6 +3380,53 @@ fn load_persisted_received_capabilities() -> Result<Vec<PersistedReceivedCapabil
         .collect())
 }
 
+fn load_local_proxy_capabilities() -> Result<Vec<LocalProxyCapability>, String> {
+    Ok(app_storage()
+        .load_local_proxy_capabilities()?
+        .into_iter()
+        .map(|record: LocalProxyCapabilityRecord| LocalProxyCapability {
+            object_id: record.object_id,
+            peer_node_id: record.peer_node_id,
+            target_kind: match record.target_kind {
+                LocalProxyTargetKind::ExportId => LocalProxyTargetKindRuntime::ExportId,
+                LocalProxyTargetKind::RemoteObjectId => LocalProxyTargetKindRuntime::RemoteObjectId,
+            },
+            target_id: record.target_id,
+            label: record.label,
+            kind: record.kind,
+            type_tag: record
+                .type_tag
+                .unwrap_or_else(|| imported_type_tag_for_kind(ImportedRemoteCapabilityKind::Other)),
+            descriptor_json: record.descriptor_json,
+            created_at_ms: record.created_at_ms,
+        })
+        .collect())
+}
+
+fn load_registered_remote_capabilities() -> Result<Vec<RegisteredRemoteCapability>, String> {
+    Ok(app_storage()
+        .load_registered_remote_capabilities()?
+        .into_iter()
+        .map(|record: RegisteredRemoteCapabilityRecord| RegisteredRemoteCapability {
+            remote_object_id: record.remote_object_id,
+            label: record.label,
+            kind: match record.kind {
+                ReceivedCapabilityKind::IpNetwork => ImportedRemoteCapabilityKind::IpNetwork,
+                ReceivedCapabilityKind::ApiSession => ImportedRemoteCapabilityKind::ApiSession,
+                ReceivedCapabilityKind::Other => ImportedRemoteCapabilityKind::Other,
+            },
+            type_tag: record
+                .type_tag
+                .unwrap_or_else(|| imported_type_tag_for_kind(ImportedRemoteCapabilityKind::Other)),
+            descriptor_json: record.descriptor_json,
+            durability: record.durability,
+            saved_token: record.saved_token,
+            created_at_ms: record.created_at_ms,
+            client: None,
+        })
+        .collect())
+}
+
 fn parse_remote_cap_numeric_suffix(object_id: &str) -> Option<u64> {
     object_id
         .strip_prefix("remote-cap-")
@@ -3245,6 +3437,32 @@ fn max_persisted_received_cap_id(records: &[PersistedReceivedCapability]) -> Opt
     records
         .iter()
         .filter_map(|record| parse_remote_cap_numeric_suffix(&record.object_id))
+        .max()
+}
+
+fn parse_local_proxy_cap_numeric_suffix(object_id: &str) -> Option<u64> {
+    object_id
+        .strip_prefix("local-proxy-cap-")
+        .and_then(|value| value.parse::<u64>().ok())
+}
+
+fn max_local_proxy_cap_id(records: &[LocalProxyCapability]) -> Option<u64> {
+    records
+        .iter()
+        .filter_map(|record| parse_local_proxy_cap_numeric_suffix(&record.object_id))
+        .max()
+}
+
+fn parse_registered_remote_cap_numeric_suffix(object_id: &str) -> Option<u64> {
+    object_id
+        .strip_prefix("remote-registered-cap-")
+        .and_then(|value| value.parse::<u64>().ok())
+}
+
+fn max_registered_remote_cap_id(records: &[RegisteredRemoteCapability]) -> Option<u64> {
+    records
+        .iter()
+        .filter_map(|record| parse_registered_remote_cap_numeric_suffix(&record.remote_object_id))
         .max()
 }
 
@@ -3400,6 +3618,46 @@ struct ImportedRemoteCapability {
     client: capnp::capability::Client,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LocalProxyTargetKindRuntime {
+    ExportId,
+    RemoteObjectId,
+}
+
+#[derive(Clone)]
+pub(crate) struct LocalProxyCapability {
+    pub(crate) object_id: String,
+    pub(crate) peer_node_id: String,
+    pub(crate) target_kind: LocalProxyTargetKindRuntime,
+    pub(crate) target_id: String,
+    pub(crate) label: String,
+    pub(crate) kind: SharedCapabilityKind,
+    pub(crate) type_tag: String,
+    pub(crate) descriptor_json: Option<String>,
+    pub(crate) created_at_ms: u64,
+}
+
+#[derive(Clone)]
+struct RegisteredRemoteCapability {
+    remote_object_id: String,
+    label: String,
+    kind: ImportedRemoteCapabilityKind,
+    type_tag: String,
+    descriptor_json: Option<String>,
+    durability: RegisteredRemoteCapabilityDurability,
+    saved_token: Option<String>,
+    created_at_ms: u64,
+    client: Option<capnp::capability::Client>,
+}
+
+fn imported_kind_to_tunnel_kind(kind: ImportedRemoteCapabilityKind) -> tunnel_capnp::CapabilityKind {
+    match kind {
+        ImportedRemoteCapabilityKind::IpNetwork => tunnel_capnp::CapabilityKind::IpNetwork,
+        ImportedRemoteCapabilityKind::ApiSession => tunnel_capnp::CapabilityKind::ApiSession,
+        ImportedRemoteCapabilityKind::Other => tunnel_capnp::CapabilityKind::Other,
+    }
+}
+
 struct ExportedIpNetworkState {
     client: ip_capnp::ip_network::Client,
 }
@@ -3454,6 +3712,30 @@ impl PairingStatus {
     }
 }
 
+fn persist_registered_remote_capabilities(
+    storage: &Storage,
+    records: impl IntoIterator<Item = RegisteredRemoteCapability>,
+) -> Result<(), String> {
+    let rows = records
+        .into_iter()
+        .map(|record| RegisteredRemoteCapabilityRecord {
+            remote_object_id: record.remote_object_id,
+            label: record.label,
+            kind: match record.kind {
+                ImportedRemoteCapabilityKind::IpNetwork => ReceivedCapabilityKind::IpNetwork,
+                ImportedRemoteCapabilityKind::ApiSession => ReceivedCapabilityKind::ApiSession,
+                ImportedRemoteCapabilityKind::Other => ReceivedCapabilityKind::Other,
+            },
+            type_tag: Some(record.type_tag),
+            descriptor_json: record.descriptor_json,
+            durability: record.durability,
+            saved_token: record.saved_token,
+            created_at_ms: record.created_at_ms,
+        })
+        .collect::<Vec<_>>();
+    storage.persist_registered_remote_capability_registry(&rows)
+}
+
 struct AppState {
     storage: Storage,
     iroh_identity: IrohIdentity,
@@ -3480,8 +3762,14 @@ struct AppState {
     imported_remote_api_session: Option<ImportedRemoteApiSession>,
     imported_remote_caps: HashMap<String, ImportedRemoteCapability>,
     persisted_received_caps: Vec<PersistedReceivedCapability>,
+    local_proxy_caps: Vec<LocalProxyCapability>,
+    registered_remote_caps: HashMap<String, RegisteredRemoteCapability>,
+    registered_remote_hook_object_ids: HashMap<usize, String>,
+    local_proxy_hook_object_ids: HashMap<usize, String>,
     next_peer_rpc_session_id: u64,
     next_imported_remote_cap_id: u64,
+    next_local_proxy_cap_id: u64,
+    next_registered_remote_cap_id: u64,
     peer_rpc_error: Option<String>,
     active_tcp_sessions: HashMap<String, Arc<SavedIpNetworkTcpSession>>,
     next_tcp_session_id: u64,
@@ -3532,8 +3820,34 @@ impl AppState {
         let exported_api_session =
             first_enabled_shared_capability(&shared_caps, SharedCapabilityKind::ApiSession);
         let persisted_received_caps = load_persisted_received_capabilities()?;
+        let mut local_proxy_caps = load_local_proxy_capabilities()?;
+        let had_remote_object_local_proxies = local_proxy_caps
+            .iter()
+            .any(|record| record.target_kind == LocalProxyTargetKindRuntime::RemoteObjectId);
+        if had_remote_object_local_proxies {
+            local_proxy_caps.retain(|record| record.target_kind == LocalProxyTargetKindRuntime::ExportId);
+            let records = local_proxy_caps
+                .iter()
+                .map(|cap| LocalProxyCapabilityRecord {
+                    object_id: cap.object_id.clone(),
+                    peer_node_id: cap.peer_node_id.clone(),
+                    target_kind: LocalProxyTargetKind::ExportId,
+                    target_id: cap.target_id.clone(),
+                    label: cap.label.clone(),
+                    kind: cap.kind,
+                    type_tag: Some(cap.type_tag.clone()),
+                    descriptor_json: cap.descriptor_json.clone(),
+                    created_at_ms: cap.created_at_ms,
+                })
+                .collect::<Vec<_>>();
+            app_storage().persist_local_proxy_capability_registry(&records)?;
+        }
+        let registered_remote_caps = load_registered_remote_capabilities()?;
         let next_imported_remote_cap_id =
             max_persisted_received_cap_id(&persisted_received_caps).unwrap_or(0);
+        let next_local_proxy_cap_id = max_local_proxy_cap_id(&local_proxy_caps).unwrap_or(0);
+        let next_registered_remote_cap_id =
+            max_registered_remote_cap_id(&registered_remote_caps).unwrap_or(0);
         Ok(Self {
             storage: app_storage(),
             iroh_identity,
@@ -3564,8 +3878,17 @@ impl AppState {
             imported_remote_api_session: None,
             imported_remote_caps: HashMap::new(),
             persisted_received_caps,
+            local_proxy_caps,
+            registered_remote_caps: registered_remote_caps
+                .into_iter()
+                .map(|record| (record.remote_object_id.clone(), record))
+                .collect(),
+            registered_remote_hook_object_ids: HashMap::new(),
+            local_proxy_hook_object_ids: HashMap::new(),
             next_peer_rpc_session_id: 0,
             next_imported_remote_cap_id,
+            next_local_proxy_cap_id,
+            next_registered_remote_cap_id,
             peer_rpc_error: None,
             active_tcp_sessions: HashMap::new(),
             next_tcp_session_id: 0,
@@ -4489,10 +4812,40 @@ async fn save_received_remote_capability_locally(
         .await
 }
 
+async fn create_local_proxy_for_remote_export(
+    app_state: &Arc<Mutex<AppState>>,
+    export_id: &str,
+) -> Result<(String, String), String> {
+    app_core(app_state)
+        .create_local_proxy_for_remote_export(export_id)
+        .await
+}
+
+async fn create_local_proxy_for_received_object(
+    app_state: &Arc<Mutex<AppState>>,
+    object_id: &str,
+) -> Result<(String, String), String> {
+    app_core(app_state)
+        .create_local_proxy_for_received_object(object_id)
+        .await
+}
+
+async fn create_local_proxy_for_registered_remote_object(
+    app_state: &Arc<Mutex<AppState>>,
+    remote_object_id: &str,
+) -> Result<(String, String), String> {
+    app_core(app_state)
+        .create_local_proxy_for_registered_remote_object(remote_object_id)
+        .await
+}
+
 fn capability_label_for_object_id(
     app_state: &Arc<Mutex<AppState>>,
     object_id: &str,
 ) -> Result<String, String> {
+    if object_id == crate::app::LOCAL_TEST_API_SESSION_OBJECT_ID {
+        return Ok(crate::app::LOCAL_TEST_API_SESSION_LABEL.to_string());
+    }
     {
         let guard = app_state
             .lock()
@@ -4502,6 +4855,13 @@ fn capability_label_for_object_id(
         }
         if let Some(record) = guard
             .persisted_received_caps
+            .iter()
+            .find(|record| record.object_id == object_id)
+        {
+            return Ok(record.label.clone());
+        }
+        if let Some(record) = guard
+            .local_proxy_caps
             .iter()
             .find(|record| record.object_id == object_id)
         {
@@ -4517,6 +4877,9 @@ fn capability_descriptor_for_object_id(
     app_state: &Arc<Mutex<AppState>>,
     object_id: &str,
 ) -> Result<Option<String>, String> {
+    if object_id == crate::app::LOCAL_TEST_API_SESSION_OBJECT_ID {
+        return Ok(None);
+    }
     {
         let guard = app_state
             .lock()
@@ -4526,6 +4889,13 @@ fn capability_descriptor_for_object_id(
         }
         if let Some(record) = guard
             .persisted_received_caps
+            .iter()
+            .find(|record| record.object_id == object_id)
+        {
+            return Ok(record.descriptor_json.clone());
+        }
+        if let Some(record) = guard
+            .local_proxy_caps
             .iter()
             .find(|record| record.object_id == object_id)
         {
@@ -4608,14 +4978,7 @@ async fn fulfill_powerbox_request_with_capability(
 
     match request.send().promise.await {
         Ok(_) => {}
-        Err(err) => {
-            let err_text = err.to_string();
-            // In Powerbox request sessions, fulfilling the request can immediately tear down the
-            // embedded provider session. Treat the common disconnect-on-success path as success.
-            if !err_text.contains("connection lost") && !err_text.contains("Disconnected") {
-                return Err(format!("SessionContext.fulfillRequest() failed: {err}"));
-            }
-        }
+        Err(err) => return Err(format!("SessionContext.fulfillRequest() failed: {err}")),
     }
     Ok(())
 }
@@ -4970,6 +5333,193 @@ async fn fetch_remote_capability_export(
         .get_cap()
         .get_as_capability::<capnp::capability::Client>()
         .map_err(|err| format!("failed to read imported capability: {err}"))?;
+    Ok((label, kind, type_tag, descriptor_json, client))
+}
+
+async fn register_remote_capability(
+    remote_bootstrap: tunnel_capnp::peer_bootstrap::Client,
+    client: capnp::capability::Client,
+    label: &str,
+    kind: ImportedRemoteCapabilityKind,
+    type_tag: &str,
+    descriptor_json: Option<&str>,
+) -> Result<String, String> {
+    let mut request = remote_bootstrap.register_capability_request();
+    let mut params = request.get();
+    params.reborrow().get_cap().set_as_capability(client.hook);
+    params.set_label(label);
+    params.set_kind(imported_kind_to_tunnel_kind(kind));
+    params.set_type_tag(type_tag);
+    params.set_descriptor_json(descriptor_json.unwrap_or(""));
+    let response = request
+        .send()
+        .promise
+        .await
+        .map_err(|err| format!("PeerBootstrap.registerCapability() failed: {err}"))?;
+    let response = response
+        .get()
+        .map_err(|err| format!("failed to decode registerCapability() response: {err}"))?;
+    response
+        .get_remote_object_id()
+        .map_err(|err| format!("failed to read registered remote object id: {err}"))?
+        .to_str()
+        .map(|value| value.to_string())
+        .map_err(|err| format!("registered remote object id was not valid UTF-8: {err}"))
+}
+
+pub(crate) fn register_local_ephemeral_capability(
+    app_state: &Arc<Mutex<AppState>>,
+    client: capnp::capability::Client,
+    label: &str,
+    kind: ImportedRemoteCapabilityKind,
+    type_tag: &str,
+    descriptor_json: Option<&str>,
+) -> Result<String, String> {
+    let mut guard = app_state
+        .lock()
+        .map_err(|_| "app state lock poisoned".to_string())?;
+    guard.next_registered_remote_cap_id += 1;
+    let remote_object_id = format!("remote-registered-cap-{}", guard.next_registered_remote_cap_id);
+    guard.registered_remote_caps.insert(
+        remote_object_id.clone(),
+        RegisteredRemoteCapability {
+            remote_object_id: remote_object_id.clone(),
+            label: label.to_string(),
+            kind,
+            type_tag: type_tag.to_string(),
+            descriptor_json: descriptor_json.map(|value| value.to_string()),
+            durability: RegisteredRemoteCapabilityDurability::Ephemeral,
+            saved_token: None,
+            created_at_ms: now_ms(),
+            client: Some(client),
+        },
+    );
+    eprintln!(
+        "register_local_ephemeral_capability: remote_object_id={} label={} kind={} type_tag={} at_ms={}",
+        remote_object_id,
+        label,
+        match kind {
+            ImportedRemoteCapabilityKind::IpNetwork => "IpNetwork",
+            ImportedRemoteCapabilityKind::ApiSession => "ApiSession",
+            ImportedRemoteCapabilityKind::Other => "Other",
+        },
+        type_tag,
+        now_ms()
+    );
+    Ok(remote_object_id)
+}
+
+async fn fetch_remote_registered_capability(
+    remote_bootstrap: tunnel_capnp::peer_bootstrap::Client,
+    remote_object_id: &str,
+) -> Result<
+    (
+        String,
+        ImportedRemoteCapabilityKind,
+        String,
+        Option<String>,
+        capnp::capability::Client,
+    ),
+    String,
+> {
+    let mut request = remote_bootstrap.get_registered_capability_request();
+    request.get().set_remote_object_id(remote_object_id);
+    let response = request
+        .send()
+        .promise
+        .await
+        .map_err(|err| format!("PeerBootstrap.getRegisteredCapability() failed: {err}"))?;
+    let response = response
+        .get()
+        .map_err(|err| format!("failed to decode getRegisteredCapability() response: {err}"))?;
+    let label = response
+        .get_label()
+        .map_err(|err| format!("failed to read registered capability label: {err}"))?
+        .to_str()
+        .unwrap_or("")
+        .to_string();
+    let kind = match response
+        .get_kind()
+        .map_err(|err| format!("failed to read registered capability kind: {err}"))?
+    {
+        tunnel_capnp::CapabilityKind::IpNetwork => ImportedRemoteCapabilityKind::IpNetwork,
+        tunnel_capnp::CapabilityKind::ApiSession => ImportedRemoteCapabilityKind::ApiSession,
+        tunnel_capnp::CapabilityKind::Other => ImportedRemoteCapabilityKind::Other,
+    };
+    let type_tag = response
+        .get_type_tag()
+        .map_err(|err| format!("failed to read registered capability type tag: {err}"))?
+        .to_str()
+        .unwrap_or("")
+        .to_string();
+    let descriptor_json = response
+        .get_descriptor_json()
+        .ok()
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.to_string())
+        .filter(|value| !value.is_empty());
+    let client = response
+        .get_cap()
+        .get_as_capability::<capnp::capability::Client>()
+        .map_err(|err| format!("failed to read registered capability: {err}"))?;
+    Ok((label, kind, type_tag, descriptor_json, client))
+}
+
+pub(crate) async fn fetch_remote_local_proxy_for_peer_registered_capability(
+    remote_bootstrap: tunnel_capnp::peer_bootstrap::Client,
+    remote_object_id: &str,
+) -> Result<
+    (
+        String,
+        ImportedRemoteCapabilityKind,
+        String,
+        Option<String>,
+        capnp::capability::Client,
+    ),
+    String,
+> {
+    let mut request = remote_bootstrap.get_local_proxy_for_peer_registered_capability_request();
+    request.get().set_remote_object_id(remote_object_id);
+    let response = request
+        .send()
+        .promise
+        .await
+        .map_err(|err| {
+            format!("PeerBootstrap.getLocalProxyForPeerRegisteredCapability() failed: {err}")
+        })?;
+    let response = response
+        .get()
+        .map_err(|err| format!("failed to decode local proxy capability response: {err}"))?;
+    let label = response
+        .get_label()
+        .map_err(|err| format!("failed to read local proxy capability label: {err}"))?
+        .to_str()
+        .unwrap_or("")
+        .to_string();
+    let kind = match response
+        .get_kind()
+        .map_err(|err| format!("failed to read local proxy capability kind: {err}"))?
+    {
+        tunnel_capnp::CapabilityKind::IpNetwork => ImportedRemoteCapabilityKind::IpNetwork,
+        tunnel_capnp::CapabilityKind::ApiSession => ImportedRemoteCapabilityKind::ApiSession,
+        tunnel_capnp::CapabilityKind::Other => ImportedRemoteCapabilityKind::Other,
+    };
+    let type_tag = response
+        .get_type_tag()
+        .map_err(|err| format!("failed to read local proxy capability type tag: {err}"))?
+        .to_str()
+        .unwrap_or("")
+        .to_string();
+    let descriptor_json = response
+        .get_descriptor_json()
+        .ok()
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.to_string())
+        .filter(|value| !value.is_empty());
+    let client = response
+        .get_cap()
+        .get_as_capability::<capnp::capability::Client>()
+        .map_err(|err| format!("failed to read local proxy capability: {err}"))?;
     Ok((label, kind, type_tag, descriptor_json, client))
 }
 
@@ -6041,8 +6591,14 @@ mod tests {
             imported_remote_api_session: None,
             imported_remote_caps: HashMap::new(),
             persisted_received_caps: Vec::new(),
+            local_proxy_caps: Vec::new(),
+            registered_remote_caps: HashMap::new(),
+            registered_remote_hook_object_ids: HashMap::new(),
+            local_proxy_hook_object_ids: HashMap::new(),
             next_peer_rpc_session_id: 0,
             next_imported_remote_cap_id: 0,
+            next_local_proxy_cap_id: 0,
+            next_registered_remote_cap_id: 0,
             peer_rpc_error: None,
             active_tcp_sessions: HashMap::new(),
             next_tcp_session_id: 0,
@@ -6321,6 +6877,73 @@ mod tests {
     }
 
     #[test]
+    fn startup_auto_reconnect_picks_a_single_initiator_after_restart() {
+        run_local_async_test(async {
+            let app_a_storage_root = make_test_storage_root("startup-auto-reconnect-a");
+            let app_b_storage_root = make_test_storage_root("startup-auto-reconnect-b");
+            let (app_a, _, app_a_sandstorm_api) =
+                build_test_app_with_storage(app_a_storage_root.clone(), 233).await;
+            let (app_b, _, app_b_sandstorm_api) =
+                build_test_app_with_storage(app_b_storage_root.clone(), 234).await;
+
+            app_a
+                .set_remote_ticket_for_test(app_b.local_ticket_for_test().unwrap())
+                .unwrap();
+            app_b
+                .set_remote_ticket_for_test(app_a.local_ticket_for_test().unwrap())
+                .unwrap();
+
+            let app_a_clone = app_a.clone();
+            let app_a_api = app_a_sandstorm_api.clone();
+            tokio::task::spawn_local(async move {
+                let _ = app_a_clone.begin_pair_connection(app_a_api).await;
+            });
+
+            wait_for_test_condition("startup reconnect initial incoming request", || {
+                app_b
+                    .render_state_json()
+                    .unwrap()
+                    .contains("\"status\":\"incomingRequest\"")
+            })
+            .await;
+
+            let app_b_clone = app_b.clone();
+            let app_b_api = app_b_sandstorm_api.clone();
+            tokio::task::spawn_local(async move {
+                let _ = app_b_clone.accept_pending_pair_connection(app_b_api).await;
+            });
+
+            wait_for_test_condition("startup reconnect initial side a connected", || {
+                app_a
+                    .render_state_json()
+                    .unwrap()
+                    .contains("\"status\":\"connected\"")
+            })
+            .await;
+
+            wait_for_test_condition("startup reconnect initial side b connected", || {
+                app_b
+                    .render_state_json()
+                    .unwrap()
+                    .contains("\"status\":\"connected\"")
+            })
+            .await;
+
+            app_a.close_test_endpoint().await;
+            app_b.close_test_endpoint().await;
+
+            let (_restarted_app_a, restarted_app_a_state, _restarted_app_a_sandstorm_api) =
+                build_test_app_with_storage_loaded(app_a_storage_root, 233).await;
+            let (_restarted_app_b, restarted_app_b_state, _restarted_app_b_sandstorm_api) =
+                build_test_app_with_storage_loaded(app_b_storage_root, 234).await;
+
+            let app_a_should_reconnect = should_auto_reconnect_tunnel(&restarted_app_a_state).unwrap();
+            let app_b_should_reconnect = should_auto_reconnect_tunnel(&restarted_app_b_state).unwrap();
+            assert_ne!(app_a_should_reconnect, app_b_should_reconnect);
+        });
+    }
+
+    #[test]
     fn approved_disabled_peer_waits_for_enable_then_connects() {
         run_local_async_test(async {
             let (app_a, _, app_a_sandstorm_api) = build_test_app("pair-enable-a", 241).await;
@@ -6384,18 +7007,41 @@ mod tests {
     }
 
     #[test]
-    fn load_persisted_received_capabilities_ignores_malformed_rows() {
+    fn load_persisted_received_capabilities_reads_json_records() {
         let root = make_test_storage_root("malformed-received-caps");
         let storage = Storage::new(&root);
         std::fs::write(
             storage.received_caps_path(),
-            concat!(
-                "NotAKind\tbad\tignored\trow\n",
-                "IpNetwork\tonly-two-columns\n",
-                "ApiSession\tremote-cap-9\texport-a\tPreview A\n",
-                "IpNetwork\tremote-cap-3\texport-net\tNetwork A\n",
-                "ApiSession\tremote-cap-10\texport-b\tPreview B\n"
-            ),
+            serde_json::to_string_pretty(&vec![
+                PersistedReceivedCapabilityRecord {
+                    object_id: "remote-cap-9".to_string(),
+                    export_id: "export-a".to_string(),
+                    label: "Preview A".to_string(),
+                    kind: ReceivedCapabilityKind::ApiSession,
+                    type_tag: Some("sandstorm/api-session".to_string()),
+                    descriptor_json: None,
+                    enabled: true,
+                },
+                PersistedReceivedCapabilityRecord {
+                    object_id: "remote-cap-3".to_string(),
+                    export_id: "export-net".to_string(),
+                    label: "Network A".to_string(),
+                    kind: ReceivedCapabilityKind::IpNetwork,
+                    type_tag: Some("sandstorm/ip-network".to_string()),
+                    descriptor_json: None,
+                    enabled: true,
+                },
+                PersistedReceivedCapabilityRecord {
+                    object_id: "remote-cap-10".to_string(),
+                    export_id: "export-b".to_string(),
+                    label: "Preview B".to_string(),
+                    kind: ReceivedCapabilityKind::ApiSession,
+                    type_tag: Some("sandstorm/api-session".to_string()),
+                    descriptor_json: None,
+                    enabled: true,
+                },
+            ])
+            .unwrap(),
         )
         .unwrap();
 
@@ -6509,10 +7155,27 @@ mod tests {
         let storage = Storage::new(&root);
         std::fs::write(
             storage.received_caps_path(),
-            concat!(
-                "IpNetwork\tremote-cap-7\texport-net\tShared Object\n",
-                "ApiSession\tremote-cap-7\texport-api\tShared Object\n"
-            ),
+            serde_json::to_string_pretty(&vec![
+                PersistedReceivedCapabilityRecord {
+                    object_id: "remote-cap-7".to_string(),
+                    export_id: "export-net".to_string(),
+                    label: "Shared Object".to_string(),
+                    kind: ReceivedCapabilityKind::IpNetwork,
+                    type_tag: Some("sandstorm/ip-network".to_string()),
+                    descriptor_json: None,
+                    enabled: true,
+                },
+                PersistedReceivedCapabilityRecord {
+                    object_id: "remote-cap-7".to_string(),
+                    export_id: "export-api".to_string(),
+                    label: "Shared Object".to_string(),
+                    kind: ReceivedCapabilityKind::ApiSession,
+                    type_tag: Some("sandstorm/api-session".to_string()),
+                    descriptor_json: None,
+                    enabled: true,
+                },
+            ])
+            .unwrap(),
         )
         .unwrap();
 
@@ -7092,6 +7755,1299 @@ mod tests {
     }
 
     #[test]
+    fn local_proxy_record_restores_remote_export_while_connected() {
+        run_local_async_test(async {
+            let (exporter_app, _, exporter_sandstorm_api) =
+                build_test_app("local-proxy-exporter", 81).await;
+            let (importer_app, _, importer_sandstorm_api) =
+                build_test_app("local-proxy-importer", 82).await;
+
+            exporter_app
+                .seed_exported_api_session_for_test(
+                    "preview-api",
+                    "Preview API",
+                    new_client(crate::test_support::FakePreviewApiSession {
+                        response_bytes: b"%PDF-PROXY\n".to_vec(),
+                    }),
+                )
+                .unwrap();
+            importer_app
+                .set_remote_ticket_for_test(exporter_app.local_ticket_for_test().unwrap())
+                .unwrap();
+            importer_app
+                .connect_peer_rpc_session(importer_sandstorm_api.clone())
+                .await
+                .unwrap();
+
+            let (label, object_id) = importer_app
+                .create_local_proxy_for_remote_export("preview-api")
+                .await
+                .unwrap();
+            let (_, duplicate_id) = importer_app
+                .create_local_proxy_for_remote_export("preview-api")
+                .await
+                .unwrap();
+
+            assert_eq!(label, "Preview API");
+            assert_eq!(object_id, duplicate_id);
+            let state_json = importer_app.render_state_json().unwrap();
+            assert!(state_json.contains("\"localProxyCaps\":[{\"objectId\":\"local-proxy-cap-1\""));
+            assert!(state_json.contains("\"targetKind\":\"exportId\""));
+            assert!(state_json.contains("\"targetId\":\"preview-api\""));
+
+            let restored = importer_app
+                .invoke_restored_api_session_for_test(
+                    importer_sandstorm_api,
+                    &object_id,
+                    "proxy.docx",
+                    b"proxy",
+                )
+                .await
+                .unwrap();
+            assert_eq!(restored.response_bytes, b"%PDF-PROXY\n".to_vec());
+
+            let _ = exporter_sandstorm_api;
+            importer_app.close_test_endpoint().await;
+            exporter_app.close_test_endpoint().await;
+        });
+    }
+
+    #[test]
+    fn local_proxy_record_requires_connected_peer_session_to_restore() {
+        run_local_async_test(async {
+            let (exporter_app, _, exporter_sandstorm_api) =
+                build_test_app("local-proxy-disconnect-exporter", 83).await;
+            let (importer_app, _, importer_sandstorm_api) =
+                build_test_app("local-proxy-disconnect-importer", 84).await;
+
+            exporter_app
+                .seed_exported_api_session_for_test(
+                    "preview-api",
+                    "Preview API",
+                    new_client(crate::test_support::FakePreviewApiSession {
+                        response_bytes: b"%PDF-PROXY-DISCONNECT\n".to_vec(),
+                    }),
+                )
+                .unwrap();
+            importer_app
+                .set_remote_ticket_for_test(exporter_app.local_ticket_for_test().unwrap())
+                .unwrap();
+            importer_app
+                .connect_peer_rpc_session(importer_sandstorm_api.clone())
+                .await
+                .unwrap();
+
+            let (_, object_id) = importer_app
+                .create_local_proxy_for_remote_export("preview-api")
+                .await
+                .unwrap();
+            importer_app.disconnect_peer_rpc_session().unwrap();
+
+            let err = match importer_app
+                .invoke_restored_api_session_for_test(
+                    importer_sandstorm_api.clone(),
+                    &object_id,
+                    "proxy-disconnected.docx",
+                    b"proxy",
+                )
+                .await
+            {
+                Ok(_) => panic!("invoke unexpectedly succeeded while disconnected"),
+                Err(err) => err,
+            };
+            assert!(err.contains("not currently connected"));
+
+            importer_app
+                .connect_peer_rpc_session(importer_sandstorm_api.clone())
+                .await
+                .unwrap();
+            let restored = importer_app
+                .invoke_restored_api_session_for_test(
+                    importer_sandstorm_api,
+                    &object_id,
+                    "proxy-reconnect.docx",
+                    b"proxy",
+                )
+                .await
+                .unwrap();
+            assert_eq!(restored.response_bytes, b"%PDF-PROXY-DISCONNECT\n".to_vec());
+
+            let _ = exporter_sandstorm_api;
+            importer_app.close_test_endpoint().await;
+            exporter_app.close_test_endpoint().await;
+        });
+    }
+
+    #[test]
+    fn local_proxy_app_persistent_save_round_trip_restores_same_object() {
+        run_local_async_test(async {
+            let (exporter_app, _, exporter_sandstorm_api) =
+                build_test_app("local-proxy-save-exporter", 183).await;
+            let (importer_app, _, importer_sandstorm_api) =
+                build_test_app("local-proxy-save-importer", 184).await;
+
+            exporter_app
+                .seed_exported_api_session_for_test(
+                    "preview-api",
+                    "Preview API",
+                    new_client(crate::test_support::FakePreviewApiSession {
+                        response_bytes: b"%PDF-PROXY-SAVE\n".to_vec(),
+                    }),
+                )
+                .unwrap();
+            importer_app
+                .set_remote_ticket_for_test(exporter_app.local_ticket_for_test().unwrap())
+                .unwrap();
+            importer_app
+                .connect_peer_rpc_session(importer_sandstorm_api.clone())
+                .await
+                .unwrap();
+
+            let (_label, object_id) = importer_app
+                .create_local_proxy_for_remote_export("preview-api")
+                .await
+                .unwrap();
+            let local_proxy = importer_app
+                .restore_object_capability(importer_sandstorm_api.clone(), &object_id)
+                .await
+                .unwrap();
+            let (saved_object_id, saved_label) =
+                save_app_persistent_capability_for_test(local_proxy).await.unwrap();
+
+            assert_eq!(saved_object_id, object_id);
+            assert_eq!(saved_label, "Preview API");
+
+            let restored = importer_app
+                .invoke_restored_api_session_for_test(
+                    importer_sandstorm_api,
+                    &saved_object_id,
+                    "proxy-save.docx",
+                    b"proxy",
+                )
+                .await
+                .unwrap();
+            assert_eq!(restored.response_bytes, b"%PDF-PROXY-SAVE\n".to_vec());
+
+            let _ = exporter_sandstorm_api;
+            importer_app.close_test_endpoint().await;
+            exporter_app.close_test_endpoint().await;
+        });
+    }
+
+    #[test]
+    fn local_proxy_for_generic_export_forwards_nested_returned_capability_live() {
+        run_local_async_test(async {
+            let (exporter_app, _, exporter_sandstorm_api) =
+                build_test_app("generic-local-proxy-exporter", 85).await;
+            let (importer_app, _, importer_sandstorm_api) =
+                build_test_app("generic-local-proxy-importer", 86).await;
+            let echo_factory: generic_proxy_test_capnp::echo_factory::Client =
+                new_client(crate::test_support::FakeEchoFactory);
+
+            exporter_app
+                .seed_exported_generic_capability_for_test(
+                    "echo-factory",
+                    "Echo Factory",
+                    "dev.iroh-tunnel.test/echo-factory",
+                    echo_factory.client,
+                )
+                .unwrap();
+            importer_app
+                .set_remote_ticket_for_test(exporter_app.local_ticket_for_test().unwrap())
+                .unwrap();
+            importer_app
+                .connect_peer_rpc_session(importer_sandstorm_api.clone())
+                .await
+                .unwrap();
+
+            let (_label, object_id) = importer_app
+                .create_local_proxy_for_remote_export("echo-factory")
+                .await
+                .unwrap();
+            let restored = importer_app
+                .restore_object_capability(importer_sandstorm_api.clone(), &object_id)
+                .await
+                .unwrap();
+            let echoed = crate::test_support::invoke_echo_factory_for_test(
+                generic_proxy_test_capnp::echo_factory::Client { client: restored },
+                "proxy:",
+                "hello",
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(echoed, "proxy:hello");
+
+            let _ = exporter_sandstorm_api;
+            importer_app.close_test_endpoint().await;
+            exporter_app.close_test_endpoint().await;
+        });
+    }
+
+    #[test]
+    fn registered_remote_object_can_be_rebound_through_local_proxy() {
+        run_local_async_test(async {
+            let (exporter_app, _, exporter_sandstorm_api) =
+                build_test_app("registered-remote-exporter", 87).await;
+            let (importer_app, importer_state, importer_sandstorm_api) =
+                build_test_app("registered-remote-importer", 88).await;
+            let echo_factory: generic_proxy_test_capnp::echo_factory::Client =
+                new_client(crate::test_support::FakeEchoFactory);
+
+            exporter_app
+                .seed_exported_generic_capability_for_test(
+                    "echo-factory",
+                    "Echo Factory",
+                    "dev.iroh-tunnel.test/echo-factory",
+                    echo_factory.client,
+                )
+                .unwrap();
+            importer_app
+                .set_remote_ticket_for_test(exporter_app.local_ticket_for_test().unwrap())
+                .unwrap();
+            importer_app
+                .connect_peer_rpc_session(importer_sandstorm_api.clone())
+                .await
+                .unwrap();
+
+            let remote_bootstrap = importer_state
+                .lock()
+                .unwrap()
+                .peer_rpc_session
+                .as_ref()
+                .unwrap()
+                .remote_bootstrap
+                .clone();
+            let (_, _, _, _, factory_client_any) =
+                fetch_remote_capability_export(remote_bootstrap.clone(), "echo-factory")
+                    .await
+                    .unwrap();
+            let factory = generic_proxy_test_capnp::echo_factory::Client {
+                client: factory_client_any,
+            };
+            let mut get_echo = factory.get_echo_request();
+            get_echo.get().set_prefix("registered:");
+            let get_echo_resp = get_echo.send().promise.await.unwrap();
+            let returned_echo = get_echo_resp.get().unwrap().get_echo().unwrap();
+
+            let remote_object_id = register_remote_capability(
+                remote_bootstrap,
+                returned_echo.client.clone(),
+                "Registered Echo",
+                ImportedRemoteCapabilityKind::Other,
+                "dev.iroh-tunnel.test/echo",
+                None,
+            )
+            .await
+            .unwrap();
+
+            let (_label, object_id) = create_local_proxy_for_registered_remote_object(
+                &importer_state,
+                &remote_object_id,
+            )
+            .await
+            .unwrap();
+            let state_json = importer_app.render_state_json().unwrap();
+            assert!(state_json.contains("\"targetKind\":\"remoteObjectId\""));
+            assert!(state_json.contains(&format!("\"targetId\":\"{remote_object_id}\"")));
+
+            let restored = importer_app
+                .restore_object_capability(importer_sandstorm_api, &object_id)
+                .await
+                .unwrap();
+            let echo = generic_proxy_test_capnp::echo::Client { client: restored };
+            let mut ping = echo.ping_request();
+            ping.get().set_text("hello");
+            let ping_resp = ping.send().promise.await.unwrap();
+            let text = ping_resp
+                .get()
+                .unwrap()
+                .get_text()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string();
+            assert_eq!(text, "registered:hello");
+
+            let _ = exporter_sandstorm_api;
+            importer_app.close_test_endpoint().await;
+            exporter_app.close_test_endpoint().await;
+        });
+    }
+
+    #[test]
+    fn localized_registered_remote_proxy_app_persistent_save_round_trip_restores_same_object() {
+        run_local_async_test(async {
+            let (exporter_app, _, exporter_sandstorm_api) =
+                build_test_app("registered-remote-save-exporter", 185).await;
+            let (importer_app, importer_state, importer_sandstorm_api) =
+                build_test_app("registered-remote-save-importer", 186).await;
+            let echo_factory: generic_proxy_test_capnp::echo_factory::Client =
+                new_client(crate::test_support::FakeEchoFactory);
+
+            exporter_app
+                .seed_exported_generic_capability_for_test(
+                    "echo-factory",
+                    "Echo Factory",
+                    "dev.iroh-tunnel.test/echo-factory",
+                    echo_factory.client,
+                )
+                .unwrap();
+            importer_app
+                .set_remote_ticket_for_test(exporter_app.local_ticket_for_test().unwrap())
+                .unwrap();
+            importer_app
+                .connect_peer_rpc_session(importer_sandstorm_api.clone())
+                .await
+                .unwrap();
+
+            let remote_bootstrap = importer_state
+                .lock()
+                .unwrap()
+                .peer_rpc_session
+                .as_ref()
+                .unwrap()
+                .remote_bootstrap
+                .clone();
+            let (_, _, _, _, factory_client_any) =
+                fetch_remote_capability_export(remote_bootstrap.clone(), "echo-factory")
+                    .await
+                    .unwrap();
+            let factory = generic_proxy_test_capnp::echo_factory::Client {
+                client: factory_client_any,
+            };
+            let mut get_echo = factory.get_echo_request();
+            get_echo.get().set_prefix("save-registered:");
+            let get_echo_resp = get_echo.send().promise.await.unwrap();
+            let returned_echo = get_echo_resp.get().unwrap().get_echo().unwrap();
+
+            let remote_object_id = register_remote_capability(
+                remote_bootstrap,
+                returned_echo.client,
+                "Registered Echo",
+                ImportedRemoteCapabilityKind::Other,
+                "dev.iroh-tunnel.test/echo",
+                None,
+            )
+            .await
+            .unwrap();
+
+            let (_label, object_id) = create_local_proxy_for_registered_remote_object(
+                &importer_state,
+                &remote_object_id,
+            )
+            .await
+            .unwrap();
+
+            let local_proxy = importer_app
+                .restore_object_capability(importer_sandstorm_api.clone(), &object_id)
+                .await
+                .unwrap();
+            let (saved_object_id, saved_label) =
+                save_app_persistent_capability_for_test(local_proxy).await.unwrap();
+            assert_eq!(saved_object_id, object_id);
+            assert_eq!(saved_label, "Registered Echo");
+
+            let restored = importer_app
+                .restore_object_capability(importer_sandstorm_api, &saved_object_id)
+                .await
+                .unwrap();
+            let echo = generic_proxy_test_capnp::echo::Client { client: restored };
+            let mut ping = echo.ping_request();
+            ping.get().set_text("hello");
+            let ping_resp = ping.send().promise.await.unwrap();
+            let text = ping_resp
+                .get()
+                .unwrap()
+                .get_text()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string();
+            assert_eq!(text, "save-registered:hello");
+
+            let _ = exporter_sandstorm_api;
+            importer_app.close_test_endpoint().await;
+            exporter_app.close_test_endpoint().await;
+        });
+    }
+
+    #[test]
+    fn fulfill_request_with_local_proxy_succeeds_in_fake_session_context() {
+        run_local_async_test(async {
+            let (exporter_app, _, exporter_sandstorm_api) =
+                build_test_app("fulfill-local-proxy-exporter", 187).await;
+            let (importer_app, _, importer_sandstorm_api) =
+                build_test_app("fulfill-local-proxy-importer", 188).await;
+
+            exporter_app
+                .seed_exported_api_session_for_test(
+                    "preview-api",
+                    "Preview API",
+                    new_client(crate::test_support::FakePreviewApiSession {
+                        response_bytes: b"%PDF-FULFILL\n".to_vec(),
+                    }),
+                )
+                .unwrap();
+            importer_app
+                .set_remote_ticket_for_test(exporter_app.local_ticket_for_test().unwrap())
+                .unwrap();
+            importer_app
+                .connect_peer_rpc_session(importer_sandstorm_api.clone())
+                .await
+                .unwrap();
+
+            let (_label, object_id) = importer_app
+                .create_local_proxy_for_remote_export("preview-api")
+                .await
+                .unwrap();
+            let cap = importer_app
+                .restore_object_capability(importer_sandstorm_api.clone(), &object_id)
+                .await
+                .unwrap();
+
+            let capture = Arc::new(Mutex::new(crate::test_support::FakeFulfillCapture::default()));
+            let session_context: grain_capnp::session_context::Client = new_client(
+                crate::test_support::FakeSessionContextForFulfill {
+                    capture: capture.clone(),
+                },
+            );
+            let descriptor_b64 =
+                powerbox_query_for_interface(api_session_capnp::api_session::Client::TYPE_ID)
+                    .unwrap();
+
+            fulfill_powerbox_request_with_capability(
+                session_context,
+                cap,
+                "Preview API",
+                &descriptor_b64,
+            )
+            .await
+            .unwrap();
+
+            let captured = capture.lock().unwrap().clone();
+            assert_eq!(captured.object_id.as_deref(), Some(object_id.as_str()));
+            assert_eq!(captured.label.as_deref(), Some("Preview API"));
+            assert!(captured.descriptor_b64.is_some());
+
+            let restored = importer_app
+                .invoke_restored_api_session_for_test(
+                    importer_sandstorm_api,
+                    &object_id,
+                    "fulfill.docx",
+                    b"proxy",
+                )
+                .await
+                .unwrap();
+            assert_eq!(restored.response_bytes, b"%PDF-FULFILL\n".to_vec());
+
+            let _ = exporter_sandstorm_api;
+            importer_app.close_test_endpoint().await;
+            exporter_app.close_test_endpoint().await;
+        });
+    }
+
+    #[test]
+    fn fulfill_request_brokers_received_capability_into_local_proxy_before_providing() {
+        run_local_async_test(async {
+            let (exporter_app, _, exporter_sandstorm_api) =
+                build_test_app("fulfill-received-exporter", 197).await;
+            let (importer_app, importer_state, importer_sandstorm_api) =
+                build_test_app("fulfill-received-importer", 198).await;
+
+            exporter_app
+                .seed_exported_api_session_for_test(
+                    "preview-api",
+                    "Preview API",
+                    new_client(crate::test_support::FakePreviewApiSession {
+                        response_bytes: b"%PDF-RECEIVED-FULFILL\n".to_vec(),
+                    }),
+                )
+                .unwrap();
+            importer_app
+                .set_remote_ticket_for_test(exporter_app.local_ticket_for_test().unwrap())
+                .unwrap();
+            importer_app
+                .connect_peer_rpc_session(importer_sandstorm_api.clone())
+                .await
+                .unwrap();
+
+            let (_label, received_object_id) = importer_app
+                .import_remote_capability_export("preview-api")
+                .await
+                .map(|(label, object_id, _kind)| (label, object_id))
+                .unwrap();
+            assert_eq!(received_object_id, "remote-cap-1");
+
+            let (_label, local_proxy_object_id) =
+                create_local_proxy_for_received_object(&importer_state, &received_object_id)
+                    .await
+                    .unwrap();
+            assert_ne!(local_proxy_object_id, received_object_id);
+            assert!(local_proxy_object_id.starts_with("local-proxy-cap-"));
+
+            let capture = Arc::new(Mutex::new(crate::test_support::FakeFulfillCapture::default()));
+            let session_context: grain_capnp::session_context::Client = new_client(
+                crate::test_support::FakeSessionContextForFulfill {
+                    capture: capture.clone(),
+                },
+            );
+            let descriptor_b64 =
+                powerbox_query_for_interface(api_session_capnp::api_session::Client::TYPE_ID)
+                    .unwrap();
+            let cap = importer_app
+                .restore_object_capability(importer_sandstorm_api.clone(), &local_proxy_object_id)
+                .await
+                .unwrap();
+
+            fulfill_powerbox_request_with_capability(
+                session_context,
+                cap,
+                "Preview API",
+                &descriptor_b64,
+            )
+            .await
+            .unwrap();
+
+            let captured = capture.lock().unwrap().clone();
+            assert_eq!(
+                captured.object_id.as_deref(),
+                Some(local_proxy_object_id.as_str())
+            );
+
+            let restored = importer_app
+                .invoke_restored_api_session_for_test(
+                    importer_sandstorm_api,
+                    &local_proxy_object_id,
+                    "fulfill-received.docx",
+                    b"proxy",
+                )
+                .await
+                .unwrap();
+            assert_eq!(restored.response_bytes, b"%PDF-RECEIVED-FULFILL\n".to_vec());
+
+            let _ = exporter_sandstorm_api;
+            importer_app.close_test_endpoint().await;
+            exporter_app.close_test_endpoint().await;
+        });
+    }
+
+    #[test]
+    fn brokered_received_api_session_can_be_provided_again_after_both_sides_restart() {
+        run_local_async_test(async {
+            let exporter_storage_root = make_test_storage_root("restart-provide-exporter");
+            let importer_storage_root = make_test_storage_root("restart-provide-importer");
+            let (exporter_app, _, exporter_sandstorm_api) =
+                build_test_app_with_storage(exporter_storage_root.clone(), 201).await;
+            let (importer_app, importer_state, importer_sandstorm_api) =
+                build_test_app_with_storage(importer_storage_root.clone(), 202).await;
+
+            exporter_app
+                .seed_exported_api_session_for_test(
+                    "preview-api",
+                    "Preview API",
+                    new_client(crate::test_support::FakePreviewApiSession {
+                        response_bytes: b"%PDF-RESTART-PROVIDE\n".to_vec(),
+                    }),
+                )
+                .unwrap();
+            importer_app
+                .set_remote_ticket_for_test(exporter_app.local_ticket_for_test().unwrap())
+                .unwrap();
+            importer_app
+                .connect_peer_rpc_session(importer_sandstorm_api.clone())
+                .await
+                .unwrap();
+
+            let (_label, received_object_id) = importer_app
+                .import_remote_capability_export("preview-api")
+                .await
+                .map(|(label, object_id, _kind)| (label, object_id))
+                .unwrap();
+            let (_label, local_proxy_object_id) =
+                create_local_proxy_for_received_object(&importer_state, &received_object_id)
+                    .await
+                    .unwrap();
+
+            let initial_capture =
+                Arc::new(Mutex::new(crate::test_support::FakeFulfillCapture::default()));
+            let initial_session_context: grain_capnp::session_context::Client = new_client(
+                crate::test_support::FakeSessionContextForFulfill {
+                    capture: initial_capture.clone(),
+                },
+            );
+            let descriptor_b64 =
+                powerbox_query_for_interface(api_session_capnp::api_session::Client::TYPE_ID)
+                    .unwrap();
+            let initial_cap = importer_app
+                .restore_object_capability(importer_sandstorm_api.clone(), &local_proxy_object_id)
+                .await
+                .unwrap();
+            fulfill_powerbox_request_with_capability(
+                initial_session_context,
+                initial_cap,
+                "Preview API",
+                &descriptor_b64,
+            )
+            .await
+            .unwrap();
+            let initial_restored = importer_app
+                .invoke_restored_api_session_for_test(
+                    importer_sandstorm_api.clone(),
+                    &local_proxy_object_id,
+                    "restart-provide-initial.docx",
+                    b"proxy",
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                initial_restored.response_bytes,
+                b"%PDF-RESTART-PROVIDE\n".to_vec()
+            );
+
+            importer_app.close_test_endpoint().await;
+            exporter_app.close_test_endpoint().await;
+
+            let (restarted_exporter_app, _, restarted_exporter_sandstorm_api) =
+                build_test_app_with_storage_loaded(exporter_storage_root, 201).await;
+            let (restarted_importer_app, restarted_importer_state, restarted_importer_sandstorm_api) =
+                build_test_app_with_storage_loaded(importer_storage_root, 202).await;
+
+            restarted_exporter_app
+                .seed_exported_api_session_for_test(
+                    "preview-api",
+                    "Preview API",
+                    new_client(crate::test_support::FakePreviewApiSession {
+                        response_bytes: b"%PDF-RESTART-PROVIDE\n".to_vec(),
+                    }),
+                )
+                .unwrap();
+            restarted_importer_app
+                .set_remote_ticket_for_test(restarted_exporter_app.local_ticket_for_test().unwrap())
+                .unwrap();
+            restarted_importer_app
+                .connect_peer_rpc_session(restarted_importer_sandstorm_api.clone())
+                .await
+                .unwrap();
+
+            let (_label, restarted_local_proxy_object_id) =
+                create_local_proxy_for_received_object(&restarted_importer_state, &received_object_id)
+                    .await
+                    .unwrap();
+            assert_eq!(restarted_local_proxy_object_id, local_proxy_object_id);
+
+            let restarted_capture =
+                Arc::new(Mutex::new(crate::test_support::FakeFulfillCapture::default()));
+            let restarted_session_context: grain_capnp::session_context::Client = new_client(
+                crate::test_support::FakeSessionContextForFulfill {
+                    capture: restarted_capture.clone(),
+                },
+            );
+            let restarted_cap = restarted_importer_app
+                .restore_object_capability(
+                    restarted_importer_sandstorm_api.clone(),
+                    &restarted_local_proxy_object_id,
+                )
+                .await
+                .unwrap();
+            fulfill_powerbox_request_with_capability(
+                restarted_session_context,
+                restarted_cap,
+                "Preview API",
+                &descriptor_b64,
+            )
+            .await
+            .unwrap();
+
+            let captured = restarted_capture.lock().unwrap().clone();
+            assert_eq!(
+                captured.object_id.as_deref(),
+                Some(restarted_local_proxy_object_id.as_str())
+            );
+
+            let restarted_restored = restarted_importer_app
+                .invoke_restored_api_session_for_test(
+                    restarted_importer_sandstorm_api,
+                    &restarted_local_proxy_object_id,
+                    "restart-provide-after-restart.docx",
+                    b"proxy",
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                restarted_restored.response_bytes,
+                b"%PDF-RESTART-PROVIDE\n".to_vec()
+            );
+
+            let _ = exporter_sandstorm_api;
+            let _ = restarted_exporter_sandstorm_api;
+            restarted_importer_app.close_test_endpoint().await;
+            restarted_exporter_app.close_test_endpoint().await;
+        });
+    }
+
+    #[test]
+    fn restart_keeps_export_backed_local_proxy_but_discards_remote_object_helper_proxies() {
+        run_local_async_test(async {
+            let exporter_storage_root = make_test_storage_root("restart-export-backed-exporter");
+            let importer_storage_root = make_test_storage_root("restart-export-backed-importer");
+            let (exporter_app, _, exporter_sandstorm_api) =
+                build_test_app_with_storage(exporter_storage_root.clone(), 199).await;
+            let (importer_app, importer_state, importer_sandstorm_api) =
+                build_test_app_with_storage(importer_storage_root.clone(), 200).await;
+            let echo_factory: generic_proxy_test_capnp::echo_factory::Client =
+                new_client(crate::test_support::FakeEchoFactory);
+
+            exporter_app
+                .seed_exported_api_session_for_test(
+                    "preview-api",
+                    "Preview API",
+                    new_client(crate::test_support::FakePreviewApiSession {
+                        response_bytes: b"%PDF-RESTART-PROXY\n".to_vec(),
+                    }),
+                )
+                .unwrap();
+            exporter_app
+                .seed_exported_generic_capability_for_test(
+                    "echo-factory",
+                    "Echo Factory",
+                    "dev.iroh-tunnel.test/echo-factory",
+                    echo_factory.client,
+                )
+                .unwrap();
+
+            importer_app
+                .set_remote_ticket_for_test(exporter_app.local_ticket_for_test().unwrap())
+                .unwrap();
+            importer_app
+                .connect_peer_rpc_session(importer_sandstorm_api.clone())
+                .await
+                .unwrap();
+
+            let (_label, top_level_object_id) = importer_app
+                .create_local_proxy_for_remote_export("preview-api")
+                .await
+                .unwrap();
+
+            let remote_bootstrap = importer_state
+                .lock()
+                .unwrap()
+                .peer_rpc_session
+                .as_ref()
+                .unwrap()
+                .remote_bootstrap
+                .clone();
+            let (_, _, _, _, factory_client_any) =
+                fetch_remote_capability_export(remote_bootstrap.clone(), "echo-factory")
+                    .await
+                    .unwrap();
+            let factory = generic_proxy_test_capnp::echo_factory::Client {
+                client: factory_client_any,
+            };
+            let mut get_echo = factory.get_echo_request();
+            get_echo.get().set_prefix("restart-helper:");
+            let get_echo_resp = get_echo.send().promise.await.unwrap();
+            let returned_echo = get_echo_resp.get().unwrap().get_echo().unwrap();
+            let remote_object_id = register_remote_capability(
+                remote_bootstrap,
+                returned_echo.client,
+                "Registered Echo",
+                ImportedRemoteCapabilityKind::Other,
+                "dev.iroh-tunnel.test/echo",
+                None,
+            )
+            .await
+            .unwrap();
+            let (_label, helper_object_id) =
+                create_local_proxy_for_registered_remote_object(&importer_state, &remote_object_id)
+                    .await
+                    .unwrap();
+            assert_ne!(top_level_object_id, helper_object_id);
+
+            importer_app.close_test_endpoint().await;
+            exporter_app.close_test_endpoint().await;
+
+            let (restarted_exporter_app, _, restarted_exporter_sandstorm_api) =
+                build_test_app_with_storage_loaded(exporter_storage_root, 199).await;
+            let (restarted_importer_app, restarted_importer_state, restarted_importer_sandstorm_api) =
+                build_test_app_with_storage_loaded(importer_storage_root, 200).await;
+
+            restarted_exporter_app
+                .seed_exported_api_session_for_test(
+                    "preview-api",
+                    "Preview API",
+                    new_client(crate::test_support::FakePreviewApiSession {
+                        response_bytes: b"%PDF-RESTART-PROXY\n".to_vec(),
+                    }),
+                )
+                .unwrap();
+
+            let restarted_local_proxy_caps = restarted_importer_state
+                .lock()
+                .unwrap()
+                .local_proxy_caps
+                .clone();
+            assert!(restarted_local_proxy_caps
+                .iter()
+                .any(|record| record.object_id == top_level_object_id
+                    && record.target_kind == LocalProxyTargetKindRuntime::ExportId));
+            assert!(!restarted_local_proxy_caps
+                .iter()
+                .any(|record| record.object_id == helper_object_id));
+            assert!(!restarted_local_proxy_caps
+                .iter()
+                .any(|record| record.target_kind == LocalProxyTargetKindRuntime::RemoteObjectId));
+
+            restarted_importer_app
+                .set_remote_ticket_for_test(restarted_exporter_app.local_ticket_for_test().unwrap())
+                .unwrap();
+            restarted_importer_app
+                .connect_peer_rpc_session(restarted_importer_sandstorm_api.clone())
+                .await
+                .unwrap();
+
+            let restored = restarted_importer_app
+                .invoke_restored_api_session_for_test(
+                    restarted_importer_sandstorm_api,
+                    &top_level_object_id,
+                    "restart-proxy.docx",
+                    b"proxy",
+                )
+                .await
+                .unwrap();
+            assert_eq!(restored.response_bytes, b"%PDF-RESTART-PROXY\n".to_vec());
+
+            let _ = exporter_sandstorm_api;
+            let _ = restarted_exporter_sandstorm_api;
+            restarted_importer_app.close_test_endpoint().await;
+            restarted_exporter_app.close_test_endpoint().await;
+        });
+    }
+
+    #[test]
+    fn registering_same_remote_capability_twice_reuses_remote_object_id() {
+        run_local_async_test(async {
+            let (exporter_app, _, exporter_sandstorm_api) =
+                build_test_app("registered-dedupe-exporter", 93).await;
+            let (importer_app, importer_state, importer_sandstorm_api) =
+                build_test_app("registered-dedupe-importer", 94).await;
+            let echo_factory: generic_proxy_test_capnp::echo_factory::Client =
+                new_client(crate::test_support::FakeEchoFactory);
+
+            exporter_app
+                .seed_exported_generic_capability_for_test(
+                    "echo-factory",
+                    "Echo Factory",
+                    "dev.iroh-tunnel.test/echo-factory",
+                    echo_factory.client,
+                )
+                .unwrap();
+            importer_app
+                .set_remote_ticket_for_test(exporter_app.local_ticket_for_test().unwrap())
+                .unwrap();
+            importer_app
+                .connect_peer_rpc_session(importer_sandstorm_api)
+                .await
+                .unwrap();
+
+            let remote_bootstrap = importer_state
+                .lock()
+                .unwrap()
+                .peer_rpc_session
+                .as_ref()
+                .unwrap()
+                .remote_bootstrap
+                .clone();
+            let (_, _, _, _, factory_client_any) =
+                fetch_remote_capability_export(remote_bootstrap.clone(), "echo-factory")
+                    .await
+                    .unwrap();
+            let factory = generic_proxy_test_capnp::echo_factory::Client {
+                client: factory_client_any,
+            };
+            let mut get_echo = factory.get_echo_request();
+            get_echo.get().set_prefix("reuse:");
+            let get_echo_resp = get_echo.send().promise.await.unwrap();
+            let returned_echo = get_echo_resp.get().unwrap().get_echo().unwrap();
+
+            let first = register_remote_capability(
+                remote_bootstrap.clone(),
+                returned_echo.client.clone(),
+                "Registered Echo",
+                ImportedRemoteCapabilityKind::Other,
+                "dev.iroh-tunnel.test/echo",
+                None,
+            )
+            .await
+            .unwrap();
+            let second = register_remote_capability(
+                remote_bootstrap,
+                returned_echo.client,
+                "Registered Echo",
+                ImportedRemoteCapabilityKind::Other,
+                "dev.iroh-tunnel.test/echo",
+                None,
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(first, second);
+
+            let _ = exporter_sandstorm_api;
+            importer_app.close_test_endpoint().await;
+            exporter_app.close_test_endpoint().await;
+        });
+    }
+
+    #[test]
+    fn registered_remote_capability_records_ephemeral_durability_when_save_fails() {
+        run_local_async_test(async {
+            let (exporter_app, exporter_state, exporter_sandstorm_api) =
+                build_test_app("registered-ephemeral-exporter", 95).await;
+            let (importer_app, importer_state, importer_sandstorm_api) =
+                build_test_app("registered-ephemeral-importer", 96).await;
+            let echo_factory: generic_proxy_test_capnp::echo_factory::Client =
+                new_client(crate::test_support::FakeEchoFactory);
+
+            exporter_app
+                .seed_exported_generic_capability_for_test(
+                    "echo-factory",
+                    "Echo Factory",
+                    "dev.iroh-tunnel.test/echo-factory",
+                    echo_factory.client,
+                )
+                .unwrap();
+            importer_app
+                .set_remote_ticket_for_test(exporter_app.local_ticket_for_test().unwrap())
+                .unwrap();
+            importer_app
+                .connect_peer_rpc_session(importer_sandstorm_api)
+                .await
+                .unwrap();
+
+            let remote_bootstrap = importer_state
+                .lock()
+                .unwrap()
+                .peer_rpc_session
+                .as_ref()
+                .unwrap()
+                .remote_bootstrap
+                .clone();
+            let (_, _, _, _, factory_client_any) =
+                fetch_remote_capability_export(remote_bootstrap.clone(), "echo-factory")
+                    .await
+                    .unwrap();
+            let factory = generic_proxy_test_capnp::echo_factory::Client {
+                client: factory_client_any,
+            };
+            let mut get_echo = factory.get_echo_request();
+            get_echo.get().set_prefix("ephemeral:");
+            let get_echo_resp = get_echo.send().promise.await.unwrap();
+            let returned_echo = get_echo_resp.get().unwrap().get_echo().unwrap();
+
+            let remote_object_id = register_remote_capability(
+                remote_bootstrap,
+                returned_echo.client,
+                "Registered Echo",
+                ImportedRemoteCapabilityKind::Other,
+                "dev.iroh-tunnel.test/echo",
+                None,
+            )
+            .await
+            .unwrap();
+
+            let registered = exporter_state
+                .lock()
+                .unwrap()
+                .registered_remote_caps
+                .get(&remote_object_id)
+                .cloned()
+                .unwrap();
+            assert!(matches!(
+                registered.durability,
+                RegisteredRemoteCapabilityDurability::Ephemeral
+            ));
+            assert!(registered.saved_token.is_none());
+
+            let _ = exporter_sandstorm_api;
+            importer_app.close_test_endpoint().await;
+            exporter_app.close_test_endpoint().await;
+        });
+    }
+
+    #[test]
+    fn localized_proxy_for_ephemeral_registered_remote_capability_fails_after_remote_restart() {
+        run_local_async_test(async {
+            let exporter_storage_root = make_test_storage_root("registered-ephemeral-restart-exporter");
+            let (exporter_app, exporter_state, exporter_sandstorm_api) =
+                build_test_app_with_storage(exporter_storage_root.clone(), 97).await;
+            let (importer_app, importer_state, importer_sandstorm_api) =
+                build_test_app("registered-ephemeral-restart-importer", 98).await;
+            let echo_factory: generic_proxy_test_capnp::echo_factory::Client =
+                new_client(crate::test_support::FakeEchoFactory);
+
+            exporter_app
+                .seed_exported_generic_capability_for_test(
+                    "echo-factory",
+                    "Echo Factory",
+                    "dev.iroh-tunnel.test/echo-factory",
+                    echo_factory.client,
+                )
+                .unwrap();
+            importer_app
+                .set_remote_ticket_for_test(exporter_app.local_ticket_for_test().unwrap())
+                .unwrap();
+            importer_app
+                .connect_peer_rpc_session(importer_sandstorm_api.clone())
+                .await
+                .unwrap();
+
+            let remote_bootstrap = importer_state
+                .lock()
+                .unwrap()
+                .peer_rpc_session
+                .as_ref()
+                .unwrap()
+                .remote_bootstrap
+                .clone();
+            let (_, _, _, _, factory_client_any) =
+                fetch_remote_capability_export(remote_bootstrap.clone(), "echo-factory")
+                    .await
+                    .unwrap();
+            let factory = generic_proxy_test_capnp::echo_factory::Client {
+                client: factory_client_any,
+            };
+            let mut get_echo = factory.get_echo_request();
+            get_echo.get().set_prefix("restart:");
+            let get_echo_resp = get_echo.send().promise.await.unwrap();
+            let returned_echo = get_echo_resp.get().unwrap().get_echo().unwrap();
+
+            let remote_object_id = register_remote_capability(
+                remote_bootstrap,
+                returned_echo.client,
+                "Registered Echo",
+                ImportedRemoteCapabilityKind::Other,
+                "dev.iroh-tunnel.test/echo",
+                None,
+            )
+            .await
+            .unwrap();
+
+            let registered = exporter_state
+                .lock()
+                .unwrap()
+                .registered_remote_caps
+                .get(&remote_object_id)
+                .cloned()
+                .unwrap();
+            assert!(matches!(
+                registered.durability,
+                RegisteredRemoteCapabilityDurability::Ephemeral
+            ));
+
+            let (_label, object_id) = create_local_proxy_for_registered_remote_object(
+                &importer_state,
+                &remote_object_id,
+            )
+            .await
+            .unwrap();
+            let restored = importer_app
+                .restore_object_capability(importer_sandstorm_api.clone(), &object_id)
+                .await
+                .unwrap();
+            let echo = generic_proxy_test_capnp::echo::Client { client: restored };
+            let mut ping = echo.ping_request();
+            ping.get().set_text("before");
+            let ping_resp = ping.send().promise.await.unwrap();
+            assert_eq!(
+                ping_resp.get().unwrap().get_text().unwrap().to_str().unwrap(),
+                "restart:before"
+            );
+
+            importer_app.disconnect_peer_rpc_session().unwrap();
+            exporter_app.close_test_endpoint().await;
+
+            let (restarted_exporter_app, restarted_exporter_state, restarted_exporter_sandstorm_api) =
+                build_test_app_with_storage_loaded(exporter_storage_root, 97).await;
+            let restarted_registered = restarted_exporter_state
+                .lock()
+                .unwrap()
+                .registered_remote_caps
+                .get(&remote_object_id)
+                .cloned()
+                .unwrap();
+            assert!(restarted_registered.client.is_none());
+            assert!(matches!(
+                restarted_registered.durability,
+                RegisteredRemoteCapabilityDurability::Ephemeral
+            ));
+
+            importer_app
+                .set_remote_ticket_for_test(restarted_exporter_app.local_ticket_for_test().unwrap())
+                .unwrap();
+            importer_app
+                .connect_peer_rpc_session(importer_sandstorm_api.clone())
+                .await
+                .unwrap();
+
+            let restored = importer_app
+                .restore_object_capability(importer_sandstorm_api, &object_id)
+                .await
+                .unwrap();
+            let echo = generic_proxy_test_capnp::echo::Client { client: restored };
+            let mut ping = echo.ping_request();
+            ping.get().set_text("after");
+            let err = match ping.send().promise.await {
+                Ok(_) => panic!("ping unexpectedly succeeded after remote restart"),
+                Err(err) => err.to_string(),
+            };
+            assert!(err.contains("is ephemeral and cannot be restored after restart"));
+
+            let _ = exporter_sandstorm_api;
+            let _ = restarted_exporter_sandstorm_api;
+            importer_app.close_test_endpoint().await;
+            restarted_exporter_app.close_test_endpoint().await;
+        });
+    }
+
+    #[test]
+    fn returned_capability_from_local_proxy_survives_reconnect_via_auto_localization() {
+        run_local_async_test(async {
+            let (exporter_app, _, exporter_sandstorm_api) =
+                build_test_app("auto-localized-return-exporter", 89).await;
+            let (importer_app, _, importer_sandstorm_api) =
+                build_test_app("auto-localized-return-importer", 90).await;
+            let echo_factory: generic_proxy_test_capnp::echo_factory::Client =
+                new_client(crate::test_support::FakeEchoFactory);
+
+            exporter_app
+                .seed_exported_generic_capability_for_test(
+                    "echo-factory",
+                    "Echo Factory",
+                    "dev.iroh-tunnel.test/echo-factory",
+                    echo_factory.client,
+                )
+                .unwrap();
+            importer_app
+                .set_remote_ticket_for_test(exporter_app.local_ticket_for_test().unwrap())
+                .unwrap();
+            importer_app
+                .connect_peer_rpc_session(importer_sandstorm_api.clone())
+                .await
+                .unwrap();
+
+            let (_, object_id) = importer_app
+                .create_local_proxy_for_remote_export("echo-factory")
+                .await
+                .unwrap();
+            let restored = importer_app
+                .restore_object_capability(importer_sandstorm_api.clone(), &object_id)
+                .await
+                .unwrap();
+            let factory = generic_proxy_test_capnp::echo_factory::Client { client: restored };
+            let mut get_echo = factory.get_echo_request();
+            get_echo.get().set_prefix("auto:");
+            let get_echo_resp = get_echo.send().promise.await.unwrap();
+            let echo = get_echo_resp.get().unwrap().get_echo().unwrap();
+
+            importer_app.disconnect_peer_rpc_session().unwrap();
+            importer_app
+                .connect_peer_rpc_session(importer_sandstorm_api)
+                .await
+                .unwrap();
+
+            let mut ping = echo.ping_request();
+            ping.get().set_text("hello");
+            let ping_resp = ping.send().promise.await.unwrap();
+            let text = ping_resp
+                .get()
+                .unwrap()
+                .get_text()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string();
+            assert_eq!(text, "auto:hello");
+
+            let _ = exporter_sandstorm_api;
+            importer_app.close_test_endpoint().await;
+            exporter_app.close_test_endpoint().await;
+        });
+    }
+
+    #[test]
+    fn local_proxy_unwraps_localized_capability_parameters() {
+        run_local_async_test(async {
+            let (exporter_app, _, exporter_sandstorm_api) =
+                build_test_app("param-unwrap-exporter", 91).await;
+            let (importer_app, _, importer_sandstorm_api) =
+                build_test_app("param-unwrap-importer", 92).await;
+            let echo_factory: generic_proxy_test_capnp::echo_factory::Client =
+                new_client(crate::test_support::FakeEchoFactory);
+            let echo_relay: generic_proxy_test_capnp::echo_relay::Client =
+                new_client(crate::test_support::FakeEchoRelay);
+
+            exporter_app
+                .seed_exported_generic_capability_for_test(
+                    "echo-factory",
+                    "Echo Factory",
+                    "dev.iroh-tunnel.test/echo-factory",
+                    echo_factory.client,
+                )
+                .unwrap();
+            exporter_app
+                .seed_exported_generic_capability_for_test(
+                    "echo-relay",
+                    "Echo Relay",
+                    "dev.iroh-tunnel.test/echo-relay",
+                    echo_relay.client,
+                )
+                .unwrap();
+            importer_app
+                .set_remote_ticket_for_test(exporter_app.local_ticket_for_test().unwrap())
+                .unwrap();
+            importer_app
+                .connect_peer_rpc_session(importer_sandstorm_api.clone())
+                .await
+                .unwrap();
+
+            let (_, factory_object_id) = importer_app
+                .create_local_proxy_for_remote_export("echo-factory")
+                .await
+                .unwrap();
+            let (_, relay_object_id) = importer_app
+                .create_local_proxy_for_remote_export("echo-relay")
+                .await
+                .unwrap();
+            let factory = generic_proxy_test_capnp::echo_factory::Client {
+                client: importer_app
+                    .restore_object_capability(importer_sandstorm_api.clone(), &factory_object_id)
+                    .await
+                    .unwrap(),
+            };
+            let relay = generic_proxy_test_capnp::echo_relay::Client {
+                client: importer_app
+                    .restore_object_capability(importer_sandstorm_api, &relay_object_id)
+                    .await
+                    .unwrap(),
+            };
+
+            let mut get_echo = factory.get_echo_request();
+            get_echo.get().set_prefix("param:");
+            let get_echo_resp = get_echo.send().promise.await.unwrap();
+            let echo = get_echo_resp.get().unwrap().get_echo().unwrap();
+            let echoed =
+                crate::test_support::invoke_echo_relay_for_test(relay, echo, "hello").await.unwrap();
+
+            assert_eq!(echoed, "param:hello");
+
+            let _ = exporter_sandstorm_api;
+            importer_app.close_test_endpoint().await;
+            exporter_app.close_test_endpoint().await;
+        });
+    }
+
+    #[test]
     fn repeated_reconnect_does_not_duplicate_imported_caps() {
         run_local_async_test(async {
             let (exporter_app, _, exporter_sandstorm_api) =
@@ -7490,6 +9446,244 @@ impl tunnel_capnp::peer_bootstrap::Server for PeerBootstrapImpl {
             });
             result.set_type_tag(&shared_capability_type_tag(&export));
             result.set_descriptor_json(export.saved_cap.descriptor_json.as_deref().unwrap_or(""));
+            Ok(())
+        })
+    }
+
+    fn register_capability(
+        self: Rc<Self>,
+        params: tunnel_capnp::peer_bootstrap::RegisterCapabilityParams,
+        mut results: tunnel_capnp::peer_bootstrap::RegisterCapabilityResults,
+    ) -> Promise<(), capnp::Error> {
+        let params = match params.get() {
+            Ok(value) => value,
+            Err(err) => return Promise::err(err),
+        };
+        let client = match params.get_cap().get_as_capability::<capnp::capability::Client>() {
+            Ok(client) => client,
+            Err(err) => return Promise::err(err),
+        };
+        let label = params
+            .get_label()
+            .ok()
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        let kind = match params.get_kind() {
+            Ok(tunnel_capnp::CapabilityKind::IpNetwork) => ImportedRemoteCapabilityKind::IpNetwork,
+            Ok(tunnel_capnp::CapabilityKind::ApiSession) => ImportedRemoteCapabilityKind::ApiSession,
+            Ok(tunnel_capnp::CapabilityKind::Other) | Err(_) => ImportedRemoteCapabilityKind::Other,
+        };
+        let type_tag = params
+            .get_type_tag()
+            .ok()
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        let descriptor_json = params
+            .get_descriptor_json()
+            .ok()
+            .and_then(|value| value.to_str().ok())
+            .map(|value| value.to_string())
+            .filter(|value| !value.is_empty());
+        let hook_ptr = client.hook.get_ptr();
+
+        let app_state = self.app_state.clone();
+        let sandstorm_api = self.sandstorm_api.clone();
+        Promise::from_future(async move {
+            let existing = match app_state.lock() {
+                Ok(guard) => guard
+                    .registered_remote_hook_object_ids
+                    .get(&hook_ptr)
+                    .cloned(),
+                Err(_) => {
+                    return Err(capnp::Error::failed(
+                        "app state lock poisoned".to_string(),
+                    ))
+                }
+            };
+            if let Some(existing) = existing {
+                results.get().set_remote_object_id(&existing);
+                return Ok(());
+            }
+
+            let saved_token = save_capability(sandstorm_api, client.clone(), &label).await.ok();
+            let durability = if saved_token.is_some() {
+                RegisteredRemoteCapabilityDurability::Saveable
+            } else {
+                RegisteredRemoteCapabilityDurability::Ephemeral
+            };
+
+            let remote_object_id = {
+                let mut guard = app_state
+                    .lock()
+                    .map_err(|_| capnp::Error::failed("app state lock poisoned".to_string()))?;
+                let storage = guard.storage.clone();
+                guard.next_registered_remote_cap_id += 1;
+                let remote_object_id =
+                    format!("remote-registered-cap-{}", guard.next_registered_remote_cap_id);
+                guard.registered_remote_caps.insert(
+                    remote_object_id.clone(),
+                    RegisteredRemoteCapability {
+                        remote_object_id: remote_object_id.clone(),
+                        label,
+                        kind,
+                        type_tag,
+                        descriptor_json,
+                        durability,
+                        saved_token,
+                        created_at_ms: now_ms(),
+                        client: Some(client),
+                    },
+                );
+                guard
+                    .registered_remote_hook_object_ids
+                    .insert(hook_ptr, remote_object_id.clone());
+                persist_registered_remote_capabilities(
+                    &storage,
+                    guard.registered_remote_caps.values().cloned(),
+                )
+                .map_err(capnp::Error::failed)?;
+                remote_object_id
+            };
+
+            results.get().set_remote_object_id(&remote_object_id);
+            Ok(())
+        })
+    }
+
+    fn get_registered_capability(
+        self: Rc<Self>,
+        params: tunnel_capnp::peer_bootstrap::GetRegisteredCapabilityParams,
+        mut results: tunnel_capnp::peer_bootstrap::GetRegisteredCapabilityResults,
+    ) -> Promise<(), capnp::Error> {
+        let requested_id = match params.get() {
+            Ok(params) => match params.get_remote_object_id() {
+                Ok(value) => value.to_str().unwrap_or("").to_string(),
+                Err(err) => return Promise::err(err),
+            },
+            Err(err) => return Promise::err(err),
+        };
+        let app_state = self.app_state.clone();
+        let sandstorm_api = self.sandstorm_api.clone();
+        Promise::from_future(async move {
+            let mut registered = {
+                let guard = app_state
+                    .lock()
+                    .map_err(|_| capnp::Error::failed("app state lock poisoned".to_string()))?;
+                guard
+                    .registered_remote_caps
+                    .get(&requested_id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        capnp::Error::failed(format!(
+                            "unknown registered remote capability id: {requested_id}"
+                        ))
+                    })?
+            };
+            eprintln!(
+                "get_registered_capability: remote_object_id={} has_live_client={} durability={:?} has_saved_token={} at_ms={}",
+                requested_id,
+                registered.client.is_some(),
+                registered.durability,
+                registered.saved_token.is_some(),
+                now_ms()
+            );
+
+            if registered.client.is_none() {
+                let saved_token = registered.saved_token.clone().ok_or_else(|| {
+                    let reason = match registered.durability {
+                        RegisteredRemoteCapabilityDurability::Saveable => {
+                            "is marked saveable but is missing its saved token"
+                        }
+                        RegisteredRemoteCapabilityDurability::Ephemeral => {
+                            "is ephemeral and cannot be restored after restart"
+                        }
+                    };
+                    capnp::Error::failed(format!(
+                        "registered remote capability {requested_id} {reason}"
+                    ))
+                })?;
+                eprintln!(
+                    "get_registered_capability: remote_object_id={} restoring from saved token at_ms={}",
+                    requested_id,
+                    now_ms()
+                );
+                let restored = restore_saved_generic_capability(sandstorm_api, &saved_token)
+                    .await
+                    .map_err(capnp::Error::failed)?;
+                let hook_ptr = restored.hook.get_ptr();
+                registered.client = Some(restored.clone());
+                let mut guard = app_state
+                    .lock()
+                    .map_err(|_| capnp::Error::failed("app state lock poisoned".to_string()))?;
+                if let Some(entry) = guard.registered_remote_caps.get_mut(&requested_id) {
+                    entry.client = Some(restored);
+                }
+                guard
+                    .registered_remote_hook_object_ids
+                    .insert(hook_ptr, requested_id.clone());
+            }
+
+            let client = registered
+                .client
+                .clone()
+                .ok_or_else(|| capnp::Error::failed("registered capability missing live client".to_string()))?;
+            let mut result = results.get();
+            result.reborrow().get_cap().set_as_capability(client.hook);
+            result.set_label(&registered.label);
+            result.set_kind(imported_kind_to_tunnel_kind(registered.kind));
+            result.set_type_tag(&registered.type_tag);
+            result.set_descriptor_json(registered.descriptor_json.as_deref().unwrap_or(""));
+            Ok(())
+        })
+    }
+
+    fn get_local_proxy_for_peer_registered_capability(
+        self: Rc<Self>,
+        params: tunnel_capnp::peer_bootstrap::GetLocalProxyForPeerRegisteredCapabilityParams,
+        mut results: tunnel_capnp::peer_bootstrap::GetLocalProxyForPeerRegisteredCapabilityResults,
+    ) -> Promise<(), capnp::Error> {
+        let requested_id = match params.get() {
+            Ok(params) => match params.get_remote_object_id() {
+                Ok(value) => value.to_str().unwrap_or("").to_string(),
+                Err(err) => return Promise::err(err),
+            },
+            Err(err) => return Promise::err(err),
+        };
+        let app_state = self.app_state.clone();
+        let sandstorm_api = self.sandstorm_api.clone();
+        Promise::from_future(async move {
+            let (label, object_id) =
+                create_local_proxy_for_registered_remote_object(&app_state, &requested_id)
+                    .await
+                    .map_err(capnp::Error::failed)?;
+            let cap = restore_app_object_capability(sandstorm_api, &app_state, &object_id)
+                .await
+                .map_err(capnp::Error::failed)?;
+            let type_tag = {
+                let guard = app_state
+                    .lock()
+                    .map_err(|_| capnp::Error::failed("app state lock poisoned".to_string()))?;
+                let record = guard
+                    .local_proxy_caps
+                    .iter()
+                    .find(|record| record.object_id == object_id)
+                    .ok_or_else(|| {
+                        capnp::Error::failed(format!(
+                            "missing local proxy record after creation: {object_id}"
+                        ))
+                    })?;
+                record.type_tag.clone()
+            };
+            let descriptor_json =
+                capability_descriptor_for_object_id(&app_state, &object_id).map_err(capnp::Error::failed)?;
+            let mut result = results.get();
+            result.reborrow().get_cap().set_as_capability(cap.hook);
+            result.set_label(&label);
+            result.set_kind(tunnel_capnp::CapabilityKind::Other);
+            result.set_type_tag(&type_tag);
+            result.set_descriptor_json(descriptor_json.as_deref().unwrap_or(""));
             Ok(())
         })
     }

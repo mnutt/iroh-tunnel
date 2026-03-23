@@ -263,6 +263,11 @@ function scheduleRefresh(data) {
     window.clearTimeout(refreshTimerId);
     refreshTimerId = 0;
   }
+  const isPowerboxRequestSession =
+    !!(data && data.powerboxRequestSession && data.powerboxRequestSession.active);
+  if (isPowerboxRequestSession) {
+    return;
+  }
   const pairing = (data && data.pairing) || {};
   const status = pairing.status || "";
   const delayMs = document.hidden
@@ -298,6 +303,11 @@ remoteTicketEl.addEventListener("input", () => {
 });
 
 document.addEventListener("visibilitychange", () => {
+  const isPowerboxRequestSession =
+    !!(currentState && currentState.powerboxRequestSession && currentState.powerboxRequestSession.active);
+  if (isPowerboxRequestSession) {
+    return;
+  }
   if (!document.hidden) {
     refreshState().catch((error) => {
       setStatus(`Failed to refresh state: ${error}`);
@@ -308,6 +318,11 @@ document.addEventListener("visibilitychange", () => {
 });
 
 window.addEventListener("focus", () => {
+  const isPowerboxRequestSession =
+    !!(currentState && currentState.powerboxRequestSession && currentState.powerboxRequestSession.active);
+  if (isPowerboxRequestSession) {
+    return;
+  }
   refreshState().catch((error) => {
     setStatus(`Failed to refresh state: ${error}`);
   });

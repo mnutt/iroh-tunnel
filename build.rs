@@ -5,6 +5,7 @@ fn main() {
     let schema_dir = Path::new("vendor/include/sandstorm");
     println!("cargo:rerun-if-changed=vendor/include");
     println!("cargo:rerun-if-changed=src/tunnel.capnp");
+    println!("cargo:rerun-if-changed=src/generic_proxy_test.capnp");
 
     let mut command = capnpc::CompilerCommand::new();
     command.import_path("vendor/include");
@@ -32,7 +33,8 @@ fn main() {
     tunnel_command.import_path("src");
     tunnel_command.src_prefix("src");
     tunnel_command.file("src/tunnel.capnp");
+    tunnel_command.file("src/generic_proxy_test.capnp");
     tunnel_command.run().expect(
-        "capnp schema compilation failed for src/tunnel.capnp; ensure `capnp` is installed in the build environment",
+        "capnp schema compilation failed for src schemas; ensure `capnp` is installed in the build environment",
     );
 }

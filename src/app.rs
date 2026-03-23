@@ -1,15 +1,20 @@
 use std::collections::HashSet;
+use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
+use capnp::capability::{
+    DispatchCallResult, FromServer, Promise as CapPromise, Server as CapServer,
+};
 use capnp::traits::HasTypeId;
 use capnp_rpc::{new_client, rpc_twoparty_capnp, twoparty, RpcSystem};
+use capnp_rpc::pry;
 use tokio::time::{sleep, Duration};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 use crate::backend::SandstormBackend;
 use crate::storage::{
-    PersistedReceivedCapabilityRecord, ReceivedCapabilityKind, SharedCapabilityKind,
-    SharedCapabilityRecord, Storage,
+    LocalProxyCapabilityRecord, LocalProxyTargetKind, PersistedReceivedCapabilityRecord,
+    ReceivedCapabilityKind, SharedCapabilityKind, SharedCapabilityRecord, Storage,
 };
 
 #[derive(Clone)]
@@ -18,9 +23,144 @@ pub(crate) struct App {
     storage: Storage,
 }
 
+pub(crate) const LOCAL_TEST_API_SESSION_OBJECT_ID: &str = "local-test-api-session";
+pub(crate) const LOCAL_TEST_API_SESSION_LABEL: &str = "Local Test ApiSession";
+
+struct TypelessHostedClient(capnp::capability::Client);
+
+impl capnp::capability::FromClientHook for TypelessHostedClient {
+    fn new(hook: Box<capnp::capability::DynClientHook>) -> Self {
+        Self(capnp::capability::Client::new(hook))
+    }
+
+    fn into_client_hook(self) -> Box<capnp::capability::DynClientHook> {
+        self.0.hook
+    }
+
+    fn as_client_hook(&self) -> &capnp::capability::DynClientHook {
+        &*self.0.hook
+    }
+}
+
+#[derive(Clone)]
+struct TypelessServerDispatch<S> {
+    server: capnp::capability::Rc<S>,
+}
+
+impl<S> std::ops::Deref for TypelessServerDispatch<S> {
+    type Target = S;
+
+    fn deref(&self) -> &Self::Target {
+        &self.server
+    }
+}
+
+impl<S> CapServer for TypelessServerDispatch<S>
+where
+    S: CapServer + Clone + 'static,
+{
+    fn dispatch_call(
+        self,
+        interface_id: u64,
+        method_id: u16,
+        params: capnp::capability::Params<capnp::any_pointer::Owned>,
+        results: capnp::capability::Results<capnp::any_pointer::Owned>,
+    ) -> DispatchCallResult {
+        (*self.server).clone().dispatch_call(interface_id, method_id, params, results)
+    }
+
+    fn as_ptr(&self) -> usize {
+        self.server.as_ptr()
+    }
+}
+
+impl<S> FromServer<S> for TypelessHostedClient
+where
+    S: CapServer + Clone + 'static,
+{
+    type Dispatch = TypelessServerDispatch<S>;
+
+    fn from_server(s: capnp::capability::Rc<S>) -> Self::Dispatch {
+        TypelessServerDispatch { server: s }
+    }
+}
+
 impl App {
     pub(crate) fn new(state: Arc<Mutex<crate::AppState>>, storage: Storage) -> Self {
         Self { state, storage }
+    }
+
+    fn local_proxy_response_transform(
+        &self,
+        local_proxy_object_id: String,
+    ) -> crate::untyped_local::ResponseCapTableTransform {
+        let app = self.clone();
+        std::rc::Rc::new(move |cap_table| {
+            let app = app.clone();
+            let local_proxy_object_id = local_proxy_object_id.clone();
+            let fut: std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = capnp::Result<
+                                Vec<Option<Box<dyn capnp::private::capability::ClientHook>>>,
+                            >,
+                        > + 'static,
+                >,
+            > = Box::pin(async move {
+                let mut localized = Vec::with_capacity(cap_table.len());
+                for entry in cap_table {
+                    let Some(hook) = entry else {
+                        localized.push(None);
+                        continue;
+                    };
+                    let client = capnp::capability::Client::new(hook);
+                    let localized_client = app
+                        .localize_remote_capability_for_local_proxy_target(
+                            &local_proxy_object_id,
+                            client,
+                        )
+                        .await
+                        .map_err(capnp::Error::failed)?;
+                    localized.push(Some(localized_client.hook));
+                }
+                Ok(localized)
+            });
+            fut
+        })
+    }
+
+    fn local_proxy_request_transform(
+        &self,
+    ) -> crate::untyped_local::RequestCapTableTransform {
+        let app = self.clone();
+        std::rc::Rc::new(move |cap_table| {
+            let app = app.clone();
+            let fut: std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = capnp::Result<
+                                Vec<Option<Box<dyn capnp::private::capability::ClientHook>>>,
+                            >,
+                        > + 'static,
+                >,
+            > = Box::pin(async move {
+                let mut transformed = Vec::with_capacity(cap_table.len());
+                for entry in cap_table {
+                    let Some(hook) = entry else {
+                        transformed.push(None);
+                        continue;
+                    };
+                    let client = capnp::capability::Client::new(hook);
+                    let client = app
+                        .unwrap_local_proxy_parameter(client)
+                        .await
+                        .map_err(capnp::Error::failed)?;
+                    transformed.push(Some(client.hook));
+                }
+                Ok(transformed)
+            });
+            fut
+        })
     }
 
     #[cfg(test)]
@@ -54,13 +194,216 @@ impl App {
             imported_remote_api_session: None,
             imported_remote_caps: std::collections::HashMap::new(),
             persisted_received_caps: Vec::new(),
+            local_proxy_caps: Vec::new(),
+            registered_remote_caps: std::collections::HashMap::new(),
+            registered_remote_hook_object_ids: std::collections::HashMap::new(),
+            local_proxy_hook_object_ids: std::collections::HashMap::new(),
             next_peer_rpc_session_id: 0,
             next_imported_remote_cap_id: 0,
+            next_local_proxy_cap_id: 0,
+            next_registered_remote_cap_id: 0,
             peer_rpc_error: None,
             active_tcp_sessions: std::collections::HashMap::new(),
             next_tcp_session_id: 0,
         }));
         Self::new(state, storage)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_test_loaded(
+        storage: Storage,
+        secret_key: crate::SecretKey,
+    ) -> Result<Self, String> {
+        let remote_ticket = storage.load_text_file(storage.remote_ticket_path().as_path())?;
+        let approved_peer_node_id =
+            storage.load_text_file(storage.approved_peer_node_id_path().as_path())?;
+        let tunnel_enabled = match storage.load_text_file(storage.tunnel_enabled_path().as_path())? {
+            Some(value) => value.trim() != "false",
+            None => true,
+        };
+        let shared_caps = storage
+            .load_shared_capabilities()?
+            .into_iter()
+            .map(|record| crate::SharedCapability {
+                id: record.id,
+                label: record.label.clone(),
+                kind: record.kind,
+                enabled: record.enabled,
+                created_at_ms: record.created_at_ms,
+                saved_cap: crate::SavedCapability {
+                    id: record.saved_cap_id,
+                    label: record.label,
+                    saved_token: String::new(),
+                    created_at_ms: record.created_at_ms,
+                    descriptor_json: record.descriptor_json,
+                },
+            })
+            .collect::<Vec<_>>();
+        let mut local_proxy_records = storage.load_local_proxy_capabilities()?;
+        if local_proxy_records
+            .iter()
+            .any(|record| matches!(record.target_kind, crate::LocalProxyTargetKind::RemoteObjectId))
+        {
+            local_proxy_records.retain(|record| {
+                matches!(record.target_kind, crate::LocalProxyTargetKind::ExportId)
+            });
+            storage.persist_local_proxy_capability_registry(&local_proxy_records)?;
+        }
+        let local_proxy_caps = local_proxy_records
+            .into_iter()
+            .map(|record| crate::LocalProxyCapability {
+                object_id: record.object_id,
+                peer_node_id: record.peer_node_id,
+                target_kind: match record.target_kind {
+                    crate::LocalProxyTargetKind::ExportId => {
+                        crate::LocalProxyTargetKindRuntime::ExportId
+                    }
+                    crate::LocalProxyTargetKind::RemoteObjectId => {
+                        crate::LocalProxyTargetKindRuntime::RemoteObjectId
+                    }
+                },
+                target_id: record.target_id,
+                label: record.label,
+                kind: record.kind,
+                type_tag: record.type_tag.unwrap_or_else(|| "capnp/unknown".to_string()),
+                descriptor_json: record.descriptor_json,
+                created_at_ms: record.created_at_ms,
+            })
+            .collect::<Vec<_>>();
+        let persisted_received_caps = storage
+            .load_persisted_received_capabilities()?
+            .into_iter()
+            .map(|record| crate::PersistedReceivedCapability {
+                object_id: record.object_id,
+                export_id: record.export_id,
+                label: record.label,
+                kind: match record.kind {
+                    crate::ReceivedCapabilityKind::IpNetwork => {
+                        crate::ImportedRemoteCapabilityKind::IpNetwork
+                    }
+                    crate::ReceivedCapabilityKind::ApiSession => {
+                        crate::ImportedRemoteCapabilityKind::ApiSession
+                    }
+                    crate::ReceivedCapabilityKind::Other => {
+                        crate::ImportedRemoteCapabilityKind::Other
+                    }
+                },
+                type_tag: record
+                    .type_tag
+                    .unwrap_or_else(|| "capnp/unknown".to_string()),
+                descriptor_json: record.descriptor_json,
+                enabled: record.enabled,
+            })
+            .collect::<Vec<_>>();
+        let registered_remote_caps = storage
+            .load_registered_remote_capabilities()?
+            .into_iter()
+            .map(|record| {
+                let kind = match record.kind {
+                    crate::ReceivedCapabilityKind::IpNetwork => {
+                        crate::ImportedRemoteCapabilityKind::IpNetwork
+                    }
+                    crate::ReceivedCapabilityKind::ApiSession => {
+                        crate::ImportedRemoteCapabilityKind::ApiSession
+                    }
+                    crate::ReceivedCapabilityKind::Other => {
+                        crate::ImportedRemoteCapabilityKind::Other
+                    }
+                };
+                (
+                    record.remote_object_id.clone(),
+                    crate::RegisteredRemoteCapability {
+                        remote_object_id: record.remote_object_id,
+                        label: record.label,
+                        kind,
+                        type_tag: record
+                            .type_tag
+                            .unwrap_or_else(|| "capnp/unknown".to_string()),
+                        descriptor_json: record.descriptor_json,
+                        durability: record.durability,
+                        saved_token: record.saved_token,
+                        created_at_ms: record.created_at_ms,
+                        client: None,
+                    },
+                )
+            })
+            .collect::<std::collections::HashMap<_, _>>();
+        let next_local_proxy_cap_id = local_proxy_caps
+            .iter()
+            .filter_map(|record| {
+                record
+                    .object_id
+                    .strip_prefix("local-proxy-cap-")
+                    .and_then(|value| value.parse::<u64>().ok())
+            })
+            .max()
+            .unwrap_or(0);
+        let next_imported_remote_cap_id = persisted_received_caps
+            .iter()
+            .filter_map(|record| {
+                record
+                    .object_id
+                    .strip_prefix("remote-cap-")
+                    .and_then(|value| value.parse::<u64>().ok())
+            })
+            .max()
+            .unwrap_or(0);
+        let next_registered_remote_cap_id = registered_remote_caps
+            .keys()
+            .filter_map(|record| {
+                record
+                    .strip_prefix("remote-registered-cap-")
+                    .and_then(|value| value.parse::<u64>().ok())
+            })
+            .max()
+            .unwrap_or(0);
+
+        let state = Arc::new(Mutex::new(crate::AppState {
+            storage: storage.clone(),
+            iroh_identity: crate::IrohIdentity {
+                node_id: secret_key.public().to_string(),
+                secret_key,
+            },
+            iroh_endpoint: None,
+            iroh_endpoint_addr: crate::IrohEndpointAddrSummary::empty(),
+            iroh_endpoint_error: None,
+            raw_udp_interface: None,
+            raw_udp_interface_source: None,
+            remote_ticket,
+            approved_peer_node_id,
+            pending_incoming_peer_node_id: None,
+            pending_outgoing_peer_node_id: None,
+            pending_incoming_connection: None,
+            tunnel_enabled,
+            pairing_status: if tunnel_enabled {
+                crate::PairingStatus::Disconnected
+            } else {
+                crate::PairingStatus::Disabled
+            },
+            shared_caps,
+            exported_ip_network: None,
+            exported_api_session: None,
+            exported_caps_live: std::collections::HashMap::new(),
+            exported_ip_network_live: std::collections::HashMap::new(),
+            exported_api_session_live: std::collections::HashMap::new(),
+            peer_rpc_session: None,
+            imported_remote_ip_network: None,
+            imported_remote_api_session: None,
+            imported_remote_caps: std::collections::HashMap::new(),
+            persisted_received_caps,
+            local_proxy_caps,
+            registered_remote_caps,
+            registered_remote_hook_object_ids: std::collections::HashMap::new(),
+            local_proxy_hook_object_ids: std::collections::HashMap::new(),
+            next_peer_rpc_session_id: 0,
+            next_imported_remote_cap_id,
+            next_local_proxy_cap_id,
+            next_registered_remote_cap_id,
+            peer_rpc_error: None,
+            active_tcp_sessions: std::collections::HashMap::new(),
+            next_tcp_session_id: 0,
+        }));
+        Ok(Self::new(state, storage))
     }
 
     #[cfg(test)]
@@ -128,12 +471,15 @@ impl App {
 
     #[cfg(test)]
     pub(crate) fn set_remote_ticket_for_test(&self, remote_ticket: String) -> Result<(), String> {
-        let mut guard = self
-            .state
-            .lock()
-            .map_err(|_| "app state lock poisoned".to_string())?;
-        guard.remote_ticket = Some(remote_ticket);
-        Ok(())
+        {
+            let mut guard = self
+                .state
+                .lock()
+                .map_err(|_| "app state lock poisoned".to_string())?;
+            guard.remote_ticket = Some(remote_ticket.clone());
+        }
+        self.storage
+            .persist_text_file(self.storage.remote_ticket_path().as_path(), &remote_ticket)
     }
 
     fn persist_approved_peer_node_id(&self, value: Option<&str>) -> Result<(), String> {
@@ -220,6 +566,39 @@ impl App {
             saved_cap.id.clone(),
             crate::ExportedApiSessionState { client },
         );
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn seed_exported_generic_capability_for_test(
+        &self,
+        export_id: &str,
+        label: &str,
+        _type_tag: &str,
+        client: capnp::capability::Client,
+    ) -> Result<(), String> {
+        let saved_cap = crate::SavedCapability {
+            id: export_id.to_string(),
+            label: label.to_string(),
+            saved_token: String::new(),
+            created_at_ms: crate::now_ms(),
+            descriptor_json: None,
+        };
+        let mut guard = self
+            .state
+            .lock()
+            .map_err(|_| "app state lock poisoned".to_string())?;
+        guard.shared_caps.push(crate::SharedCapability {
+            id: crate::make_shared_cap_id(),
+            label: saved_cap.label.clone(),
+            kind: SharedCapabilityKind::Other,
+            enabled: true,
+            created_at_ms: saved_cap.created_at_ms,
+            saved_cap: saved_cap.clone(),
+        });
+        guard
+            .exported_caps_live
+            .insert(saved_cap.id.clone(), client);
         Ok(())
     }
 
@@ -341,6 +720,9 @@ impl App {
         sandstorm_api: crate::grain_capnp::sandstorm_api::Client<capnp::any_pointer::Owned>,
         object_id: &str,
     ) -> Result<capnp::capability::Client, String> {
+        if object_id == LOCAL_TEST_API_SESSION_OBJECT_ID {
+            return self.build_local_test_api_session_client();
+        }
         let imported_remote_cap = {
             let guard = self
                 .state
@@ -350,6 +732,20 @@ impl App {
         };
         if let Some(imported_remote_cap) = imported_remote_cap {
             return Ok(imported_remote_cap.client);
+        }
+        let local_proxy_cap = {
+            let guard = self
+                .state
+                .lock()
+                .map_err(|_| "app state lock poisoned".to_string())?;
+            guard
+                .local_proxy_caps
+                .iter()
+                .find(|record| record.object_id == object_id)
+                .cloned()
+        };
+        if let Some(record) = local_proxy_cap {
+            return self.build_local_proxy_client(record.object_id);
         }
         {
             let guard = self
@@ -376,6 +772,392 @@ impl App {
         SandstormBackend::new(sandstorm_api)
             .restore_capability(&token)
             .await
+    }
+
+    fn build_local_proxy_client(
+        &self,
+        object_id: String,
+    ) -> Result<capnp::capability::Client, String> {
+        let backend_client = crate::untyped_local::new_client_with_transforms(
+            LocalProxyCapabilityServer::new(self.clone(), object_id.clone()),
+            Some(self.local_proxy_request_transform()),
+            Some(self.local_proxy_response_transform(object_id.clone())),
+        );
+        let client = new_client::<TypelessHostedClient, _>(HostedLocalProxyCapabilityServer::new(
+            self.clone(),
+            object_id.clone(),
+            backend_client,
+        ))
+        .0;
+        let hook_ptr = client.hook.get_ptr();
+        let mut guard = self
+            .state
+            .lock()
+            .map_err(|_| "app state lock poisoned".to_string())?;
+        guard.local_proxy_hook_object_ids.insert(hook_ptr, object_id);
+        Ok(client)
+    }
+
+    fn build_local_test_api_session_client(&self) -> Result<capnp::capability::Client, String> {
+        let backend_client =
+            new_client::<crate::api_session_capnp::api_session::Client, _>(LocalTestApiSessionBackend)
+                .client;
+        Ok(new_client::<TypelessHostedClient, _>(HostedStaticCapabilityServer::new(
+            LOCAL_TEST_API_SESSION_OBJECT_ID.to_string(),
+            LOCAL_TEST_API_SESSION_LABEL.to_string(),
+            backend_client,
+        ))
+        .0)
+    }
+
+    fn build_ephemeral_hosted_capability_client(
+        &self,
+        label: &str,
+        backend_client: capnp::capability::Client,
+    ) -> Result<capnp::capability::Client, String> {
+        let object_id = {
+            let mut guard = self
+                .state
+                .lock()
+                .map_err(|_| "app state lock poisoned".to_string())?;
+            guard.next_local_proxy_cap_id += 1;
+            format!("ephemeral-hosted-cap-{}", guard.next_local_proxy_cap_id)
+        };
+        let transformed_backend = crate::untyped_local::new_client_with_transforms(
+            ForwardingCapabilityServer::new(backend_client),
+            Some(self.local_proxy_request_transform()),
+            None,
+        );
+        Ok(new_client::<TypelessHostedClient, _>(HostedStaticCapabilityServer::new(
+            object_id,
+            label.to_string(),
+            transformed_backend,
+        ))
+        .0)
+    }
+
+    pub(crate) async fn resolve_local_proxy_target_remote_capability(
+        &self,
+        object_id: &str,
+    ) -> Result<capnp::capability::Client, String> {
+        let record = {
+            let guard = self
+                .state
+                .lock()
+                .map_err(|_| "app state lock poisoned".to_string())?;
+            guard
+                .local_proxy_caps
+                .iter()
+                .find(|record| record.object_id == object_id)
+                .cloned()
+                .ok_or_else(|| format!("unknown local proxy object id: {object_id}"))?
+        };
+        let remote_bootstrap = {
+            let guard = self
+                .state
+                .lock()
+                .map_err(|_| "app state lock poisoned".to_string())?;
+            let session = guard
+                .peer_rpc_session
+                .as_ref()
+                .ok_or_else(|| {
+                    format!(
+                        "local proxy object {} is known but the tunnel is not currently connected; reconnect the peer session to restore it",
+                        record.object_id
+                    )
+                })?;
+            if session.remote_node_id != record.peer_node_id {
+                return Err(format!(
+                    "local proxy object {} targets peer {} but the current peer session is {}",
+                    record.object_id, record.peer_node_id, session.remote_node_id
+                ));
+            }
+            session.remote_bootstrap.clone()
+        };
+        let (_label, _kind, _type_tag, _descriptor_json, client) = match record.target_kind {
+            crate::LocalProxyTargetKindRuntime::ExportId => {
+                crate::fetch_remote_capability_export(remote_bootstrap, &record.target_id).await?
+            }
+            crate::LocalProxyTargetKindRuntime::RemoteObjectId => {
+                crate::fetch_remote_registered_capability(remote_bootstrap, &record.target_id)
+                    .await?
+            }
+        };
+        Ok(client)
+    }
+
+    pub(crate) async fn create_local_proxy_for_remote_export(
+        &self,
+        export_id: &str,
+    ) -> Result<(String, String), String> {
+        let (remote_bootstrap, remote_node_id, export_metadata) = {
+            let guard = self
+                .state
+                .lock()
+                .map_err(|_| "app state lock poisoned".to_string())?;
+            let session = guard
+                .peer_rpc_session
+                .as_ref()
+                .ok_or_else(|| "peer rpc session is not connected".to_string())?;
+            let export = session
+                .capability_exports
+                .iter()
+                .find(|row| row.id == export_id)
+                .cloned()
+                .ok_or_else(|| format!("unknown remote export id: {export_id}"))?;
+            (
+                session.remote_bootstrap.clone(),
+                session.remote_node_id.clone(),
+                export,
+            )
+        };
+
+        let (_label, fetched_kind, fetched_type_tag, fetched_descriptor_json, _client) =
+            crate::fetch_remote_capability_export(remote_bootstrap, export_id).await?;
+
+        self.create_local_proxy_record(
+            remote_node_id,
+            crate::LocalProxyTargetKindRuntime::ExportId,
+            export_id.to_string(),
+            export_metadata.label.clone(),
+            fetched_kind,
+            if fetched_type_tag.is_empty() {
+                export_metadata.type_tag.clone()
+            } else {
+                fetched_type_tag
+            },
+            fetched_descriptor_json.or(export_metadata.descriptor_json.clone()),
+        )
+    }
+
+    pub(crate) async fn create_local_proxy_for_received_object(
+        &self,
+        object_id: &str,
+    ) -> Result<(String, String), String> {
+        let (remote_node_id, export_id, label, kind, type_tag, descriptor_json) = {
+            let guard = self
+                .state
+                .lock()
+                .map_err(|_| "app state lock poisoned".to_string())?;
+            let session = guard
+                .peer_rpc_session
+                .as_ref()
+                .ok_or_else(|| "peer rpc session is not connected".to_string())?;
+
+            if let Some(cap) = guard.imported_remote_caps.get(object_id) {
+                (
+                    session.remote_node_id.clone(),
+                    cap.export_id.clone(),
+                    cap.label.clone(),
+                    cap.kind,
+                    cap.type_tag.clone(),
+                    cap.descriptor_json.clone(),
+                )
+            } else if let Some(record) = guard
+                .persisted_received_caps
+                .iter()
+                .find(|record| record.object_id == object_id)
+            {
+                (
+                    session.remote_node_id.clone(),
+                    record.export_id.clone(),
+                    record.label.clone(),
+                    record.kind,
+                    record.type_tag.clone(),
+                    record.descriptor_json.clone(),
+                )
+            } else {
+                return Err(format!("object {} is not a received remote capability", object_id));
+            }
+        };
+
+        self.create_local_proxy_record(
+            remote_node_id,
+            crate::LocalProxyTargetKindRuntime::ExportId,
+            export_id,
+            label,
+            kind,
+            type_tag,
+            descriptor_json,
+        )
+    }
+
+    pub(crate) async fn create_local_proxy_for_registered_remote_object(
+        &self,
+        remote_object_id: &str,
+    ) -> Result<(String, String), String> {
+        let (remote_bootstrap, remote_node_id) = {
+            let guard = self
+                .state
+                .lock()
+                .map_err(|_| "app state lock poisoned".to_string())?;
+            let session = guard
+                .peer_rpc_session
+                .as_ref()
+                .ok_or_else(|| "peer rpc session is not connected".to_string())?;
+            (session.remote_bootstrap.clone(), session.remote_node_id.clone())
+        };
+        let (label, fetched_kind, fetched_type_tag, fetched_descriptor_json, _client) =
+            crate::fetch_remote_registered_capability(remote_bootstrap, remote_object_id).await?;
+        self.create_local_proxy_record(
+            remote_node_id,
+            crate::LocalProxyTargetKindRuntime::RemoteObjectId,
+            remote_object_id.to_string(),
+            label,
+            fetched_kind,
+            fetched_type_tag,
+            fetched_descriptor_json,
+        )
+    }
+
+    pub(crate) async fn localize_remote_capability_for_local_proxy_target(
+        &self,
+        local_proxy_object_id: &str,
+        client: capnp::capability::Client,
+    ) -> Result<capnp::capability::Client, String> {
+        let (remote_bootstrap, _remote_node_id) = {
+            let guard = self
+                .state
+                .lock()
+                .map_err(|_| "app state lock poisoned".to_string())?;
+            let record = guard
+                .local_proxy_caps
+                .iter()
+                .find(|record| record.object_id == local_proxy_object_id)
+                .ok_or_else(|| {
+                    format!("unknown local proxy object id: {local_proxy_object_id}")
+                })?;
+            let session = guard.peer_rpc_session.as_ref().ok_or_else(|| {
+                format!(
+                    "local proxy object {} is known but the tunnel is not currently connected; reconnect the peer session to restore it",
+                    record.object_id
+                )
+            })?;
+            if session.remote_node_id != record.peer_node_id {
+                return Err(format!(
+                    "local proxy object {} targets peer {} but the current peer session is {}",
+                    record.object_id, record.peer_node_id, session.remote_node_id
+                ));
+            }
+            (session.remote_bootstrap.clone(), session.remote_node_id.clone())
+        };
+
+        let remote_object_id = crate::register_remote_capability(
+            remote_bootstrap,
+            client,
+            "Remote capability",
+            crate::ImportedRemoteCapabilityKind::Other,
+            "capnp/unknown",
+            None,
+        )
+        .await?;
+        let (_, object_id) = self
+            .create_local_proxy_for_registered_remote_object(&remote_object_id)
+            .await?;
+        self.build_local_proxy_client(object_id)
+    }
+
+    pub(crate) async fn unwrap_local_proxy_parameter(
+        &self,
+        client: capnp::capability::Client,
+    ) -> Result<capnp::capability::Client, String> {
+        let maybe_object_id = {
+            let guard = self
+                .state
+                .lock()
+                .map_err(|_| "app state lock poisoned".to_string())?;
+            guard
+                .local_proxy_hook_object_ids
+                .get(&client.hook.get_ptr())
+                .cloned()
+        };
+        match maybe_object_id {
+            Some(object_id) => self.resolve_local_proxy_target_remote_capability(&object_id).await,
+            None => {
+                let remote_bootstrap = {
+                    let guard = self
+                        .state
+                        .lock()
+                        .map_err(|_| "app state lock poisoned".to_string())?;
+                    guard
+                        .peer_rpc_session
+                        .as_ref()
+                        .ok_or_else(|| "peer rpc session is not connected".to_string())?
+                        .remote_bootstrap
+                        .clone()
+                };
+                let hosted_client =
+                    self.build_ephemeral_hosted_capability_client("Forwarded capability", client)?;
+                let remote_object_id = crate::register_local_ephemeral_capability(
+                    &self.state,
+                    hosted_client,
+                    "Forwarded capability",
+                    crate::ImportedRemoteCapabilityKind::Other,
+                    "capnp/unknown",
+                    None,
+                )?;
+                let (_label, _kind, _type_tag, _descriptor_json, localized_client) =
+                    crate::fetch_remote_local_proxy_for_peer_registered_capability(
+                        remote_bootstrap,
+                        &remote_object_id,
+                    )
+                    .await?;
+                Ok(localized_client)
+            }
+        }
+    }
+
+    fn create_local_proxy_record(
+        &self,
+        remote_node_id: String,
+        target_kind: crate::LocalProxyTargetKindRuntime,
+        target_id: String,
+        label: String,
+        fetched_kind: crate::ImportedRemoteCapabilityKind,
+        type_tag: String,
+        descriptor_json: Option<String>,
+    ) -> Result<(String, String), String> {
+        let (record, persisted_records) = {
+            let mut guard = self
+                .state
+                .lock()
+                .map_err(|_| "app state lock poisoned".to_string())?;
+            if let Some(existing) = guard
+                .local_proxy_caps
+                .iter()
+                .find(|record| record.peer_node_id == remote_node_id
+                    && record.target_kind == target_kind
+                    && record.target_id == target_id)
+                .cloned()
+            {
+                return Ok((existing.label, existing.object_id));
+            }
+
+            guard.next_local_proxy_cap_id += 1;
+            let object_id = format!("local-proxy-cap-{}", guard.next_local_proxy_cap_id);
+            let now = crate::now_ms();
+            let kind = match fetched_kind {
+                crate::ImportedRemoteCapabilityKind::IpNetwork => crate::SharedCapabilityKind::IpNetwork,
+                crate::ImportedRemoteCapabilityKind::ApiSession => crate::SharedCapabilityKind::ApiSession,
+                crate::ImportedRemoteCapabilityKind::Other => crate::SharedCapabilityKind::Other,
+            };
+            let record = crate::LocalProxyCapability {
+                object_id,
+                peer_node_id: remote_node_id.clone(),
+                target_kind,
+                target_id,
+                label,
+                kind,
+                type_tag,
+                descriptor_json,
+                created_at_ms: now,
+            };
+            guard.local_proxy_caps.push(record.clone());
+            (record, guard.local_proxy_caps.clone())
+        };
+
+        self.persist_local_proxy_capability_registry(&persisted_records)?;
+        Ok((record.label, record.object_id))
     }
 
     pub(crate) fn drop_received_remote_capability(
@@ -2134,6 +2916,31 @@ impl App {
         })
         .collect::<Vec<_>>()
         .join(",");
+        let local_proxy_caps = guard
+            .local_proxy_caps
+            .iter()
+            .map(|cap| {
+                format!(
+                    "{{\"objectId\":\"{}\",\"peerNodeId\":\"{}\",\"targetKind\":\"{}\",\"targetId\":\"{}\",\"label\":\"{}\",\"kind\":\"{}\",\"typeTag\":\"{}\",\"descriptorJson\":{},\"createdAtMs\":{}}}",
+                    crate::json_escape(&cap.object_id),
+                    crate::json_escape(&cap.peer_node_id),
+                    crate::json_escape(match cap.target_kind {
+                        crate::LocalProxyTargetKindRuntime::ExportId => "exportId",
+                        crate::LocalProxyTargetKindRuntime::RemoteObjectId => "remoteObjectId",
+                    }),
+                    crate::json_escape(&cap.target_id),
+                    crate::json_escape(&cap.label),
+                    crate::json_escape(cap.kind.as_str()),
+                    crate::json_escape(&cap.type_tag),
+                    match &cap.descriptor_json {
+                        Some(value) => format!("\"{}\"", crate::json_escape(value)),
+                        None => "null".to_string(),
+                    },
+                    cap.created_at_ms
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
         let remote_ticket = match &guard.remote_ticket {
             Some(value) => format!("\"{}\"", crate::json_escape(value)),
             None => "null".to_string(),
@@ -2193,7 +3000,7 @@ impl App {
             crate::advertised_powerbox_matches_json_from_b64(&advertised_match_descriptors)?;
 
         Ok(format!(
-            "{{\"powerboxQueries\":{{\"apiSession\":\"{}\",\"ipNetwork\":\"{}\",\"ipInterface\":\"{}\"}},\"powerboxAdvertisedMatches\":{},\"irohNodeId\":\"{}\",\"irohEndpoint\":{{\"bound\":{},\"nodeId\":\"{}\",\"relayUrls\":[{}],\"directAddrs\":[{}],\"customAddrs\":[{}],\"error\":{},\"localTicket\":{},\"rawUdpInterface\":{}}},\"pairing\":{{\"status\":\"{}\",\"approvedPeerNodeId\":{},\"pendingIncomingPeerNodeId\":{},\"pendingOutgoingPeerNodeId\":{},\"tunnelEnabled\":{}}},\"peerRpc\":{},\"peerRpcError\":{},\"exportedIpNetwork\":{},\"exportedApiSession\":{},\"importedRemoteIpNetwork\":{},\"importedRemoteApiSession\":{},\"importedRemoteCaps\":[{}],\"persistedReceivedCaps\":[{}],\"transportAssessment\":\"{}\",\"remoteTicket\":{},\"savedCaps\":[{}],\"sharedCaps\":[{}],\"activeTcpSessions\":[{}]}}",
+            "{{\"powerboxQueries\":{{\"apiSession\":\"{}\",\"ipNetwork\":\"{}\",\"ipInterface\":\"{}\"}},\"powerboxAdvertisedMatches\":{},\"irohNodeId\":\"{}\",\"irohEndpoint\":{{\"bound\":{},\"nodeId\":\"{}\",\"relayUrls\":[{}],\"directAddrs\":[{}],\"customAddrs\":[{}],\"error\":{},\"localTicket\":{},\"rawUdpInterface\":{}}},\"pairing\":{{\"status\":\"{}\",\"approvedPeerNodeId\":{},\"pendingIncomingPeerNodeId\":{},\"pendingOutgoingPeerNodeId\":{},\"tunnelEnabled\":{}}},\"peerRpc\":{},\"peerRpcError\":{},\"exportedIpNetwork\":{},\"exportedApiSession\":{},\"importedRemoteIpNetwork\":{},\"importedRemoteApiSession\":{},\"importedRemoteCaps\":[{}],\"persistedReceivedCaps\":[{}],\"localProxyCaps\":[{}],\"transportAssessment\":\"{}\",\"remoteTicket\":{},\"savedCaps\":[{}],\"sharedCaps\":[{}],\"activeTcpSessions\":[{}]}}",
             crate::json_escape(&crate::powerbox_query_for_interface(
                 crate::api_session_capnp::api_session::Client::TYPE_ID
             )?),
@@ -2226,6 +3033,7 @@ impl App {
             imported_remote_api_session,
             imported_remote_caps,
             persisted_received_caps,
+            local_proxy_caps,
             crate::json_escape(crate::IROH_TRANSPORT_ASSESSMENT),
             remote_ticket,
             rows.join(","),
@@ -2279,6 +3087,32 @@ impl App {
             })
             .collect::<Vec<_>>();
         self.storage.persist_shared_capabilities(&records)
+    }
+
+    fn persist_local_proxy_capability_registry(
+        &self,
+        local_proxy_caps: &[crate::LocalProxyCapability],
+    ) -> Result<(), String> {
+        let records = local_proxy_caps
+            .iter()
+            .map(|cap| LocalProxyCapabilityRecord {
+                object_id: cap.object_id.clone(),
+                peer_node_id: cap.peer_node_id.clone(),
+                target_kind: match cap.target_kind {
+                    crate::LocalProxyTargetKindRuntime::ExportId => LocalProxyTargetKind::ExportId,
+                    crate::LocalProxyTargetKindRuntime::RemoteObjectId => {
+                        LocalProxyTargetKind::RemoteObjectId
+                    }
+                },
+                target_id: cap.target_id.clone(),
+                label: cap.label.clone(),
+                kind: cap.kind,
+                type_tag: Some(cap.type_tag.clone()),
+                descriptor_json: cap.descriptor_json.clone(),
+                created_at_ms: cap.created_at_ms,
+            })
+            .collect::<Vec<_>>();
+        self.storage.persist_local_proxy_capability_registry(&records)
     }
 
     fn allocate_imported_remote_object_id(&self, guard: &mut crate::AppState) -> String {
@@ -2439,5 +3273,363 @@ impl App {
             self.persist_received_capability_registry(&persisted_caps)?;
         }
         Ok(())
+    }
+}
+
+#[derive(Clone)]
+struct LocalProxyCapabilityServer {
+    app: App,
+    object_id: String,
+    identity: std::sync::Arc<()>,
+}
+
+impl LocalProxyCapabilityServer {
+    fn new(app: App, object_id: String) -> Self {
+        Self {
+            app,
+            object_id,
+            identity: std::sync::Arc::new(()),
+        }
+    }
+}
+
+impl CapServer for LocalProxyCapabilityServer {
+    fn dispatch_call(
+        self,
+        interface_id: u64,
+        method_id: u16,
+        params: capnp::capability::Params<capnp::any_pointer::Owned>,
+        mut results: capnp::capability::Results<capnp::any_pointer::Owned>,
+    ) -> DispatchCallResult {
+        let app = self.app.clone();
+        let object_id = self.object_id.clone();
+        DispatchCallResult::new(
+            CapPromise::from_future(async move {
+                let remote_client = app
+                    .resolve_local_proxy_target_remote_capability(&object_id)
+                    .await
+                    .map_err(capnp::Error::failed)?;
+                let mut request = remote_client
+                    .new_call::<capnp::any_pointer::Owned, capnp::any_pointer::Owned>(
+                        interface_id,
+                        method_id,
+                        None,
+                    );
+                request
+                    .get()
+                    .set_as(params.get().map_err(|err| err)?)?;
+                let response = request.send().promise.await?;
+                results.get().set_as(response.get()?)?;
+                Ok(())
+            }),
+            false,
+        )
+    }
+
+    fn as_ptr(&self) -> usize {
+        std::sync::Arc::as_ptr(&self.identity) as usize
+    }
+}
+
+#[derive(Clone)]
+struct HostedLocalProxyCapabilityServer {
+    app: App,
+    object_id: String,
+    backend_client: capnp::capability::Client,
+    identity: std::sync::Arc<()>,
+}
+
+impl HostedLocalProxyCapabilityServer {
+    fn new(app: App, object_id: String, backend_client: capnp::capability::Client) -> Self {
+        Self {
+            app,
+            object_id,
+            backend_client,
+            identity: std::sync::Arc::new(()),
+        }
+    }
+}
+
+impl CapServer for HostedLocalProxyCapabilityServer {
+    fn dispatch_call(
+        self,
+        interface_id: u64,
+        method_id: u16,
+        params: capnp::capability::Params<capnp::any_pointer::Owned>,
+        mut results: capnp::capability::Results<capnp::any_pointer::Owned>,
+    ) -> DispatchCallResult {
+        if interface_id
+            == crate::grain_capnp::app_persistent::Client::<capnp::text::Owned>::TYPE_ID
+        {
+            let object_id = self.object_id.clone();
+            let app = self.app.clone();
+            return DispatchCallResult::new(
+                CapPromise::from_future(async move {
+                    match method_id {
+                        0 => {
+                            let label = app
+                                .state
+                                .lock()
+                                .map_err(|_| {
+                                    capnp::Error::failed("app state lock poisoned".to_string())
+                                })?
+                                .local_proxy_caps
+                                .iter()
+                                .find(|record| record.object_id == object_id)
+                                .map(|record| record.label.clone())
+                                .ok_or_else(|| {
+                                    capnp::Error::failed("unknown local proxy object".to_string())
+                                })?;
+                            let mut save_results =
+                                crate::grain_capnp::app_persistent::SaveResults::<
+                                    capnp::text::Owned,
+                                >::new(results.hook);
+                            let mut builder = save_results.get();
+                            builder.set_object_id(&object_id).map_err(|err| {
+                                capnp::Error::failed(format!(
+                                    "failed to set proxy object id: {err}"
+                                ))
+                            })?;
+                            let mut localized = builder.init_label();
+                            localized.set_default_text(&label);
+                            localized.init_localizations(0);
+                            Ok(())
+                        }
+                        _ => {
+                            Err(capnp::Error::unimplemented(
+                                "unknown app persistent method".to_string(),
+                            ))
+                        }
+                    }
+                }),
+                false,
+            );
+        }
+
+        let backend_client = self.backend_client.clone();
+        let object_id = self.object_id.clone();
+        DispatchCallResult::new(
+            CapPromise::from_future(async move {
+                let mut request = backend_client
+                    .new_call::<capnp::any_pointer::Owned, capnp::any_pointer::Owned>(
+                        interface_id,
+                        method_id,
+                        None,
+                    );
+                request.get().set_as(params.get().map_err(|err| err)?)?;
+                let response = request.send().promise.await.map_err(|err| {
+                    eprintln!(
+                        "hosted_local_proxy.forward: object_id={object_id} interface_id=0x{interface_id:016x} method_id={} failed at_ms={} err={err}",
+                        method_id,
+                        crate::now_ms()
+                    );
+                    err
+                })?;
+                results.get().set_as(response.get()?)?;
+                Ok(())
+            }),
+            false,
+        )
+    }
+
+    fn as_ptr(&self) -> usize {
+        std::sync::Arc::as_ptr(&self.identity) as usize
+    }
+}
+
+#[derive(Clone)]
+struct HostedStaticCapabilityServer {
+    object_id: String,
+    label: String,
+    backend_client: capnp::capability::Client,
+    identity: std::sync::Arc<()>,
+}
+
+#[derive(Clone)]
+struct ForwardingCapabilityServer {
+    backend_client: capnp::capability::Client,
+    identity: std::sync::Arc<()>,
+}
+
+impl ForwardingCapabilityServer {
+    fn new(backend_client: capnp::capability::Client) -> Self {
+        Self {
+            backend_client,
+            identity: std::sync::Arc::new(()),
+        }
+    }
+}
+
+impl CapServer for ForwardingCapabilityServer {
+    fn dispatch_call(
+        self,
+        interface_id: u64,
+        method_id: u16,
+        params: capnp::capability::Params<capnp::any_pointer::Owned>,
+        mut results: capnp::capability::Results<capnp::any_pointer::Owned>,
+    ) -> DispatchCallResult {
+        let backend_client = self.backend_client.clone();
+        DispatchCallResult::new(
+            CapPromise::from_future(async move {
+                eprintln!(
+                    "forwarding_capability.dispatch: interface_id=0x{interface_id:016x} method_id={} at_ms={}",
+                    method_id,
+                    crate::now_ms()
+                );
+                let mut request = backend_client
+                    .new_call::<capnp::any_pointer::Owned, capnp::any_pointer::Owned>(
+                        interface_id,
+                        method_id,
+                        None,
+                    );
+                request.get().set_as(params.get().map_err(|err| err)?)?;
+                let response = request.send().promise.await.map_err(|err| {
+                    eprintln!(
+                        "forwarding_capability.dispatch: interface_id=0x{interface_id:016x} method_id={} failed at_ms={} err={err}",
+                        method_id,
+                        crate::now_ms()
+                    );
+                    err
+                })?;
+                results.get().set_as(response.get()?)?;
+                eprintln!(
+                    "forwarding_capability.dispatch: interface_id=0x{interface_id:016x} method_id={} ok at_ms={}",
+                    method_id,
+                    crate::now_ms()
+                );
+                Ok(())
+            }),
+            false,
+        )
+    }
+
+    fn as_ptr(&self) -> usize {
+        std::sync::Arc::as_ptr(&self.identity) as usize
+    }
+}
+
+impl HostedStaticCapabilityServer {
+    fn new(object_id: String, label: String, backend_client: capnp::capability::Client) -> Self {
+        Self {
+            object_id,
+            label,
+            backend_client,
+            identity: std::sync::Arc::new(()),
+        }
+    }
+}
+
+impl CapServer for HostedStaticCapabilityServer {
+    fn dispatch_call(
+        self,
+        interface_id: u64,
+        method_id: u16,
+        params: capnp::capability::Params<capnp::any_pointer::Owned>,
+        mut results: capnp::capability::Results<capnp::any_pointer::Owned>,
+    ) -> DispatchCallResult {
+        if interface_id
+            == crate::grain_capnp::app_persistent::Client::<capnp::text::Owned>::TYPE_ID
+        {
+            let object_id = self.object_id.clone();
+            let label = self.label.clone();
+            return DispatchCallResult::new(
+                CapPromise::from_future(async move {
+                    match method_id {
+                        0 => {
+                            let mut save_results =
+                                crate::grain_capnp::app_persistent::SaveResults::<
+                                    capnp::text::Owned,
+                                >::new(results.hook);
+                            let mut builder = save_results.get();
+                            builder.set_object_id(&object_id).map_err(|err| {
+                                capnp::Error::failed(format!(
+                                    "failed to set static object id: {err}"
+                                ))
+                            })?;
+                            let mut localized = builder.init_label();
+                            localized.set_default_text(&label);
+                            localized.init_localizations(0);
+                            Ok(())
+                        }
+                        _ => Err(capnp::Error::unimplemented(
+                            "unknown app persistent method".to_string(),
+                        )),
+                    }
+                }),
+                false,
+            );
+        }
+
+        let backend_client = self.backend_client.clone();
+        let object_id = self.object_id.clone();
+        DispatchCallResult::new(
+            CapPromise::from_future(async move {
+                eprintln!(
+                    "hosted_static.dispatch: object_id={} interface_id=0x{interface_id:016x} method_id={} at_ms={}",
+                    object_id,
+                    method_id,
+                    crate::now_ms()
+                );
+                let mut request = backend_client
+                    .new_call::<capnp::any_pointer::Owned, capnp::any_pointer::Owned>(
+                        interface_id,
+                        method_id,
+                        None,
+                    );
+                request.get().set_as(params.get().map_err(|err| err)?)?;
+                let response = request.send().promise.await.map_err(|err| {
+                    eprintln!(
+                        "hosted_static.dispatch: object_id={} interface_id=0x{interface_id:016x} method_id={} failed at_ms={} err={err}",
+                        object_id,
+                        method_id,
+                        crate::now_ms()
+                    );
+                    err
+                })?;
+                results.get().set_as(response.get()?)?;
+                eprintln!(
+                    "hosted_static.dispatch: object_id={} interface_id=0x{interface_id:016x} method_id={} ok at_ms={}",
+                    object_id,
+                    method_id,
+                    crate::now_ms()
+                );
+                Ok(())
+            }),
+            false,
+        )
+    }
+
+    fn as_ptr(&self) -> usize {
+        std::sync::Arc::as_ptr(&self.identity) as usize
+    }
+}
+
+#[derive(Clone)]
+struct LocalTestApiSessionBackend;
+
+impl crate::grain_capnp::ui_session::Server for LocalTestApiSessionBackend {}
+impl crate::api_session_capnp::api_session::Server for LocalTestApiSessionBackend {}
+
+impl crate::web_session_capnp::web_session::Server for LocalTestApiSessionBackend {
+    fn post(
+        self: Rc<Self>,
+        params: crate::web_session_capnp::web_session::PostParams,
+        mut results: crate::web_session_capnp::web_session::PostResults,
+    ) -> CapPromise<(), capnp::Error> {
+        let params = pry!(params.get());
+        let path = pry!(params.get_path()).to_str().unwrap_or("").to_string();
+        if path != "preview" {
+            return CapPromise::err(capnp::Error::failed(format!(
+                "unexpected preview path: {path}"
+            )));
+        }
+
+        let mut content = results.get().init_content();
+        content.set_status_code(
+            crate::web_session_capnp::web_session::response::SuccessCode::Ok,
+        );
+        content.set_mime_type("application/pdf");
+        content.init_body().set_bytes(b"%PDF-LOCAL-TEST\n");
+        CapPromise::ok(())
     }
 }

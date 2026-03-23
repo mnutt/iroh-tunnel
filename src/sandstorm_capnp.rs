@@ -69,3 +69,6 @@ pub mod sandstorm_http_bridge_capnp {
 pub mod tunnel_capnp {
     include!(concat!(env!("OUT_DIR"), "/tunnel_capnp.rs"));
 }
+pub mod generic_proxy_test_capnp {
+    include!(concat!(env!("OUT_DIR"), "/generic_proxy_test_capnp.rs"));
+}

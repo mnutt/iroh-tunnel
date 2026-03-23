@@ -619,7 +619,44 @@ function renderReceivedCapabilities(context, data) {
 
   if (isPowerboxRequestSession) {
     const savedCaps = data.savedCaps || [];
+    const localProvideCaps =
+      (data.powerboxRequestSession && data.powerboxRequestSession.localProvideCaps) || [];
     const itemsRendered = { count: 0 };
+
+    for (const entry of localProvideCaps) {
+      const item = document.createElement("li");
+      item.className = "cap-card";
+
+      const meta = document.createElement("div");
+      meta.className = "cap-meta";
+      const strong = document.createElement("strong");
+      strong.textContent = entry.label;
+      meta.appendChild(strong);
+      appendInlineText(meta, "Provided directly by this grain");
+      appendInlineText(meta, formatCapabilityType(entry.kind, entry.typeTag));
+      item.appendChild(meta);
+
+      const actions = document.createElement("div");
+      actions.className = "cap-actions";
+      actions.appendChild(createButton("Provide", "secondary", async () => {
+        setStatus(`Providing ${entry.label} to requesting app...`);
+        const response = await fetch("api/powerbox/fulfill-object", {
+          method: "PUT",
+          headers: { "Content-Type": "text/plain" },
+          body: entry.objectId,
+        });
+        if (!response.ok) {
+          const body = await response.text();
+          setStatus(responseTextToStatus("Powerbox fulfill failed", response, body));
+          await refreshState();
+          return;
+        }
+        setStatus(`Provided ${entry.label} to requesting app.`);
+      }));
+      item.appendChild(actions);
+      receivedCapsEl.appendChild(item);
+      itemsRendered.count += 1;
+    }
 
     for (const entry of savedCaps) {
       const item = document.createElement("li");

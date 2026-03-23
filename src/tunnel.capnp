@@ -35,6 +35,14 @@ struct CapabilityExport {
   descriptorJson @4 :Text;
 }
 
+struct CapabilityRegistration {
+  cap @0 :Capability;
+  label @1 :Text;
+  kind @2 :CapabilityKind;
+  typeTag @3 :Text;
+  descriptorJson @4 :Text;
+}
+
 enum PairDecision {
   accepted @0;
   rejected @1;
@@ -63,4 +71,7 @@ interface PeerBootstrap {
   getApiSessionExport @3 (id :Text) -> (cap :ApiSession.ApiSession, label :Text);
   listCapabilityExports @4 () -> (exports :List(ExportedCapability));
   getCapabilityExport @5 (id :Text) -> CapabilityExport;
+  registerCapability @6 CapabilityRegistration -> (remoteObjectId :Text);
+  getRegisteredCapability @7 (remoteObjectId :Text) -> CapabilityExport;
+  getLocalProxyForPeerRegisteredCapability @8 (remoteObjectId :Text) -> CapabilityExport;
 }
