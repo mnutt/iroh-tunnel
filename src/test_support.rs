@@ -19,8 +19,8 @@ where
     runtime.block_on(local_set.run_until(future));
 }
 
-pub(crate) fn dummy_sandstorm_api_client(
-) -> grain_capnp::sandstorm_api::Client<capnp::any_pointer::Owned> {
+pub(crate) fn dummy_sandstorm_api_client()
+-> grain_capnp::sandstorm_api::Client<capnp::any_pointer::Owned> {
     let (_tx, rx) = futures::channel::oneshot::channel();
     capnp_rpc::new_future_client(rx.map_err(|_| {
         capnp::Error::failed("test sandstorm api bootstrap channel canceled".to_string())
@@ -144,7 +144,7 @@ pub(crate) async fn invoke_api_session_client_for_test(
                     .map_err(|err| format!("failed to read response bytes: {err}"))?
                     .to_vec(),
                 web_session_capnp::web_session::response::content::body::Stream(_) => {
-                    return Err("test fake ApiSession unexpectedly returned a stream".to_string())
+                    return Err("test fake ApiSession unexpectedly returned a stream".to_string());
                 }
             };
             Ok(ApiSessionInvokeSummary {
@@ -367,7 +367,7 @@ impl generic_proxy_test_capnp::echo::Server for FakeEcho {
             .to_str()
             .unwrap_or("")
             .to_string();
-        results.get().set_text(&format!("{}{}", self.prefix, text));
+        results.get().set_text(format!("{}{}", self.prefix, text));
         Promise::ok(())
     }
 }
@@ -387,7 +387,12 @@ impl generic_proxy_test_capnp::echo_relay::Server for FakeEchoRelay {
             let mut ping = echo.ping_request();
             ping.get().set_text(&text);
             let response = ping.send().promise.await?;
-            let echoed = response.get()?.get_text()?.to_str().unwrap_or("").to_string();
+            let echoed = response
+                .get()?
+                .get_text()?
+                .to_str()
+                .unwrap_or("")
+                .to_string();
             results.get().set_text(&echoed);
             Ok(())
         })
@@ -433,7 +438,10 @@ impl ip_capnp::ip_remote_host::Server for FakeIpRemoteHost {
         params: ip_capnp::ip_remote_host::GetTcpPortParams,
         mut results: ip_capnp::ip_remote_host::GetTcpPortResults,
     ) -> impl std::future::Future<Output = Result<(), capnp::Error>> + 'static {
-        let port = params.get().map(|params| params.get_port_num()).unwrap_or(0);
+        let port = params
+            .get()
+            .map(|params| params.get_port_num())
+            .unwrap_or(0);
         let tcp_port: ip_capnp::tcp_port::Client = new_client(FakeTcpPort {
             host: self.host.clone(),
             port,
@@ -507,16 +515,13 @@ impl util_capnp::byte_stream::Server for FakeTcpUpstream {
         Promise::from_future(async move {
             let mut write_req = downstream.write_request();
             write_req.get().set_data(&response_bytes);
-            write_req
-                .send()
-                .await
-                .map_err(|err| capnp::Error::failed(format!("fake downstream write failed: {err}")))?;
+            write_req.send().await.map_err(|err| {
+                capnp::Error::failed(format!("fake downstream write failed: {err}"))
+            })?;
             let done_req = downstream.done_request();
-            done_req
-                .send()
-                .promise
-                .await
-                .map_err(|err| capnp::Error::failed(format!("fake downstream done failed: {err}")))?;
+            done_req.send().promise.await.map_err(|err| {
+                capnp::Error::failed(format!("fake downstream done failed: {err}"))
+            })?;
             Ok(())
         })
     }

@@ -109,11 +109,7 @@ impl SandstormUdpSocketBackend for ProxyUdpBackend {
     }
 
     fn try_send_packet(&self, packet: &OwnedUdpPacket) -> io::Result<()> {
-        let mut send = self
-            .inner
-            .send
-            .lock()
-            .map_err(poisoned_lock_to_io_error)?;
+        let mut send = self.inner.send.lock().map_err(poisoned_lock_to_io_error)?;
 
         if send.closed {
             return Err(io::Error::new(
@@ -133,11 +129,7 @@ impl SandstormUdpSocketBackend for ProxyUdpBackend {
     }
 
     fn poll_writable(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        let mut send = self
-            .inner
-            .send
-            .lock()
-            .map_err(poisoned_lock_to_io_error)?;
+        let mut send = self.inner.send.lock().map_err(poisoned_lock_to_io_error)?;
 
         if send.closed {
             return Poll::Ready(Err(io::Error::new(
@@ -172,11 +164,7 @@ impl ProxyUdpDriver {
     pub async fn next_outgoing_packet(&self) -> io::Result<OwnedUdpPacket> {
         loop {
             {
-                let mut send = self
-                    .inner
-                    .send
-                    .lock()
-                    .map_err(poisoned_lock_to_io_error)?;
+                let mut send = self.inner.send.lock().map_err(poisoned_lock_to_io_error)?;
                 if let Some(packet) = send.queue.pop_front() {
                     if let Some(waker) = send.writable_waker.take() {
                         waker.wake();
@@ -196,10 +184,10 @@ impl ProxyUdpDriver {
     }
 
     pub fn receive_packet(&self, packet: OwnedUdpPacket) {
-        if let Ok(receiver) = self.inner.receiver.lock() {
-            if let Some(receiver) = receiver.as_ref() {
-                receiver.receive_packet(packet);
-            }
+        if let Ok(receiver) = self.inner.receiver.lock()
+            && let Some(receiver) = receiver.as_ref()
+        {
+            receiver.receive_packet(packet);
         }
     }
 
@@ -213,10 +201,10 @@ impl ProxyUdpDriver {
 
         self.inner.send_notify.notify_waiters();
 
-        if let Ok(receiver) = self.inner.receiver.lock() {
-            if let Some(receiver) = receiver.as_ref() {
-                receiver.close();
-            }
+        if let Ok(receiver) = self.inner.receiver.lock()
+            && let Some(receiver) = receiver.as_ref()
+        {
+            receiver.close();
         }
     }
 }
@@ -250,9 +238,7 @@ impl SandstormQuinnUdpSocket {
         let local_addr = backend.local_addr()?;
         let capabilities = backend.capabilities();
         let recv = Arc::new(RecvState::default());
-        backend.register_receiver(Arc::new(SandstormReceiver {
-            recv: recv.clone(),
-        }))?;
+        backend.register_receiver(Arc::new(SandstormReceiver { recv: recv.clone() }))?;
         Ok(Self {
             backend,
             recv,
@@ -297,11 +283,7 @@ impl AsyncUdpSocket for SandstormQuinnUdpSocket {
         bufs: &mut [IoSliceMut<'_>],
         meta: &mut [RecvMeta],
     ) -> Poll<io::Result<usize>> {
-        let mut state = self
-            .recv
-            .state
-            .lock()
-            .map_err(poisoned_lock_to_io_error)?;
+        let mut state = self.recv.state.lock().map_err(poisoned_lock_to_io_error)?;
 
         if state.closed && state.queue.is_empty() {
             return Poll::Ready(Err(io::Error::new(
@@ -593,13 +575,15 @@ mod tests {
     fn io_poller_tracks_backend_writability() {
         let backend = Arc::new(MockBackend::new(SocketAddr::from(([127, 0, 0, 1], 4242))));
         backend.writable.store(false, Ordering::SeqCst);
-        let socket = Arc::new(
-            SandstormQuinnUdpSocket::new(backend.clone()).expect("socket should build"),
-        );
+        let socket =
+            Arc::new(SandstormQuinnUdpSocket::new(backend.clone()).expect("socket should build"));
         let mut poller = socket.create_io_poller();
         let mut cx = test_context();
 
-        assert!(matches!(poller.as_mut().poll_writable(&mut cx), Poll::Pending));
+        assert!(matches!(
+            poller.as_mut().poll_writable(&mut cx),
+            Poll::Pending
+        ));
 
         backend.writable.store(true, Ordering::SeqCst);
 

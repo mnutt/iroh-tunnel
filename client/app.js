@@ -7,8 +7,6 @@ import {
   disconnectTunnel,
   enableTunnel,
   forgetConnection,
-  importRemoteCapability,
-  probeTicket,
   requestPowerboxCapability,
   rejectTunnel,
 } from "./actions.js";
@@ -17,14 +15,10 @@ import { renderApp } from "./render.js";
 const statusEl = document.getElementById("status");
 const heroSectionEl = document.getElementById("hero-section");
 const nodeIdEl = document.getElementById("node-id");
-const endpointAddrsEl = document.getElementById("endpoint-addrs");
 const endpointStatusEl = document.getElementById("endpoint-status");
 const rawUdpInterfaceEl = document.getElementById("raw-udp-interface");
-const transportAssessmentEl = document.getElementById("transport-assessment");
 const customTransportPillEl = document.getElementById("custom-transport-pill");
 const peerRpcPillEl = document.getElementById("peer-rpc-pill");
-const debugPeerRpcErrorEl = document.getElementById("debug-peer-rpc-error");
-const powerboxMatchDebugEl = document.getElementById("powerbox-match-debug");
 const tunnelStatusPillEl = document.getElementById("tunnel-status-pill");
 const tunnelHelperEl = document.getElementById("tunnel-helper");
 const shareInlineNoteEl = document.getElementById("share-inline-note");
@@ -39,9 +33,6 @@ const receivedPanelEl = document.getElementById("received-panel");
 const receivedTitleEl = document.getElementById("received-title");
 const receivedCopyEl = document.getElementById("received-copy");
 const savedCapsEl = document.getElementById("saved-caps");
-const activeTcpSessionsEl = document.getElementById("active-tcp-sessions");
-const remoteCapabilityExportSelectEl = document.getElementById("remote-capability-export-select");
-const importRemoteCapabilityButton = document.getElementById("import-remote-capability");
 const requestButton = document.getElementById("request-cap");
 const requestIpNetworkButton = document.getElementById("request-ip-network");
 const requestIpInterfaceButton = document.getElementById("request-ip-interface");
@@ -52,27 +43,7 @@ const rejectTunnelButton = document.getElementById("reject-tunnel");
 const disconnectPeerRpcButton = document.getElementById("disconnect-peer-rpc");
 const clearTicketButton = document.getElementById("clear-ticket");
 const copyTicketButton = document.getElementById("copy-ticket");
-const probeTicketButton = document.getElementById("probe-ticket");
-const networkProbeHostEl = document.getElementById("network-probe-host");
-const networkProbePortEl = document.getElementById("network-probe-port");
-const networkProbePathEl = document.getElementById("network-probe-path");
-const tcpProbeHostEl = document.getElementById("tcp-probe-host");
-const tcpProbePortEl = document.getElementById("tcp-probe-port");
-const tcpProbePayloadEl = document.getElementById("tcp-probe-payload");
-const exchangeHostEl = document.getElementById("exchange-host");
-const exchangePortEl = document.getElementById("exchange-port");
-const exchangePayloadEl = document.getElementById("exchange-payload");
-const udpProbeHostEl = document.getElementById("udp-probe-host");
-const udpProbePortEl = document.getElementById("udp-probe-port");
-const udpProbeWaitEl = document.getElementById("udp-probe-wait");
-const udpProbePayloadEl = document.getElementById("udp-probe-payload");
-const sessionHostEl = document.getElementById("session-host");
-const sessionPortEl = document.getElementById("session-port");
-const sessionReadMaxEl = document.getElementById("session-read-max");
-const sessionReadWaitEl = document.getElementById("session-read-wait");
-const sessionPayloadEl = document.getElementById("session-payload");
 const tunnelPanelEl = document.getElementById("tunnel-panel");
-const debugPanelEl = document.getElementById("debug-panel");
 
 let powerboxQueries = {
   apiSession: "",
@@ -91,14 +62,10 @@ const renderContext = {
   currentState,
   heroSectionEl,
   nodeIdEl,
-  endpointAddrsEl,
   endpointStatusEl,
   rawUdpInterfaceEl,
-  transportAssessmentEl,
   customTransportPillEl,
   peerRpcPillEl,
-  debugPeerRpcErrorEl,
-  powerboxMatchDebugEl,
   tunnelStatusPillEl,
   tunnelHelperEl,
   shareInlineNoteEl,
@@ -113,8 +80,6 @@ const renderContext = {
   receivedTitleEl,
   receivedCopyEl,
   savedCapsEl,
-  activeTcpSessionsEl,
-  remoteCapabilityExportSelectEl,
   requestIpInterfaceButton,
   connectTunnelButton,
   toggleTunnelButton,
@@ -122,26 +87,7 @@ const renderContext = {
   rejectTunnelButton,
   disconnectPeerRpcButton,
   clearTicketButton,
-  networkProbeHostEl,
-  networkProbePortEl,
-  networkProbePathEl,
-  tcpProbeHostEl,
-  tcpProbePortEl,
-  tcpProbePayloadEl,
-  exchangeHostEl,
-  exchangePortEl,
-  exchangePayloadEl,
-  udpProbeHostEl,
-  udpProbePortEl,
-  udpProbeWaitEl,
-  udpProbePayloadEl,
-  sessionHostEl,
-  sessionPortEl,
-  sessionPayloadEl,
-  sessionReadMaxEl,
-  sessionReadWaitEl,
   tunnelPanelEl,
-  debugPanelEl,
   setStatus,
   refreshState,
 };
@@ -263,14 +209,15 @@ function scheduleRefresh(data) {
 const appContext = {
   localTicketEl,
   remoteTicketEl,
-  remoteCapabilityExportSelectEl,
   setStatus,
   refreshState,
 };
 
-remoteTicketEl.addEventListener("input", () => {
-  renderCurrentState();
-});
+if (remoteTicketEl) {
+  remoteTicketEl.addEventListener("input", () => {
+    renderCurrentState();
+  });
+}
 
 document.addEventListener("visibilitychange", () => {
   const isPowerboxRequestSession =
@@ -298,101 +245,113 @@ window.addEventListener("focus", () => {
   });
 });
 
-copyTicketButton.addEventListener("click", async () => {
-  await copyTicket(appContext);
-});
-
-clearTicketButton.addEventListener("click", async () => {
-  await forgetConnection(appContext);
-});
-
-probeTicketButton.addEventListener("click", async () => {
-  await probeTicket(appContext);
-});
-
-connectTunnelButton.addEventListener("click", async () => {
-  await connectTunnel(appContext);
-});
-
-toggleTunnelButton.addEventListener("click", async () => {
-  if ((currentState && currentState.pairing && currentState.pairing.status) === "disabled") {
-    await enableTunnel(appContext);
-  } else {
-    await disableTunnel(appContext);
-  }
-});
-
-acceptTunnelButton.addEventListener("click", async () => {
-  await acceptTunnel(appContext);
-});
-
-rejectTunnelButton.addEventListener("click", async () => {
-  await rejectTunnel(appContext);
-});
-
-disconnectPeerRpcButton.addEventListener("click", async () => {
-  await disconnectTunnel(appContext);
-});
-
-importRemoteCapabilityButton.addEventListener("click", async () => {
-  await importRemoteCapability(appContext);
-});
-
-requestButton.addEventListener("click", () => {
-  if (!powerboxQueries.apiSession) {
-    setStatus("ApiSession query is not loaded yet.");
-    return;
-  }
-  const defaultLabel = "ApiSession capability";
-  requestPowerboxCapability(appContext, powerboxQueries.apiSession, defaultLabel, {
-    resolveSaveLabel: (descriptor) => {
-      return deriveSuggestedCapabilityLabel(descriptor, defaultLabel);
-    },
-    afterClaim: async (result) => {
-      setStatus("Configuring shared capability...");
-      const exportResponse = await fetch("api/tunnel/exported-api-session", {
-        method: "POST",
-        headers: { "Content-Type": "text/plain" },
-        body: result.id,
-      });
-      if (!exportResponse.ok) {
-        const body = await exportResponse.text();
-        throw new Error(responseTextToStatus("Shared capability setup failed", exportResponse, body));
-      }
-      setStatus("Capability is now shared.");
-    },
+if (copyTicketButton) {
+  copyTicketButton.addEventListener("click", async () => {
+    await copyTicket(appContext);
   });
-});
+}
 
-requestIpNetworkButton.addEventListener("click", () => {
-  if (!powerboxQueries.ipNetwork) {
-    setStatus("IpNetwork query is not loaded yet.");
-    return;
-  }
-  requestPowerboxCapability(appContext, powerboxQueries.ipNetwork, "IpNetwork capability");
-});
-
-requestIpInterfaceButton.addEventListener("click", () => {
-  if (!powerboxQueries.ipInterface) {
-    setStatus("IpInterface query is not loaded yet.");
-    return;
-  }
-  requestPowerboxCapability(appContext, powerboxQueries.ipInterface, "IpInterface capability", {
-    afterClaim: async (result) => {
-      setStatus("Binding tunneling capability...");
-      const bindResponse = await fetch("api/endpoint/raw-udp-interface", {
-        method: "POST",
-        headers: { "Content-Type": "text/plain" },
-        body: result.savedToken,
-      });
-      if (!bindResponse.ok) {
-        const body = await bindResponse.text();
-        throw new Error(responseTextToStatus("Tunnel capability bind failed", bindResponse, body));
-      }
-      setStatus("Tunneling capability ready.");
-    },
+if (clearTicketButton) {
+  clearTicketButton.addEventListener("click", async () => {
+    await forgetConnection(appContext);
   });
-});
+}
+
+if (connectTunnelButton) {
+  connectTunnelButton.addEventListener("click", async () => {
+    await connectTunnel(appContext);
+  });
+}
+
+if (toggleTunnelButton) {
+  toggleTunnelButton.addEventListener("click", async () => {
+    if ((currentState && currentState.pairing && currentState.pairing.status) === "disabled") {
+      await enableTunnel(appContext);
+    } else {
+      await disableTunnel(appContext);
+    }
+  });
+}
+
+if (acceptTunnelButton) {
+  acceptTunnelButton.addEventListener("click", async () => {
+    await acceptTunnel(appContext);
+  });
+}
+
+if (rejectTunnelButton) {
+  rejectTunnelButton.addEventListener("click", async () => {
+    await rejectTunnel(appContext);
+  });
+}
+
+if (disconnectPeerRpcButton) {
+  disconnectPeerRpcButton.addEventListener("click", async () => {
+    await disconnectTunnel(appContext);
+  });
+}
+
+if (requestButton) {
+  requestButton.addEventListener("click", () => {
+    if (!powerboxQueries.apiSession) {
+      setStatus("ApiSession query is not loaded yet.");
+      return;
+    }
+    const defaultLabel = "ApiSession capability";
+    requestPowerboxCapability(appContext, powerboxQueries.apiSession, defaultLabel, {
+      resolveSaveLabel: (descriptor) => {
+        return deriveSuggestedCapabilityLabel(descriptor, defaultLabel);
+      },
+      afterClaim: async (result) => {
+        setStatus("Configuring shared capability...");
+        const exportResponse = await fetch("api/tunnel/exported-api-session", {
+          method: "POST",
+          headers: { "Content-Type": "text/plain" },
+          body: result.id,
+        });
+        if (!exportResponse.ok) {
+          const body = await exportResponse.text();
+          throw new Error(responseTextToStatus("Shared capability setup failed", exportResponse, body));
+        }
+        setStatus("Capability is now shared.");
+      },
+    });
+  });
+}
+
+if (requestIpNetworkButton) {
+  requestIpNetworkButton.addEventListener("click", () => {
+    if (!powerboxQueries.ipNetwork) {
+      setStatus("IpNetwork query is not loaded yet.");
+      return;
+    }
+    requestPowerboxCapability(appContext, powerboxQueries.ipNetwork, "IpNetwork capability");
+  });
+}
+
+if (requestIpInterfaceButton) {
+  requestIpInterfaceButton.addEventListener("click", () => {
+    if (!powerboxQueries.ipInterface) {
+      setStatus("IpInterface query is not loaded yet.");
+      return;
+    }
+    requestPowerboxCapability(appContext, powerboxQueries.ipInterface, "IpInterface capability", {
+      afterClaim: async (result) => {
+        setStatus("Binding tunneling capability...");
+        const bindResponse = await fetch("api/endpoint/raw-udp-interface", {
+          method: "POST",
+          headers: { "Content-Type": "text/plain" },
+          body: result.savedToken,
+        });
+        if (!bindResponse.ok) {
+          const body = await bindResponse.text();
+          throw new Error(responseTextToStatus("Tunnel capability bind failed", bindResponse, body));
+        }
+        setStatus("Tunneling capability ready.");
+      },
+    });
+  });
+}
 
 refreshState().catch((error) => {
   setStatus(`Failed to load current state: ${error}`);

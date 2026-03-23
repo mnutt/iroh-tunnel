@@ -8,8 +8,8 @@ use quinn_udp::EcnCodepoint;
 
 use crate::ip_capnp;
 use crate::quinn_adapter::{
-    new_proxy_udp_backend, OwnedUdpPacket, ProxyUdpBackend, ProxyUdpDriver,
-    SandstormUdpCapabilities, SandstormUdpReceiver,
+    OwnedUdpPacket, ProxyUdpBackend, ProxyUdpDriver, SandstormUdpCapabilities,
+    SandstormUdpReceiver, new_proxy_udp_backend,
 };
 use crate::sandstorm_custom_transport::{
     DEFAULT_SEND_QUEUE_CAPACITY as DEFAULT_CUSTOM_TRANSPORT_SEND_QUEUE_CAPACITY,
@@ -40,11 +40,7 @@ impl ip_capnp::raw_udp_receiver::Server for CapnpRawUdpReceiverBridge {
         let payload = pry!(packet.get_payload()).to_vec();
         let src = pry!(udp_endpoint_to_socket_addr(pry!(packet.get_src())));
         let dst = pry!(udp_endpoint_to_socket_addr(pry!(packet.get_dst())));
-        let ecn = packet
-            .get_ecn()
-            .ok()
-            .and_then(ecn_from_capnp)
-            .or(None);
+        let ecn = packet.get_ecn().ok().and_then(ecn_from_capnp).or(None);
 
         self.receiver.receive_packet(OwnedUdpPacket {
             payload,
@@ -70,7 +66,10 @@ pub fn udp_endpoint_to_socket_addr(
     endpoint: ip_capnp::udp_endpoint::Reader<'_>,
 ) -> Result<SocketAddr, capnp::Error> {
     let address = endpoint.get_address()?;
-    Ok(SocketAddr::new(ip_address_to_ip_addr(address), endpoint.get_port()))
+    Ok(SocketAddr::new(
+        ip_address_to_ip_addr(address),
+        endpoint.get_port(),
+    ))
 }
 
 pub fn ip_address_to_ip_addr(address: ip_capnp::ip_address::Reader<'_>) -> IpAddr {
@@ -172,7 +171,9 @@ pub async fn new_capnp_raw_udp_backend_with_capacity(
     Ok(backend)
 }
 
-pub async fn get_local_endpoint(socket: &ip_capnp::raw_udp_socket::Client) -> io::Result<SocketAddr> {
+pub async fn get_local_endpoint(
+    socket: &ip_capnp::raw_udp_socket::Client,
+) -> io::Result<SocketAddr> {
     let response = socket
         .get_local_endpoint_request()
         .send()
@@ -208,7 +209,10 @@ pub async fn get_capabilities(
     })
 }
 
-async fn run_capnp_raw_udp_driver(socket: ip_capnp::raw_udp_socket::Client, driver: ProxyUdpDriver) {
+async fn run_capnp_raw_udp_driver(
+    socket: ip_capnp::raw_udp_socket::Client,
+    driver: ProxyUdpDriver,
+) {
     let receiver_client = new_raw_udp_receiver_client(Arc::new(driver.clone()));
     let register_result = async {
         let mut request = socket.set_receiver_request();
@@ -379,12 +383,12 @@ mod tests {
     use std::sync::Mutex;
     use std::task::{Context, Poll};
 
+    use crate::quinn_adapter::{SandstormQuinnUdpSocket, SandstormUdpSocketBackend};
+    use crate::sandstorm_custom_transport::SANDSTORM_RAW_UDP_TRANSPORT_ID;
     use futures::task::noop_waker;
     use iroh::endpoint::transports::CustomTransport;
     use n0_watcher::Watcher;
     use quinn::AsyncUdpSocket;
-    use crate::quinn_adapter::{SandstormQuinnUdpSocket, SandstormUdpSocketBackend};
-    use crate::sandstorm_custom_transport::SANDSTORM_RAW_UDP_TRANSPORT_ID;
 
     #[test]
     fn ip_addr_roundtrips_ipv4_through_capnp_wire_shape() {
@@ -394,7 +398,10 @@ mod tests {
         let reader = message
             .get_root_as_reader::<ip_capnp::ip_address::Reader<'_>>()
             .unwrap();
-        assert_eq!(ip_address_to_ip_addr(reader), IpAddr::V4(Ipv4Addr::new(192, 0, 2, 99)));
+        assert_eq!(
+            ip_address_to_ip_addr(reader),
+            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 99))
+        );
     }
 
     #[test]
@@ -544,11 +551,11 @@ mod tests {
                 .unwrap()
                 .sent_packets
                 .push_back(RecordedPacket {
-                payload,
-                src,
-                dst,
-                ecn,
-            });
+                    payload,
+                    src,
+                    dst,
+                    ecn,
+                });
             Promise::ok(())
         }
 
@@ -643,7 +650,9 @@ mod tests {
 
             tokio::task::yield_now().await;
 
-            let sent = server.take_sent_packet().expect("sent packet should be captured");
+            let sent = server
+                .take_sent_packet()
+                .expect("sent packet should be captured");
             assert_eq!(sent.payload, b"ping");
             assert_eq!(sent.src, local_addr);
             assert_eq!(sent.dst, remote_addr);
@@ -725,7 +734,10 @@ mod tests {
             assert_eq!(n, 1);
             assert_eq!(&recv_buf[..metas[0].len], b"reply");
             assert_eq!(metas[0].addr, remote_addr);
-            assert!(matches!(addrs[0], iroh::endpoint::transports::Addr::Custom(_)));
+            assert!(matches!(
+                addrs[0],
+                iroh::endpoint::transports::Addr::Custom(_)
+            ));
         });
     }
 }

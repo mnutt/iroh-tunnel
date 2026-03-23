@@ -28,7 +28,10 @@ pub fn new_sandstorm_custom_transport(
     local_addr: SocketAddr,
     transport_id: u64,
     send_queue_capacity: usize,
-) -> (Arc<SandstormCustomTransport>, SandstormCustomTransportDriver) {
+) -> (
+    Arc<SandstormCustomTransport>,
+    SandstormCustomTransportDriver,
+) {
     let local_custom_addr = socket_addr_to_custom_addr(transport_id, local_addr);
     let shared = Arc::new(Shared {
         transport_id,
@@ -92,11 +95,7 @@ impl SandstormCustomTransportDriver {
     pub async fn next_outgoing_packet(&self) -> io::Result<OwnedUdpPacket> {
         loop {
             {
-                let mut send = self
-                    .shared
-                    .send
-                    .lock()
-                    .map_err(poisoned_lock_to_io_error)?;
+                let mut send = self.shared.send.lock().map_err(poisoned_lock_to_io_error)?;
                 if let Some(packet) = send.queue.pop_front() {
                     if let Some(waker) = send.writable_waker.take() {
                         waker.wake();
@@ -175,11 +174,7 @@ impl CustomEndpoint for SandstormCustomEndpoint {
         source_addrs: &mut [Addr],
     ) -> Poll<io::Result<usize>> {
         let limit = bufs.len().min(metas.len()).min(source_addrs.len());
-        let mut recv = self
-            .shared
-            .recv
-            .lock()
-            .map_err(poisoned_lock_to_io_error)?;
+        let mut recv = self.shared.recv.lock().map_err(poisoned_lock_to_io_error)?;
 
         if recv.closed && recv.queue.is_empty() {
             return Poll::Ready(Err(io::Error::new(
@@ -208,8 +203,10 @@ impl CustomEndpoint for SandstormCustomEndpoint {
             meta.ecn = packet.ecn;
             meta.dst_ip = packet.dst_ip;
             metas[count] = meta;
-            source_addrs[count] =
-                Addr::Custom(socket_addr_to_custom_addr(self.shared.transport_id, packet.src));
+            source_addrs[count] = Addr::Custom(socket_addr_to_custom_addr(
+                self.shared.transport_id,
+                packet.src,
+            ));
             count += 1;
         }
 
@@ -246,11 +243,7 @@ impl CustomSender for SandstormCustomSender {
         transmit: &Transmit<'_>,
     ) -> Poll<io::Result<()>> {
         let dst = custom_addr_to_socket_addr(dst)?;
-        let mut send = self
-            .shared
-            .send
-            .lock()
-            .map_err(poisoned_lock_to_io_error)?;
+        let mut send = self.shared.send.lock().map_err(poisoned_lock_to_io_error)?;
 
         if send.closed {
             return Poll::Ready(Err(io::Error::new(
@@ -322,7 +315,10 @@ pub fn socket_addr_to_custom_addr(transport_id: u64, addr: SocketAddr) -> Custom
 
 pub fn custom_addr_to_socket_addr(addr: &CustomAddr) -> io::Result<SocketAddr> {
     match addr.data() {
-        [4, a, b, c, d, p0, p1] => Ok(SocketAddr::from(([*a, *b, *c, *d], u16::from_be_bytes([*p0, *p1])))),
+        [4, a, b, c, d, p0, p1] => Ok(SocketAddr::from((
+            [*a, *b, *c, *d],
+            u16::from_be_bytes([*p0, *p1]),
+        ))),
         [6, bytes @ ..] if bytes.len() == 18 => {
             let mut ip = [0u8; 16];
             ip.copy_from_slice(&bytes[..16]);

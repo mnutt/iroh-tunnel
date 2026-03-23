@@ -52,17 +52,6 @@ pub struct SharedCapabilityRecord {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct PersistedReceivedCapabilityRecord {
-    pub object_id: String,
-    pub export_id: String,
-    pub label: String,
-    pub kind: ReceivedCapabilityKind,
-    pub type_tag: Option<String>,
-    pub descriptor_json: Option<String>,
-    pub enabled: bool,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum LocalProxyTargetKind {
     ExportId,
     RemoteObjectId,
@@ -119,10 +108,6 @@ impl Storage {
         self.root.join("shared-caps.json")
     }
 
-    pub fn received_caps_path(&self) -> PathBuf {
-        self.root.join("received-caps.json")
-    }
-
     pub fn local_proxy_caps_path(&self) -> PathBuf {
         self.root.join("local-proxy-caps.json")
     }
@@ -136,10 +121,17 @@ impl Storage {
         T: for<'de> Deserialize<'de>,
     {
         match std::fs::read_to_string(&path) {
-            Ok(contents) => serde_json::from_str(&contents)
-                .map_err(|err| format!("{read_error}: failed to parse JSON {}: {err}", path.display())),
+            Ok(contents) => serde_json::from_str(&contents).map_err(|err| {
+                format!(
+                    "{read_error}: failed to parse JSON {}: {err}",
+                    path.display()
+                )
+            }),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
-            Err(err) => Err(format!("{read_error}: failed to read {}: {err}", path.display())),
+            Err(err) => Err(format!(
+                "{read_error}: failed to read {}: {err}",
+                path.display()
+            )),
         }
     }
 
@@ -180,16 +172,26 @@ impl Storage {
     }
 
     pub fn ensure_root(&self) -> Result<(), String> {
-        std::fs::create_dir_all(&self.root)
-            .map_err(|err| format!("failed to create state directory {}: {err}", self.root.display()))
+        std::fs::create_dir_all(&self.root).map_err(|err| {
+            format!(
+                "failed to create state directory {}: {err}",
+                self.root.display()
+            )
+        })
     }
 
     pub fn load_saved_capabilities(&self) -> Result<Vec<SavedCapabilityRecord>, String> {
-        self.read_json(self.saved_caps_path(), "failed to load saved capability registry")
+        self.read_json(
+            self.saved_caps_path(),
+            "failed to load saved capability registry",
+        )
     }
 
     pub fn load_shared_capabilities(&self) -> Result<Vec<SharedCapabilityRecord>, String> {
-        self.read_json(self.shared_caps_path(), "failed to load shared capability registry")
+        self.read_json(
+            self.shared_caps_path(),
+            "failed to load shared capability registry",
+        )
     }
 
     pub fn persist_shared_capabilities(
@@ -213,15 +215,6 @@ impl Storage {
         )
     }
 
-    pub fn load_persisted_received_capabilities(
-        &self,
-    ) -> Result<Vec<PersistedReceivedCapabilityRecord>, String> {
-        self.read_json(
-            self.received_caps_path(),
-            "failed to load received capability registry",
-        )
-    }
-
     pub fn load_local_proxy_capabilities(&self) -> Result<Vec<LocalProxyCapabilityRecord>, String> {
         self.read_json(
             self.local_proxy_caps_path(),
@@ -235,17 +228,6 @@ impl Storage {
         self.read_json(
             self.registered_remote_caps_path(),
             "failed to load registered remote capability registry",
-        )
-    }
-
-    pub fn persist_received_capability_registry(
-        &self,
-        records: &[PersistedReceivedCapabilityRecord],
-    ) -> Result<(), String> {
-        self.write_json(
-            self.received_caps_path(),
-            records,
-            "failed to persist received capability registry",
         )
     }
 

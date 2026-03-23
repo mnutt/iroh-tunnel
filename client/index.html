@@ -456,129 +456,16 @@
 
               <p id="peer-rpc-error" class="inline-note"></p>
 
-              <details id="debug-panel" class="debug">
-                <summary>Debug</summary>
-                <div class="debug-grid">
-                  <div class="debug-panel stack">
-                    <h3>Current State</h3>
-                    <div class="kv-grid">
-                      <div class="kv">
-                        <strong>Advertised Addresses</strong>
-                        <code id="endpoint-addrs">loading...</code>
-                      </div>
-                      <div class="kv">
-                        <strong>Connection Error</strong>
-                        <code id="debug-peer-rpc-error">none</code>
-                      </div>
-                      <div class="kv">
-                        <strong>Transport</strong>
-                        <code id="custom-transport-pill">loading...</code>
-                      </div>
-                      <div class="kv">
-                        <strong>Peer RPC</strong>
-                        <code id="peer-rpc-pill">loading...</code>
-                      </div>
-                    </div>
-                    <p id="transport-assessment" class="muted">loading...</p>
-                  </div>
-
-                  <div class="debug-panel stack">
-                    <h3>Saved Capabilities</h3>
-                    <p class="muted">
-                      Low-level capability actions stay here while the product flow is being
-                      simplified.
-                    </p>
-                    <div class="button-row">
-                      <button id="request-ip-network" class="secondary">Request Network Capability</button>
-                    </div>
-                    <ul id="saved-caps" class="debug-list"></ul>
-                  </div>
-
-                  <div class="debug-panel stack">
-                    <h3>Powerbox Match Debug</h3>
-                    <div class="field">
-                      <span class="field-label">Advertised Match Descriptors</span>
-                      <ul id="powerbox-match-debug" class="debug-list"></ul>
-                    </div>
-                  </div>
-
-                  <div class="debug-panel stack">
-                    <h3>Remote Exports</h3>
-                    <div class="field">
-                      <label class="field-label" for="remote-capability-export-select">Remote Capability Exports</label>
-                      <select id="remote-capability-export-select">
-                        <option value="">No remote capability exports loaded</option>
-                      </select>
-                    </div>
-                    <div class="button-row">
-                      <button id="import-remote-capability" class="secondary">Import Selected Capability</button>
-                    </div>
-                  </div>
-
-                  <div class="debug-panel stack">
-                    <h3>Transport Lab</h3>
-                    <div class="button-row">
-                      <button id="probe-ticket" class="secondary">Probe Connection</button>
-                    </div>
-
-                    <div class="field">
-                      <span class="field-label">HTTP Probe Target</span>
-                      <div class="button-row">
-                        <input id="network-probe-host" type="text" value="neverssl.com" placeholder="Host">
-                        <input id="network-probe-port" type="number" value="80" min="1" max="65535" placeholder="Port">
-                        <input id="network-probe-path" type="text" value="/" placeholder="Path">
-                      </div>
-                    </div>
-
-                    <div class="field">
-                      <span class="field-label">TCP Probe Target</span>
-                      <div class="button-row">
-                        <input id="tcp-probe-host" type="text" value="neverssl.com" placeholder="Host">
-                        <input id="tcp-probe-port" type="number" value="80" min="1" max="65535" placeholder="Port">
-                      </div>
-                      <textarea id="tcp-probe-payload" spellcheck="false">GET / HTTP/1.0
-Host: neverssl.com
-
-</textarea>
-                    </div>
-
-                    <div class="field">
-                      <span class="field-label">Binary Exchange</span>
-                      <div class="button-row">
-                        <input id="exchange-host" type="text" value="neverssl.com" placeholder="Host">
-                        <input id="exchange-port" type="number" value="80" min="1" max="65535" placeholder="Port">
-                      </div>
-                      <textarea id="exchange-payload" spellcheck="false">R0VUIC8gSFRUUC8xLjANCkhvc3Q6IG5ldmVyc3NsLmNvbQ0KDQo=</textarea>
-                    </div>
-
-                    <div class="field">
-                      <span class="field-label">UDP Probe</span>
-                      <div class="button-row">
-                        <input id="udp-probe-host" type="text" value="1.1.1.1" placeholder="Host">
-                        <input id="udp-probe-port" type="number" value="53" min="1" max="65535" placeholder="Port">
-                        <input id="udp-probe-wait" type="number" value="1000" min="0" placeholder="Wait ms">
-                      </div>
-                      <textarea id="udp-probe-payload" spellcheck="false">AAABAAABAAAAAAAAB2V4YW1wbGUDY29tAAABAAE=</textarea>
-                    </div>
-
-                    <div class="field">
-                      <span class="field-label">Stateful TCP Session</span>
-                      <div class="button-row">
-                        <input id="session-host" type="text" value="neverssl.com" placeholder="Host">
-                        <input id="session-port" type="number" value="80" min="1" max="65535" placeholder="Port">
-                        <input id="session-read-max" type="number" value="4096" min="1" placeholder="Read bytes">
-                        <input id="session-read-wait" type="number" value="250" min="0" placeholder="Wait ms">
-                      </div>
-                      <textarea id="session-payload" spellcheck="false">R0VUIC8gSFRUUC8xLjANCkhvc3Q6IG5ldmVyc3NsLmNvbQ0KDQo=</textarea>
-                    </div>
-
-                    <div class="field">
-                      <span class="field-label">Active TCP Sessions</span>
-                      <ul id="active-tcp-sessions" class="debug-list"></ul>
-                    </div>
-                  </div>
+              <div class="debug-panel stack">
+                <h3>Saved Capabilities</h3>
+                <p class="muted">
+                  Low-level capability actions stay here while the product flow is being simplified.
+                </p>
+                <div class="button-row">
+                  <button id="request-ip-network" class="secondary">Request Network Capability</button>
                 </div>
-              </details>
+                <ul id="saved-caps" class="debug-list"></ul>
+              </div>
             </div>
           </section>
         </div>

@@ -1,7 +1,5 @@
 import {
-  fetchWithTimeout,
   postText,
-  previewBase64Payload,
   responseTextToStatus,
 } from "./http.js";
 
@@ -52,143 +50,10 @@ function renderEmptyList(container, text) {
   container.appendChild(item);
 }
 
-function renderPowerboxMatchDebug(container, items) {
-  container.innerHTML = "";
-  if (!items.length) {
-    renderEmptyList(container, "No advertised Powerbox matches.");
-    return;
-  }
-
-  for (const entry of items) {
-    const item = document.createElement("li");
-    item.className = "cap-card";
-
-    const meta = document.createElement("div");
-    meta.className = "cap-meta";
-    const strong = document.createElement("strong");
-    strong.textContent = "Match descriptor";
-    meta.appendChild(strong);
-    appendInlineText(
-      meta,
-      entry.tagIds && entry.tagIds.length
-        ? `Tag IDs: ${entry.tagIds.join(", ")}`
-        : "No tag IDs"
-    );
-    const details = document.createElement("details");
-    const summary = document.createElement("summary");
-    summary.textContent = "Encoded descriptor";
-    details.appendChild(summary);
-    const code = document.createElement("code");
-    code.textContent = entry.descriptor || "";
-    details.appendChild(code);
-    meta.appendChild(details);
-    item.appendChild(meta);
-    container.appendChild(item);
-  }
-}
-
-function renderActiveTcpSessions(context, items) {
-  const { activeTcpSessionsEl, sessionPayloadEl, sessionReadMaxEl, sessionReadWaitEl, setStatus, refreshState } = context;
-  activeTcpSessionsEl.innerHTML = "";
-  if (!items.length) {
-    renderEmptyList(activeTcpSessionsEl, "No active TCP sessions.");
-    return;
-  }
-
-  for (const entry of items) {
-    const item = document.createElement("li");
-    item.className = "cap-card";
-
-    const label = document.createElement("div");
-    label.className = "cap-meta";
-    const strong = document.createElement("strong");
-    const sessionCode = document.createElement("code");
-    sessionCode.textContent = entry.sessionId;
-    strong.appendChild(sessionCode);
-    label.appendChild(strong);
-    appendInlineText(label, `${entry.host}:${entry.port}`);
-    appendInlineText(
-      label,
-      `buffered ${entry.bufferedBytes} | received ${entry.receivedBytes} | done ${entry.done}`
-    );
-    item.appendChild(label);
-
-    const actions = document.createElement("div");
-    actions.className = "cap-actions";
-
-    const sendButton = createButton("Send Chunk", "secondary", async () => {
-      if (entry.done) {
-        setStatus(`TCP session ${entry.sessionId} is already closed by the remote side.`);
-        return;
-      }
-      const payload = (sessionPayloadEl.value || "").trim();
-      setStatus(`Sending ${entry.sessionId} payload...`);
-      const response = await postText("api/network/session/send", `${entry.sessionId}\n${payload}`);
-      if (!response.ok) {
-        const body = await response.text();
-        setStatus(responseTextToStatus("TCP session send failed", response, body));
-        return;
-      }
-      const result = await response.json();
-      setStatus(`TCP session ${result.sessionId} sent ${result.bytesSent} bytes [${result.trace}]`);
-      await refreshState();
-    });
-    sendButton.disabled = !!entry.done;
-    actions.appendChild(sendButton);
-
-    actions.appendChild(createButton("Read Chunk", "secondary", async () => {
-      const maxBytes = (sessionReadMaxEl.value || "").trim() || "4096";
-      const waitMs = (sessionReadWaitEl.value || "").trim() || "250";
-      setStatus(`Reading ${entry.sessionId}...`);
-      const response = await postText("api/network/session/receive", `${entry.sessionId}\n${maxBytes}\n${waitMs}`);
-      if (!response.ok) {
-        const body = await response.text();
-        setStatus(responseTextToStatus("TCP session receive failed", response, body));
-        return;
-      }
-      const result = await response.json();
-      const preview = previewBase64Payload(result.responseBase64);
-      setStatus(`TCP session ${result.sessionId} read ${result.responseByteCount} bytes: ${preview} [${result.trace}]`);
-      await refreshState();
-    }));
-
-    actions.appendChild(createButton("Close Session", "secondary", async () => {
-      setStatus(`Closing ${entry.sessionId}...`);
-      const response = await postText("api/network/session/close", entry.sessionId);
-      if (!response.ok) {
-        const body = await response.text();
-        setStatus(responseTextToStatus("TCP session close failed", response, body));
-        return;
-      }
-      const result = await response.json();
-      setStatus(`TCP session ${result.sessionId} closed [${result.trace}]`);
-      await refreshState();
-    }));
-
-    item.appendChild(actions);
-    activeTcpSessionsEl.appendChild(item);
-  }
-}
-
 function renderSavedCaps(context, items, rawUdpInterface) {
   const {
     savedCapsEl,
     currentState,
-    networkProbeHostEl,
-    networkProbePortEl,
-    networkProbePathEl,
-    tcpProbeHostEl,
-    tcpProbePortEl,
-    tcpProbePayloadEl,
-    exchangeHostEl,
-    exchangePortEl,
-    exchangePayloadEl,
-    udpProbeHostEl,
-    udpProbePortEl,
-    udpProbeWaitEl,
-    udpProbePayloadEl,
-    sessionHostEl,
-    sessionPortEl,
     setStatus,
     refreshState,
   } = context;
@@ -332,105 +197,6 @@ function renderSavedCaps(context, items, rawUdpInterface) {
       }
     }));
 
-    advancedRow.appendChild(createButton("IP Network Probe", "secondary", async () => {
-      const host = (networkProbeHostEl.value || "").trim() || "neverssl.com";
-      const port = (networkProbePortEl.value || "").trim() || "80";
-      const path = (networkProbePathEl.value || "").trim() || "/";
-      setStatus(`Running IP network probe for ${entry.savedToken} to ${host}:${port}${path}...`);
-      const response = await postText("api/network/http-probe", `${entry.savedToken}\n${host}\n${port}\n${path}`);
-      if (!response.ok) {
-        const body = await response.text();
-        setStatus(responseTextToStatus("IP network probe failed", response, body));
-        return;
-      }
-      const result = await response.json();
-      setStatus(`IP network probe to ${result.host}:${result.port}${result.path} succeeded: ${result.responsePreview} [${result.trace}]`);
-    }));
-
-    advancedRow.appendChild(createButton("TCP Byte Probe", "secondary", async () => {
-      const host = (tcpProbeHostEl.value || "").trim() || "neverssl.com";
-      const port = (tcpProbePortEl.value || "").trim() || "80";
-      const payload = tcpProbePayloadEl.value || "";
-      setStatus(`Running TCP byte probe for ${entry.savedToken} to ${host}:${port}...`);
-      const response = await postText("api/network/tcp-probe", `${entry.savedToken}\n${host}\n${port}\n\n${payload}`);
-      if (!response.ok) {
-        const body = await response.text();
-        setStatus(responseTextToStatus("TCP byte probe failed", response, body));
-        return;
-      }
-      const result = await response.json();
-      setStatus(`TCP byte probe to ${result.host}:${result.port} returned ${result.responseByteCount} bytes: ${result.responsePreview} [${result.trace}]`);
-    }));
-
-    advancedRow.appendChild(createButton("Binary Exchange", "secondary", async () => {
-      const host = (exchangeHostEl.value || "").trim() || "neverssl.com";
-      const port = (exchangePortEl.value || "").trim() || "80";
-      const payload = (exchangePayloadEl.value || "").trim();
-      setStatus(`Running binary exchange for ${entry.savedToken} to ${host}:${port}...`);
-      const response = await postText("api/network/exchange", `${entry.savedToken}\n${host}\n${port}\n${payload}`);
-      if (!response.ok) {
-        const body = await response.text();
-        setStatus(responseTextToStatus("Binary exchange failed", response, body));
-        return;
-      }
-      const result = await response.json();
-      const preview = previewBase64Payload(result.responseBase64);
-      setStatus(`Binary exchange to ${result.host}:${result.port} returned ${result.responseByteCount} bytes: ${preview} [${result.trace}]`);
-    }));
-
-    advancedRow.appendChild(createButton("UDP Probe", "secondary", async () => {
-      const host = (udpProbeHostEl.value || "").trim() || "1.1.1.1";
-      const port = (udpProbePortEl.value || "").trim() || "53";
-      const waitMs = (udpProbeWaitEl.value || "").trim() || "1000";
-      const payload = (udpProbePayloadEl.value || "").trim();
-      setStatus(`Running UDP probe for ${entry.savedToken} to ${host}:${port}...`);
-      let response;
-      try {
-        response = await fetchWithTimeout("api/network/udp-probe", {
-          method: "POST",
-          headers: { "Content-Type": "text/plain" },
-          body: `${entry.savedToken}\n${host}\n${port}\n${payload}\n${waitMs}`,
-        }, Number(waitMs) + 4000);
-      } catch (error) {
-        if (error.name === "AbortError") {
-          setStatus(`UDP probe client timeout after ${Number(waitMs) + 4000}ms`);
-          return;
-        }
-        setStatus(`UDP probe request failed: ${error}`);
-        return;
-      }
-      if (!response.ok) {
-        const body = await response.text();
-        setStatus(responseTextToStatus("UDP probe failed", response, body));
-        return;
-      }
-      let result;
-      try {
-        result = await response.json();
-      } catch (error) {
-        const body = await response.text().catch(() => "");
-        setStatus(`UDP probe JSON parse failed: ${error} ${body}`.trim());
-        return;
-      }
-      const preview = previewBase64Payload(result.responseBase64);
-      setStatus(`UDP probe to ${result.host}:${result.port} returned ${result.responseByteCount} bytes in ${result.responsePacketCount} packet(s): ${preview} [${result.trace}]`);
-    }));
-
-    advancedRow.appendChild(createButton("Open TCP Session", "secondary", async () => {
-      const host = (sessionHostEl.value || "").trim() || "neverssl.com";
-      const port = (sessionPortEl.value || "").trim() || "80";
-      setStatus(`Opening TCP session for ${entry.savedToken} to ${host}:${port}...`);
-      const response = await postText("api/network/session/open", `${entry.savedToken}\n${host}\n${port}`);
-      if (!response.ok) {
-        const body = await response.text();
-        setStatus(responseTextToStatus("TCP session open failed", response, body));
-        return;
-      }
-      const result = await response.json();
-      setStatus(`Opened TCP session ${result.sessionId} to ${result.host}:${result.port} [${result.trace}]`);
-      await refreshState();
-    }));
-
     advanced.appendChild(advancedRow);
     item.appendChild(actions);
     item.appendChild(advanced);
@@ -528,43 +294,6 @@ function renderSharedCapabilities(context, data) {
 
     item.appendChild(debugDetails);
     sharedCapsEl.appendChild(item);
-  }
-}
-
-function renderRemoteExports(selectEl, exports, emptyText) {
-  selectEl.innerHTML = "";
-  if (!exports.length) {
-    const option = document.createElement("option");
-    option.value = "";
-    option.textContent = emptyText;
-    selectEl.appendChild(option);
-    return;
-  }
-  for (const entry of exports) {
-    const option = document.createElement("option");
-    option.value = entry.id;
-    option.textContent = `${entry.label} (${entry.id})`;
-    selectEl.appendChild(option);
-  }
-}
-
-function renderCombinedRemoteExports(selectEl, peerRpc) {
-  const combined = peerRpc.capabilityExports || [];
-
-  selectEl.innerHTML = "";
-  if (!combined.length) {
-    const option = document.createElement("option");
-    option.value = "";
-    option.textContent = "No remote capability exports loaded";
-    selectEl.appendChild(option);
-    return;
-  }
-
-  for (const entry of combined) {
-    const option = document.createElement("option");
-    option.value = entry.id;
-    option.textContent = `${entry.label} (${formatCapabilityType(entry.kind, entry.typeTag).replace("Type: ", "")})`;
-    selectEl.appendChild(option);
   }
 }
 
@@ -1026,84 +755,95 @@ export function renderApp(context, data) {
   const {
     heroSectionEl,
     nodeIdEl,
-    endpointAddrsEl,
     endpointStatusEl,
     rawUdpInterfaceEl,
     customTransportPillEl,
     peerRpcPillEl,
-    transportAssessmentEl,
     localTicketEl,
     remoteTicketEl,
     peerRpcStatusEl,
     peerRpcErrorEl,
-    debugPeerRpcErrorEl,
-    remoteCapabilityExportSelectEl,
-    powerboxMatchDebugEl,
     sharePanelEl,
     receivedPanelEl,
     receivedTitleEl,
     receivedCopyEl,
     tunnelPanelEl,
-    debugPanelEl,
   } = context;
   const endpoint = data.irohEndpoint || {};
   const peerRpc = data.peerRpc || { connected: false, capabilityExports: [] };
   const pairing = data.pairing || {};
-  const directAddrs = endpoint.directAddrs || [];
-  const customAddrs = endpoint.customAddrs || [];
   const hasCustomTicket = (endpoint.localTicket || "").split("\n").some((line) => line.startsWith("custom:"));
 
-  nodeIdEl.textContent = data.irohNodeId || "unavailable";
-  endpointAddrsEl.textContent = [...directAddrs, ...customAddrs].length
-    ? [...directAddrs, ...customAddrs].join(", ")
-    : "none";
-  endpointStatusEl.textContent = endpoint.error || (endpoint.bound ? "bound (relay disabled)" : "not bound");
-  rawUdpInterfaceEl.textContent = endpoint.rawUdpInterface
-    ? `${endpoint.rawUdpInterface.label} [${endpoint.rawUdpInterface.source}]`
-    : "not configured";
-  customTransportPillEl.textContent = hasCustomTicket ? "Custom Transport Ready" : "Custom Transport Missing";
-  peerRpcPillEl.textContent = peerRpc.connected ? "Peer RPC Connected" : "Peer RPC Disconnected";
-  transportAssessmentEl.textContent = data.transportAssessment || "unavailable";
-  localTicketEl.value = endpoint.localTicket || "";
+  if (nodeIdEl) {
+    nodeIdEl.textContent = data.irohNodeId || "unavailable";
+  }
+  if (endpointStatusEl) {
+    endpointStatusEl.textContent = endpoint.error || (endpoint.bound ? "bound (relay disabled)" : "not bound");
+  }
+  if (rawUdpInterfaceEl) {
+    rawUdpInterfaceEl.textContent = endpoint.rawUdpInterface
+      ? `${endpoint.rawUdpInterface.label} [${endpoint.rawUdpInterface.source}]`
+      : "not configured";
+  }
+  if (customTransportPillEl) {
+    customTransportPillEl.textContent = hasCustomTicket ? "Custom Transport Ready" : "Custom Transport Missing";
+  }
+  if (peerRpcPillEl) {
+    peerRpcPillEl.textContent = peerRpc.connected ? "Peer RPC Connected" : "Peer RPC Disconnected";
+  }
+  if (localTicketEl) {
+    localTicketEl.value = endpoint.localTicket || "";
+  }
   const serverRemoteTicket = data.remoteTicket || "";
-  const currentRemoteTicket = remoteTicketEl.value || "";
+  const currentRemoteTicket = remoteTicketEl ? (remoteTicketEl.value || "") : "";
   const preserveRemoteTicketDraft =
     document.activeElement === remoteTicketEl
     || (!!currentRemoteTicket.trim() && currentRemoteTicket !== serverRemoteTicket);
-  if (!preserveRemoteTicketDraft) {
+  if (!preserveRemoteTicketDraft && remoteTicketEl) {
     remoteTicketEl.value = serverRemoteTicket;
   }
-  peerRpcStatusEl.textContent = peerRpc.connected
-    ? `connected to ${peerRpc.remoteNodeId} [session ${peerRpc.sessionId}]`
-    : pairing.status === "incomingRequest"
-      ? `incoming request from ${pairing.pendingIncomingPeerNodeId || "remote grain"}`
-      : pairing.status === "awaitingRemoteAccept" || pairing.status === "connecting"
-        ? `waiting for ${pairing.pendingOutgoingPeerNodeId || "remote grain"}`
-        : pairing.approvedPeerNodeId
-          ? `approved peer ${pairing.approvedPeerNodeId}`
-          : "not connected";
-  peerRpcErrorEl.textContent = data.peerRpcError || "";
-  debugPeerRpcErrorEl.textContent = data.peerRpcError || "none";
+  if (peerRpcStatusEl) {
+    peerRpcStatusEl.textContent = peerRpc.connected
+      ? `connected to ${peerRpc.remoteNodeId} [session ${peerRpc.sessionId}]`
+      : pairing.status === "incomingRequest"
+        ? `incoming request from ${pairing.pendingIncomingPeerNodeId || "remote grain"}`
+        : pairing.status === "awaitingRemoteAccept" || pairing.status === "connecting"
+          ? `waiting for ${pairing.pendingOutgoingPeerNodeId || "remote grain"}`
+          : pairing.approvedPeerNodeId
+            ? `approved peer ${pairing.approvedPeerNodeId}`
+            : "not connected";
+  }
+  if (peerRpcErrorEl) {
+    peerRpcErrorEl.textContent = data.peerRpcError || "";
+  }
 
   const isPowerboxRequestSession =
     data.powerboxRequestSession && data.powerboxRequestSession.active;
-  heroSectionEl.style.display = isPowerboxRequestSession ? "none" : "";
-  sharePanelEl.style.display = isPowerboxRequestSession ? "none" : "";
-  tunnelPanelEl.style.display = isPowerboxRequestSession ? "none" : "";
-  debugPanelEl.style.display = isPowerboxRequestSession ? "none" : "";
-  receivedPanelEl.style.display = "";
-  receivedTitleEl.textContent = isPowerboxRequestSession
-    ? "Provide Capability"
-    : "Received Capabilities";
-  receivedCopyEl.textContent = isPowerboxRequestSession
-    ? "Choose a capability to provide to the requesting grain."
-    : "Capabilities remembered from the remote grain stay listed here, even when the tunnel is disconnected.";
+  if (heroSectionEl) {
+    heroSectionEl.style.display = isPowerboxRequestSession ? "none" : "";
+  }
+  if (sharePanelEl) {
+    sharePanelEl.style.display = isPowerboxRequestSession ? "none" : "";
+  }
+  if (tunnelPanelEl) {
+    tunnelPanelEl.style.display = isPowerboxRequestSession ? "none" : "";
+  }
+  if (receivedPanelEl) {
+    receivedPanelEl.style.display = "";
+  }
+  if (receivedTitleEl) {
+    receivedTitleEl.textContent = isPowerboxRequestSession
+      ? "Provide Capability"
+      : "Received Capabilities";
+  }
+  if (receivedCopyEl) {
+    receivedCopyEl.textContent = isPowerboxRequestSession
+      ? "Choose a capability to provide to the requesting grain."
+      : "Capabilities remembered from the remote grain stay listed here, even when the tunnel is disconnected.";
+  }
 
-  renderCombinedRemoteExports(remoteCapabilityExportSelectEl, peerRpc);
-  renderPowerboxMatchDebug(powerboxMatchDebugEl, data.powerboxAdvertisedMatches || []);
   renderSharedCapabilities(context, data);
   renderReceivedCapabilities(context, data);
   renderSavedCaps(context, data.savedCaps || [], endpoint.rawUdpInterface || null);
-  renderActiveTcpSessions(context, data.activeTcpSessions || []);
   renderTunnel(context, data);
 }

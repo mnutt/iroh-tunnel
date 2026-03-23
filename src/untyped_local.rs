@@ -342,9 +342,9 @@ impl PipelineHook for UnsupportedPipeline {
     }
 
     fn get_pipelined_cap(&self, _ops: &[PipelineOp]) -> Box<dyn ClientHook> {
-        Box::new(BrokenClient::new(
-            Error::unimplemented("pipelining is not supported by the local untyped proxy".to_string()),
-        ))
+        Box::new(BrokenClient::new(Error::unimplemented(
+            "pipelining is not supported by the local untyped proxy".to_string(),
+        )))
     }
 }
 
@@ -452,18 +452,11 @@ where
         method_id: u16,
         size_hint: Option<capnp::MessageSize>,
     ) -> capability::Request<any_pointer::Owned, any_pointer::Owned> {
-        capability::Request::new(Box::new(Request::new(
-            interface_id,
-            method_id,
-            size_hint,
-            self.add_ref(),
-        )
-        .with_request_cap_table_transform(
-            self.request_cap_table_transform.clone(),
-        )
-        .with_response_cap_table_transform(
-            self.response_cap_table_transform.clone(),
-        )))
+        capability::Request::new(Box::new(
+            Request::new(interface_id, method_id, size_hint, self.add_ref())
+                .with_request_cap_table_transform(self.request_cap_table_transform.clone())
+                .with_response_cap_table_transform(self.response_cap_table_transform.clone()),
+        ))
     }
 
     fn call(

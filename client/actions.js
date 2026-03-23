@@ -137,45 +137,6 @@ export async function copyTicket(context) {
   }
 }
 
-export async function probeTicket(context) {
-  const { setStatus } = context;
-  setStatus("Probing remote connection...");
-  const response = await fetch("api/pairing/probe-connect", { method: "POST" });
-  if (!response.ok) {
-    const body = await response.text();
-    setStatus(responseTextToStatus("Probe failed", response, body));
-    return;
-  }
-  const result = await response.json();
-  setStatus(`Probe succeeded with ${result.remoteNodeId}: ${result.response}`);
-}
-
-export async function importRemoteCapability(context) {
-  const { remoteCapabilityExportSelectEl, setStatus, refreshState } = context;
-  const selected = remoteCapabilityExportSelectEl.value;
-  if (!selected) {
-    setStatus("Select a remote capability export first.");
-    return;
-  }
-
-  const exportId = selected.trim();
-  if (!exportId) {
-    setStatus("Selected remote capability export is invalid.");
-    return;
-  }
-
-  setStatus(`Importing remote capability ${exportId}...`);
-  const response = await postText("api/tunnel/rpc/import-capability", exportId);
-  if (!response.ok) {
-    const body = await response.text();
-    setStatus(responseTextToStatus("Remote capability import failed", response, body));
-    return;
-  }
-  const result = await response.json();
-  setStatus(`Imported remote capability ${result.label} as object ${result.objectId}.`);
-  await refreshState();
-}
-
 export function requestPowerboxCapability(context, query, saveLabel, options = {}) {
   const { setStatus, refreshState } = context;
   const { afterClaim, resolveSaveLabel } = options;
